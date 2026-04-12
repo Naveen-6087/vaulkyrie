@@ -6,6 +6,7 @@ use pinocchio::{default_allocator, default_panic_handler, program_entrypoint};
 
 pub mod instruction;
 pub mod state;
+pub mod transition;
 
 #[cfg(feature = "bpf-entrypoint")]
 program_entrypoint!(process_instruction);

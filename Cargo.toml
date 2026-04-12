@@ -18,5 +18,5 @@ frost-ed25519 = "2.2.0"
 pinocchio = "0.7.1"
 rand_chacha = "0.3.1"
 rand_core = "0.6.4"
-sha2 = "0.10.9"
+sha2 = { version = "0.10.9", default-features = false }
 solana-signature = { version = "2.0.19", features = ["verify"] }
