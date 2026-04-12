@@ -1,0 +1,13 @@
+[package]
+name = "vaulkyrie-frost"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+frost-ed25519.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+
