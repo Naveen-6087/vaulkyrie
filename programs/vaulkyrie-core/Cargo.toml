@@ -14,3 +14,4 @@ bpf-entrypoint = []
 
 [dependencies]
 pinocchio.workspace = true
+vaulkyrie-protocol = { path = "../../crates/vaulkyrie-protocol" }
