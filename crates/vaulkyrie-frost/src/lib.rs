@@ -167,6 +167,7 @@ pub fn run_dkg_signing_harness(message: &[u8]) -> Result<HarnessReport, HarnessE
 #[cfg(test)]
 mod tests {
     use super::run_dkg_signing_harness;
+    use solana_signature::Signature as SolanaSignature;
 
     #[test]
     fn dkg_harness_produces_standard_key_and_signature_lengths() {
@@ -186,5 +187,15 @@ mod tests {
 
         assert_eq!(first.group_public_key, second.group_public_key);
         assert_eq!(first.signature, second.signature);
+    }
+
+    #[test]
+    fn dkg_harness_signature_verifies_with_solana_signature_api() {
+        let message = b"vaulkyrie frost harness";
+        let report = run_dkg_signing_harness(message).expect("run should succeed");
+
+        let solana_signature = SolanaSignature::from(report.signature);
+
+        assert!(solana_signature.verify(&report.group_public_key, message));
     }
 }

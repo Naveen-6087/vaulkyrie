@@ -10,4 +10,4 @@ ed25519-dalek.workspace = true
 frost-ed25519.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true
-
+solana-signature.workspace = true
