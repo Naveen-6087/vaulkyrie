@@ -200,6 +200,7 @@ pub fn process(
             {
                 let vault_data = vault_account.try_borrow_data()?;
                 let vault = decode_vault_state(&vault_data)?;
+                transition::validate_vault_recovery_mode(&vault).map_err(map_transition_error)?;
                 let wallet_signer = get_account_info!(accounts, 2);
                 require_wallet_authority(&vault, wallet_signer)?;
             }
@@ -450,6 +451,7 @@ pub fn process_rotate_authority_data(
 
     let mut vault = VaultRegistry::decode(vault_dst).ok_or(ProgramError::InvalidAccountData)?;
     require_discriminator(&vault.discriminator, &VAULT_REGISTRY_DISCRIMINATOR)?;
+    transition::validate_vault_recovery_mode(&vault).map_err(map_transition_error)?;
 
     let mut authority =
         QuantumAuthorityState::decode(authority_dst).ok_or(ProgramError::InvalidAccountData)?;
@@ -536,6 +538,7 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::VaultAuthorityMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::VaultPolicyMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::VaultNotActive => ProgramError::InvalidAccountData,
+        transition::TransitionError::VaultNotRecovery => ProgramError::InvalidAccountData,
         transition::TransitionError::VaultStatusInvalid => ProgramError::InvalidInstructionData,
         transition::TransitionError::VaultStatusTransitionNotAllowed => ProgramError::InvalidArgument,
         transition::TransitionError::SessionPolicyMismatch => ProgramError::InvalidArgument,
@@ -786,7 +789,7 @@ mod tests {
     fn rotate_authority_updates_current_hash() {
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut bytes = [0; QuantumAuthorityState::LEN];
-        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Active, 8);
+        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Recovery, 8);
         let initial = QuantumAuthorityState::new([7; 32], 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut bytes));
@@ -815,7 +818,7 @@ mod tests {
     fn rotate_authority_rejects_vault_authority_mismatch() {
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut authority_bytes = [0; QuantumAuthorityState::LEN];
-        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Active, 8);
+        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Recovery, 8);
         let initial = QuantumAuthorityState::new([9; 32], 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
@@ -840,7 +843,7 @@ mod tests {
     fn rotate_authority_rejects_no_op_hash() {
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut authority_bytes = [0; QuantumAuthorityState::LEN];
-        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Active, 8);
+        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Recovery, 8);
         let initial = QuantumAuthorityState::new([7; 32], 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
@@ -865,7 +868,7 @@ mod tests {
     fn rotate_authority_rejects_expired_statement() {
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut authority_bytes = [0; QuantumAuthorityState::LEN];
-        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Active, 8);
+        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Recovery, 8);
         let initial = QuantumAuthorityState::new([7; 32], 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
@@ -884,6 +887,31 @@ mod tests {
         .expect_err("expired authority statement should fail");
 
         assert_eq!(error, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn rotate_authority_rejects_active_vault() {
+        let mut vault_bytes = [0; VaultRegistry::LEN];
+        let mut authority_bytes = [0; QuantumAuthorityState::LEN];
+        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Active, 8);
+        let initial = QuantumAuthorityState::new([7; 32], 1);
+        assert!(vault.encode(&mut vault_bytes));
+        assert!(initial.encode(&mut authority_bytes));
+
+        let error = process_rotate_authority_data(
+            &mut vault_bytes,
+            &mut authority_bytes,
+            &vaulkyrie_protocol::AuthorityRotationStatement {
+                action_hash: sample_action_hash(),
+                next_authority_hash: [8; 32],
+                sequence: 0,
+                expiry_slot: 200,
+            },
+            10,
+        )
+        .expect_err("active vault should fail recovery-mode rotation");
+
+        assert_eq!(error, ProgramError::InvalidAccountData);
     }
 
     #[test]

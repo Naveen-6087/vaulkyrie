@@ -15,6 +15,7 @@ pub enum TransitionError {
     VaultAuthorityMismatch,
     VaultPolicyMismatch,
     VaultNotActive,
+    VaultNotRecovery,
     VaultStatusInvalid,
     VaultStatusTransitionNotAllowed,
     SessionPolicyMismatch,
@@ -103,6 +104,14 @@ pub fn validate_vault_active(vault: &VaultRegistry) -> Result<(), TransitionErro
     }
 
     Ok(())
+}
+
+pub fn validate_vault_recovery_mode(vault: &VaultRegistry) -> Result<(), TransitionError> {
+    if vault.status == VaultStatus::Recovery as u8 || vault.status == VaultStatus::Locked as u8 {
+        Ok(())
+    } else {
+        Err(TransitionError::VaultNotRecovery)
+    }
 }
 
 pub fn validate_vault_authority_alignment(
@@ -306,6 +315,7 @@ mod tests {
         finalize_action_session, initialize_quantum_authority, initialize_vault, parse_vault_status,
         mark_action_session_ready, rotate_vault_authority, validate_vault_authority_alignment,
         validate_vault_active, validate_vault_for_receipt, validate_vault_for_session,
+        validate_vault_recovery_mode,
         open_action_session, open_action_session_from_receipt, stage_policy_receipt, update_vault_status,
         TransitionError,
     };
@@ -398,6 +408,32 @@ mod tests {
         let error = validate_vault_active(&vault).expect_err("locked vault should fail");
 
         assert_eq!(error, TransitionError::VaultNotActive);
+    }
+
+    #[test]
+    fn validate_vault_recovery_mode_accepts_recovery() {
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        vault.status = VaultStatus::Recovery as u8;
+
+        validate_vault_recovery_mode(&vault).expect("recovery vault should pass");
+    }
+
+    #[test]
+    fn validate_vault_recovery_mode_accepts_locked() {
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        vault.status = VaultStatus::Locked as u8;
+
+        validate_vault_recovery_mode(&vault).expect("locked vault should pass");
+    }
+
+    #[test]
+    fn validate_vault_recovery_mode_rejects_active() {
+        let vault = initialize_vault([1; 32], [2; 32], 9, 4);
+
+        let error = validate_vault_recovery_mode(&vault)
+            .expect_err("active vault should fail recovery-mode check");
+
+        assert_eq!(error, TransitionError::VaultNotRecovery);
     }
 
     #[test]
