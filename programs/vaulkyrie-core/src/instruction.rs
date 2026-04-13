@@ -16,6 +16,7 @@ pub enum CoreInstruction {
     StageReceipt(PolicyReceipt),
     ConsumeReceipt(PolicyReceipt),
     OpenSession(PolicyReceipt),
+    ActivateSession([u8; 32]),
     RotateAuthority(AuthorityRotationStatement),
 }
 
@@ -29,10 +30,21 @@ impl TryFrom<&[u8]> for CoreInstruction {
             [2, rest @ ..] => Ok(Self::StageReceipt(parse_policy_receipt(rest)?)),
             [3, rest @ ..] => Ok(Self::ConsumeReceipt(parse_policy_receipt(rest)?)),
             [4, rest @ ..] => Ok(Self::OpenSession(parse_policy_receipt(rest)?)),
-            [5, rest @ ..] => Ok(Self::RotateAuthority(parse_authority_rotation(rest)?)),
+            [5, rest @ ..] => Ok(Self::ActivateSession(parse_action_hash(rest)?)),
+            [6, rest @ ..] => Ok(Self::RotateAuthority(parse_authority_rotation(rest)?)),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
+}
+
+fn parse_action_hash(data: &[u8]) -> Result<[u8; 32], ProgramError> {
+    if data.len() != 32 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut action_hash = [0; 32];
+    action_hash.copy_from_slice(data);
+    Ok(action_hash)
 }
 
 fn parse_init_vault(data: &[u8]) -> Result<InitVaultArgs, ProgramError> {
@@ -192,8 +204,19 @@ mod tests {
     }
 
     #[test]
-    fn parses_rotate_authority_instruction() {
+    fn parses_activate_session_instruction() {
         let mut data = vec![5];
+        data.extend_from_slice(&[7; 32]);
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::ActivateSession([7; 32]))
+        );
+    }
+
+    #[test]
+    fn parses_rotate_authority_instruction() {
+        let mut data = vec![6];
         data.extend_from_slice(&[5; 32]);
         data.extend_from_slice(&[6; 32]);
         data.extend_from_slice(&13u64.to_le_bytes());

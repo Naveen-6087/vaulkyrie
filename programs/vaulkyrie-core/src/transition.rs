@@ -9,6 +9,8 @@ use crate::state::{
 pub enum TransitionError {
     ReceiptAlreadyConsumed,
     ReceiptMismatch,
+    SessionMismatch,
+    SessionNotPending,
     AuthoritySequenceMismatch,
 }
 
@@ -61,8 +63,20 @@ pub fn consume_policy_receipt(
     Ok(())
 }
 
-pub fn mark_action_session_ready(state: &mut ActionSessionState) {
+pub fn mark_action_session_ready(
+    state: &mut ActionSessionState,
+    action_hash: [u8; 32],
+) -> Result<(), TransitionError> {
+    if state.action_hash != action_hash {
+        return Err(TransitionError::SessionMismatch);
+    }
+
+    if state.status != SessionStatus::Pending as u8 {
+        return Err(TransitionError::SessionNotPending);
+    }
+
     state.status = SessionStatus::Ready as u8;
+    Ok(())
 }
 
 pub fn apply_authority_rotation(
@@ -177,9 +191,45 @@ mod tests {
         };
         let mut session = open_action_session(&receipt);
 
-        mark_action_session_ready(&mut session);
+        mark_action_session_ready(&mut session, receipt.action_hash)
+            .expect("matching action hash should mark session ready");
 
         assert_eq!(session.status, SessionStatus::Ready as u8);
+    }
+
+    #[test]
+    fn marking_action_session_ready_rejects_action_mismatch() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+        let mut session = open_action_session(&receipt);
+
+        let error = mark_action_session_ready(&mut session, [99; 32])
+            .expect_err("wrong action hash should be rejected");
+
+        assert_eq!(error, TransitionError::SessionMismatch);
+    }
+
+    #[test]
+    fn marking_action_session_ready_rejects_non_pending_session() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+        let mut session = open_action_session(&receipt);
+        session.status = SessionStatus::Ready as u8;
+
+        let error = mark_action_session_ready(&mut session, receipt.action_hash)
+            .expect_err("ready session should not transition twice");
+
+        assert_eq!(error, TransitionError::SessionNotPending);
     }
 
     #[test]

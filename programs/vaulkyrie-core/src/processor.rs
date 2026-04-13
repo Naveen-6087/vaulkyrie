@@ -3,7 +3,11 @@ use vaulkyrie_protocol::{AuthorityRotationStatement, PolicyReceipt};
 
 use crate::{
     instruction::{CoreInstruction, InitVaultArgs},
-    state::{ActionSessionState, PolicyReceiptState, QuantumAuthorityState, VaultRegistry},
+    state::{
+        ActionSessionState, PolicyReceiptState, QuantumAuthorityState, VaultRegistry,
+        ACTION_SESSION_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR,
+        QUANTUM_STATE_DISCRIMINATOR,
+    },
     transition,
 };
 
@@ -41,6 +45,13 @@ pub fn process(
             require_program_owner(program_id, account)?;
             let mut data = account.try_borrow_mut_data()?;
             process_open_session_data(&mut data, &receipt)
+        }
+        CoreInstruction::ActivateSession(action_hash) => {
+            let account = get_account_info!(accounts, 0);
+            require_writable(account)?;
+            require_program_owner(program_id, account)?;
+            let mut data = account.try_borrow_mut_data()?;
+            process_activate_session_data(&mut data, action_hash)
         }
         CoreInstruction::RotateAuthority(statement) => {
             let account = get_account_info!(accounts, 0);
@@ -96,6 +107,7 @@ pub fn process_consume_receipt_data(dst: &mut [u8], receipt: &PolicyReceipt) -> 
     }
 
     let mut state = PolicyReceiptState::decode(dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&state.discriminator, &POLICY_RECEIPT_DISCRIMINATOR)?;
     transition::consume_policy_receipt(&mut state, receipt)
         .map_err(map_transition_error)?;
 
@@ -122,6 +134,23 @@ pub fn process_open_session_data(dst: &mut [u8], receipt: &PolicyReceipt) -> Pro
     Ok(())
 }
 
+pub fn process_activate_session_data(dst: &mut [u8], action_hash: [u8; 32]) -> ProgramResult {
+    if dst.len() != ActionSessionState::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let mut state = ActionSessionState::decode(dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&state.discriminator, &ACTION_SESSION_DISCRIMINATOR)?;
+    transition::mark_action_session_ready(&mut state, action_hash)
+        .map_err(map_transition_error)?;
+
+    if !state.encode(dst) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Ok(())
+}
+
 pub fn process_rotate_authority_data(
     dst: &mut [u8],
     statement: &AuthorityRotationStatement,
@@ -131,6 +160,7 @@ pub fn process_rotate_authority_data(
     }
 
     let mut state = QuantumAuthorityState::decode(dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&state.discriminator, &QUANTUM_STATE_DISCRIMINATOR)?;
     transition::apply_authority_rotation(&mut state, statement)
         .map_err(map_transition_error)?;
 
@@ -164,10 +194,20 @@ fn is_zeroed(data: &[u8]) -> bool {
     data.iter().all(|byte| *byte == 0)
 }
 
+fn require_discriminator(actual: &[u8; 8], expected: &[u8; 8]) -> ProgramResult {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ProgramError::InvalidAccountData)
+    }
+}
+
 fn map_transition_error(error: transition::TransitionError) -> ProgramError {
     match error {
         transition::TransitionError::ReceiptAlreadyConsumed => ProgramError::AccountAlreadyInitialized,
         transition::TransitionError::ReceiptMismatch => ProgramError::InvalidAccountData,
+        transition::TransitionError::SessionMismatch => ProgramError::InvalidArgument,
+        transition::TransitionError::SessionNotPending => ProgramError::AccountAlreadyInitialized,
         transition::TransitionError::AuthoritySequenceMismatch => ProgramError::InvalidArgument,
     }
 }
@@ -178,12 +218,15 @@ mod tests {
     use vaulkyrie_protocol::{ActionDescriptor, ActionKind, PolicyReceipt, ThresholdRequirement};
 
     use super::{
-        process_consume_receipt_data, process_init_vault_data, process_open_session_data,
-        process_rotate_authority_data, process_stage_receipt_data,
+        process_activate_session_data, process_consume_receipt_data, process_init_vault_data,
+        process_open_session_data, process_rotate_authority_data, process_stage_receipt_data,
     };
     use crate::{
         instruction::InitVaultArgs,
-        state::{ActionSessionState, PolicyReceiptState, QuantumAuthorityState, SessionStatus, VaultRegistry},
+        state::{
+            ActionSessionState, PolicyReceiptState, QuantumAuthorityState, SessionStatus,
+            VaultRegistry, ACTION_SESSION_DISCRIMINATOR,
+        },
     };
 
     fn sample_action_hash() -> [u8; 32] {
@@ -295,5 +338,51 @@ mod tests {
             ThresholdRequirement::TwoOfThree.as_byte()
         );
         assert_eq!(state.status, SessionStatus::Pending as u8);
+    }
+
+    #[test]
+    fn activate_session_marks_state_ready() {
+        let receipt = sample_receipt();
+        let mut bytes = [0; ActionSessionState::LEN];
+
+        process_open_session_data(&mut bytes, &receipt).expect("open session should succeed");
+        process_activate_session_data(&mut bytes, receipt.action_hash)
+            .expect("activate session should succeed");
+
+        let state = ActionSessionState::decode(&bytes).expect("state should decode");
+        assert_eq!(state.status, SessionStatus::Ready as u8);
+    }
+
+    #[test]
+    fn activate_session_rejects_wrong_discriminator() {
+        let mut bytes = [0; ActionSessionState::LEN];
+        bytes[..8].copy_from_slice(b"BADTYPE1");
+
+        let error = process_activate_session_data(&mut bytes, [7; 32])
+            .expect_err("wrong discriminator should fail");
+
+        assert_eq!(error, ProgramError::InvalidAccountData);
+    }
+
+    #[test]
+    fn activate_session_rejects_wrong_action_hash() {
+        let receipt = sample_receipt();
+        let mut bytes = [0; ActionSessionState::LEN];
+
+        process_open_session_data(&mut bytes, &receipt).expect("open session should succeed");
+        let error = process_activate_session_data(&mut bytes, [9; 32])
+            .expect_err("wrong action hash should fail");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn open_session_writes_expected_discriminator() {
+        let receipt = sample_receipt();
+        let mut bytes = [0; ActionSessionState::LEN];
+
+        process_open_session_data(&mut bytes, &receipt).expect("open session should succeed");
+
+        assert_eq!(&bytes[..8], &ACTION_SESSION_DISCRIMINATOR);
     }
 }
