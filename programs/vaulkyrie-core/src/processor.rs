@@ -163,6 +163,19 @@ pub fn process(
                 current_slot,
             )
         }
+        CoreInstruction::SetVaultStatus(status) => {
+            let vault_account = get_account_info!(accounts, 0);
+            require_program_owner(program_id, vault_account)?;
+            {
+                let vault_data = vault_account.try_borrow_data()?;
+                let vault = decode_vault_state(&vault_data)?;
+                let wallet_signer = get_account_info!(accounts, 1);
+                require_wallet_authority(&vault, wallet_signer)?;
+            }
+            require_writable(vault_account)?;
+            let mut vault_data = vault_account.try_borrow_mut_data()?;
+            process_set_vault_status_data(&mut vault_data, status)
+        }
         CoreInstruction::RotateAuthority(statement) => {
             let current_slot = current_slot()?;
             let vault_account = get_account_info!(accounts, 0);
@@ -189,6 +202,23 @@ pub fn process(
             )
         }
     }
+}
+
+pub fn process_set_vault_status_data(dst: &mut [u8], status: u8) -> ProgramResult {
+    if dst.len() != VaultRegistry::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let mut vault = VaultRegistry::decode(dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&vault.discriminator, &VAULT_REGISTRY_DISCRIMINATOR)?;
+    let next_status = transition::parse_vault_status(status).map_err(map_transition_error)?;
+    transition::update_vault_status(&mut vault, next_status).map_err(map_transition_error)?;
+
+    if !vault.encode(dst) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Ok(())
 }
 
 pub fn process_init_vault_data(dst: &mut [u8], args: InitVaultArgs) -> ProgramResult {
@@ -475,6 +505,8 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::VaultAuthorityMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::VaultPolicyMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::VaultNotActive => ProgramError::InvalidAccountData,
+        transition::TransitionError::VaultStatusInvalid => ProgramError::InvalidInstructionData,
+        transition::TransitionError::VaultStatusTransitionNotAllowed => ProgramError::InvalidArgument,
         transition::TransitionError::SessionMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::SessionNotPending => ProgramError::AccountAlreadyInitialized,
         transition::TransitionError::SessionNotReady => ProgramError::InvalidAccountData,
@@ -491,14 +523,14 @@ mod tests {
     use super::{
         process_activate_session_data, process_consume_receipt_data, process_consume_session_data,
         process_finalize_session_data, process_init_authority_data, process_init_vault_data,
-        process_open_session_data, process_rotate_authority_data, process_stage_receipt_data,
-        ensure_wallet_authority,
+        process_open_session_data, process_rotate_authority_data, process_set_vault_status_data,
+        process_stage_receipt_data, ensure_wallet_authority,
     };
     use crate::{
         instruction::{InitAuthorityArgs, InitVaultArgs},
         state::{
             ActionSessionState, PolicyReceiptState, QuantumAuthorityState, SessionStatus,
-            VaultRegistry, ACTION_SESSION_DISCRIMINATOR,
+            VaultRegistry, VaultStatus, ACTION_SESSION_DISCRIMINATOR,
         },
     };
 
@@ -542,6 +574,43 @@ mod tests {
     fn wallet_authority_accepts_matching_signer() {
         ensure_wallet_authority([1; 32], [1; 32], true)
             .expect("matching signer pubkey should pass");
+    }
+
+    #[test]
+    fn set_vault_status_updates_state() {
+        let mut bytes = [0; VaultRegistry::LEN];
+        let vault = VaultRegistry::new([5; 32], [6; 32], 7, VaultStatus::Active, 8);
+        assert!(vault.encode(&mut bytes));
+
+        process_set_vault_status_data(&mut bytes, VaultStatus::Locked as u8)
+            .expect("active to locked should pass");
+
+        let updated = VaultRegistry::decode(&bytes).expect("vault should decode");
+        assert_eq!(updated.status, VaultStatus::Locked as u8);
+    }
+
+    #[test]
+    fn set_vault_status_rejects_unknown_value() {
+        let mut bytes = [0; VaultRegistry::LEN];
+        let vault = VaultRegistry::new([5; 32], [6; 32], 7, VaultStatus::Active, 8);
+        assert!(vault.encode(&mut bytes));
+
+        let error = process_set_vault_status_data(&mut bytes, 42)
+            .expect_err("unknown status should fail");
+
+        assert_eq!(error, ProgramError::InvalidInstructionData);
+    }
+
+    #[test]
+    fn set_vault_status_rejects_disallowed_transition() {
+        let mut bytes = [0; VaultRegistry::LEN];
+        let vault = VaultRegistry::new([5; 32], [6; 32], 7, VaultStatus::Locked, 8);
+        assert!(vault.encode(&mut bytes));
+
+        let error = process_set_vault_status_data(&mut bytes, VaultStatus::Active as u8)
+            .expect_err("locked to active should fail");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
     }
 
     #[test]

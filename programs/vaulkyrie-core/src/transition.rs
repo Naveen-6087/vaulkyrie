@@ -15,6 +15,8 @@ pub enum TransitionError {
     VaultAuthorityMismatch,
     VaultPolicyMismatch,
     VaultNotActive,
+    VaultStatusInvalid,
+    VaultStatusTransitionNotAllowed,
     SessionMismatch,
     SessionNotPending,
     SessionNotReady,
@@ -42,6 +44,38 @@ pub fn initialize_quantum_authority(
     bump: u8,
 ) -> QuantumAuthorityState {
     QuantumAuthorityState::new(current_authority_hash, bump)
+}
+
+pub fn parse_vault_status(status: u8) -> Result<VaultStatus, TransitionError> {
+    match status {
+        value if value == VaultStatus::Active as u8 => Ok(VaultStatus::Active),
+        value if value == VaultStatus::Recovery as u8 => Ok(VaultStatus::Recovery),
+        value if value == VaultStatus::Locked as u8 => Ok(VaultStatus::Locked),
+        _ => Err(TransitionError::VaultStatusInvalid),
+    }
+}
+
+pub fn update_vault_status(
+    vault: &mut VaultRegistry,
+    next_status: VaultStatus,
+) -> Result<(), TransitionError> {
+    let current = parse_vault_status(vault.status)?;
+
+    let is_allowed = matches!(
+        (current, next_status),
+        (VaultStatus::Active, VaultStatus::Recovery)
+            | (VaultStatus::Active, VaultStatus::Locked)
+            | (VaultStatus::Recovery, VaultStatus::Active)
+            | (VaultStatus::Recovery, VaultStatus::Locked)
+            | (VaultStatus::Locked, VaultStatus::Recovery)
+    ) || current == next_status;
+
+    if !is_allowed {
+        return Err(TransitionError::VaultStatusTransitionNotAllowed);
+    }
+
+    vault.status = next_status as u8;
+    Ok(())
 }
 
 pub fn validate_vault_for_receipt(
@@ -244,10 +278,10 @@ mod tests {
 
     use super::{
         apply_authority_rotation, consume_action_session, consume_policy_receipt,
-        finalize_action_session, initialize_quantum_authority, initialize_vault,
+        finalize_action_session, initialize_quantum_authority, initialize_vault, parse_vault_status,
         mark_action_session_ready, rotate_vault_authority, validate_vault_authority_alignment,
         validate_vault_for_receipt,
-        open_action_session, open_action_session_from_receipt, stage_policy_receipt,
+        open_action_session, open_action_session_from_receipt, stage_policy_receipt, update_vault_status,
         TransitionError,
     };
     use crate::state::{QuantumAuthorityState, SessionStatus, VaultStatus};
@@ -346,6 +380,36 @@ mod tests {
             .expect_err("expired receipt should not stage");
 
         assert_eq!(error, TransitionError::ReceiptExpired);
+    }
+
+    #[test]
+    fn parse_vault_status_rejects_unknown_value() {
+        let error = parse_vault_status(42).expect_err("unknown status should fail");
+
+        assert_eq!(error, TransitionError::VaultStatusInvalid);
+    }
+
+    #[test]
+    fn update_vault_status_allows_lock_then_recovery() {
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+
+        update_vault_status(&mut vault, VaultStatus::Locked)
+            .expect("active to locked should be allowed");
+        update_vault_status(&mut vault, VaultStatus::Recovery)
+            .expect("locked to recovery should be allowed");
+
+        assert_eq!(vault.status, VaultStatus::Recovery as u8);
+    }
+
+    #[test]
+    fn update_vault_status_rejects_locked_to_active() {
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        vault.status = VaultStatus::Locked as u8;
+
+        let error = update_vault_status(&mut vault, VaultStatus::Active)
+            .expect_err("locked to active should be rejected");
+
+        assert_eq!(error, TransitionError::VaultStatusTransitionNotAllowed);
     }
 
     #[test]
