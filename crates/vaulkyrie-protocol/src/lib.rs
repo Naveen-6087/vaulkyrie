@@ -52,6 +52,20 @@ impl ThresholdRequirement {
     }
 }
 
+impl TryFrom<u8> for ThresholdRequirement {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::OneOfThree),
+            2 => Ok(Self::TwoOfThree),
+            3 => Ok(Self::ThreeOfThree),
+            255 => Ok(Self::RequirePqcAuth),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyReceipt {
     pub action_hash: [u8; 32],
@@ -171,5 +185,16 @@ mod tests {
         assert_eq!(ThresholdRequirement::TwoOfThree.as_byte(), 2);
         assert_eq!(ThresholdRequirement::ThreeOfThree.as_byte(), 3);
         assert_eq!(ThresholdRequirement::RequirePqcAuth.as_byte(), 255);
+    }
+
+    #[test]
+    fn threshold_decoding_accepts_known_values() {
+        assert_eq!(ThresholdRequirement::try_from(1), Ok(ThresholdRequirement::OneOfThree));
+        assert_eq!(ThresholdRequirement::try_from(2), Ok(ThresholdRequirement::TwoOfThree));
+        assert_eq!(
+            ThresholdRequirement::try_from(255),
+            Ok(ThresholdRequirement::RequirePqcAuth)
+        );
+        assert_eq!(ThresholdRequirement::try_from(99), Err(()));
     }
 }
