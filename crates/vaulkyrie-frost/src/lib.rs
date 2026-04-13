@@ -1,5 +1,5 @@
 use core::fmt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::{Signature as DalekSignature, Verifier, VerifyingKey as DalekVerifyingKey};
 use frost_ed25519 as frost;
@@ -13,6 +13,7 @@ pub const DEFAULT_MAX_SIGNERS: u16 = 3;
 pub enum HarnessError {
     Frost(frost::Error),
     InvalidVerifyingKey(ed25519_dalek::SignatureError),
+    InvalidConfig(&'static str),
 }
 
 impl fmt::Display for HarnessError {
@@ -20,6 +21,7 @@ impl fmt::Display for HarnessError {
         match self {
             Self::Frost(err) => write!(f, "frost error: {err}"),
             Self::InvalidVerifyingKey(err) => write!(f, "invalid ed25519 verifying key: {err}"),
+            Self::InvalidConfig(reason) => write!(f, "invalid harness config: {reason}"),
         }
     }
 }
@@ -42,18 +44,52 @@ impl From<ed25519_dalek::SignatureError> for HarnessError {
 pub struct HarnessReport {
     pub group_public_key: [u8; 32],
     pub signature: [u8; 64],
+    pub signer_set: Vec<u16>,
 }
 
 pub fn run_dkg_signing_harness(message: &[u8]) -> Result<HarnessReport, HarnessError> {
-    let mut rng = ChaCha20Rng::from_seed([11; 32]);
+    let config = HarnessConfig::default();
+    run_dkg_signing_with_config(message, &config)
+}
+
+#[derive(Debug, Clone)]
+pub struct HarnessConfig {
+    pub min_signers: u16,
+    pub max_signers: u16,
+    pub signing_participants: Vec<u16>,
+    pub rng_seed: [u8; 32],
+}
+
+impl Default for HarnessConfig {
+    fn default() -> Self {
+        Self {
+            min_signers: DEFAULT_MIN_SIGNERS,
+            max_signers: DEFAULT_MAX_SIGNERS,
+            signing_participants: vec![1, 2],
+            rng_seed: [11; 32],
+        }
+    }
+}
+
+pub fn run_dkg_signing_with_config(
+    message: &[u8],
+    config: &HarnessConfig,
+) -> Result<HarnessReport, HarnessError> {
+    validate_config(config)?;
+    let mut rng = ChaCha20Rng::from_seed(config.rng_seed);
+    let signing_participants = parse_signing_participants(config)?;
 
     let mut round1_secret_packages = BTreeMap::new();
     let mut round1_public_packages = BTreeMap::new();
 
-    for participant in 1..=DEFAULT_MAX_SIGNERS {
-        let identifier = participant.try_into().expect("participant id should fit");
-        let (secret_package, public_package) =
-            frost::keys::dkg::part1(identifier, DEFAULT_MAX_SIGNERS, DEFAULT_MIN_SIGNERS, &mut rng)?;
+    for participant in 1..=config.max_signers {
+        let identifier = identifier_from_u16(participant)?;
+        let (secret_package, public_package) = frost::keys::dkg::part1(
+            identifier,
+            config.max_signers,
+            config.min_signers,
+            &mut rng,
+        )?;
 
         round1_secret_packages.insert(identifier, secret_package);
         round1_public_packages.insert(identifier, public_package);
@@ -62,8 +98,8 @@ pub fn run_dkg_signing_harness(message: &[u8]) -> Result<HarnessReport, HarnessE
     let mut round2_secret_packages = BTreeMap::new();
     let mut round2_public_packages: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
 
-    for participant in 1..=DEFAULT_MAX_SIGNERS {
-        let identifier = participant.try_into().expect("participant id should fit");
+    for participant in 1..=config.max_signers {
+        let identifier = identifier_from_u16(participant)?;
         let peer_round1_packages = round1_public_packages
             .iter()
             .filter(|(peer_identifier, _)| **peer_identifier != identifier)
@@ -88,8 +124,8 @@ pub fn run_dkg_signing_harness(message: &[u8]) -> Result<HarnessReport, HarnessE
     let mut key_packages = BTreeMap::new();
     let mut public_key_package = None;
 
-    for participant in 1..=DEFAULT_MAX_SIGNERS {
-        let identifier = participant.try_into().expect("participant id should fit");
+    for participant in 1..=config.max_signers {
+        let identifier = identifier_from_u16(participant)?;
         let peer_round1_packages = round1_public_packages
             .iter()
             .filter(|(peer_identifier, _)| **peer_identifier != identifier)
@@ -107,10 +143,6 @@ pub fn run_dkg_signing_harness(message: &[u8]) -> Result<HarnessReport, HarnessE
     }
 
     let public_key_package = public_key_package.expect("dkg should produce a public key package");
-
-    let signing_participants: Vec<_> = (1..=DEFAULT_MIN_SIGNERS)
-        .map(|participant| participant.try_into().expect("participant id should fit"))
-        .collect();
 
     let mut nonce_commitments = BTreeMap::new();
     let mut nonces = BTreeMap::new();
@@ -158,15 +190,71 @@ pub fn run_dkg_signing_harness(message: &[u8]) -> Result<HarnessReport, HarnessE
         .verify(message, &dalek_signature)
         .map_err(HarnessError::from)?;
 
+    let signer_set = config.signing_participants.clone();
+
     Ok(HarnessReport {
         group_public_key: public_key_bytes,
         signature: signature_bytes,
+        signer_set,
     })
+}
+
+fn identifier_from_u16(participant: u16) -> Result<frost::Identifier, HarnessError> {
+    participant
+        .try_into()
+        .map_err(|_| HarnessError::InvalidConfig("participant id must be in range"))
+}
+
+fn parse_signing_participants(
+    config: &HarnessConfig,
+) -> Result<Vec<frost::Identifier>, HarnessError> {
+    config
+        .signing_participants
+        .iter()
+        .copied()
+        .map(identifier_from_u16)
+        .collect()
+}
+
+fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
+    if config.min_signers == 0 || config.max_signers == 0 {
+        return Err(HarnessError::InvalidConfig("min/max signers must be non-zero"));
+    }
+    if config.min_signers > config.max_signers {
+        return Err(HarnessError::InvalidConfig("min_signers must be <= max_signers"));
+    }
+    if config.signing_participants.len() < usize::from(config.min_signers) {
+        return Err(HarnessError::InvalidConfig(
+            "signing participants below threshold",
+        ));
+    }
+    if config.signing_participants.len() > usize::from(config.max_signers) {
+        return Err(HarnessError::InvalidConfig(
+            "signing participants exceed max_signers",
+        ));
+    }
+
+    let mut seen = BTreeSet::new();
+    for participant in &config.signing_participants {
+        if *participant == 0 || *participant > config.max_signers {
+            return Err(HarnessError::InvalidConfig(
+                "signing participant out of DKG range",
+            ));
+        }
+
+        if !seen.insert(*participant) {
+            return Err(HarnessError::InvalidConfig(
+                "signing participants must be unique",
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::run_dkg_signing_harness;
+    use super::{run_dkg_signing_harness, run_dkg_signing_with_config, HarnessConfig, HarnessError};
     use solana_signature::Signature as SolanaSignature;
 
     #[test]
@@ -197,5 +285,77 @@ mod tests {
         let solana_signature = SolanaSignature::from(report.signature);
 
         assert!(solana_signature.verify(&report.group_public_key, message));
+    }
+
+    #[test]
+    fn dkg_harness_supports_custom_signer_set() {
+        let message = b"vaulkyrie custom signers";
+        let config = HarnessConfig {
+            min_signers: 3,
+            max_signers: 5,
+            signing_participants: vec![1, 3, 5],
+            rng_seed: [21; 32],
+        };
+
+        let report = run_dkg_signing_with_config(message, &config)
+            .expect("configured signing ceremony should succeed");
+        let solana_signature = SolanaSignature::from(report.signature);
+
+        assert_eq!(report.signer_set, vec![1, 3, 5]);
+        assert!(solana_signature.verify(&report.group_public_key, message));
+    }
+
+    #[test]
+    fn dkg_harness_rejects_insufficient_signers() {
+        let config = HarnessConfig {
+            min_signers: 3,
+            max_signers: 5,
+            signing_participants: vec![1, 2],
+            rng_seed: [7; 32],
+        };
+
+        let error = run_dkg_signing_with_config(b"msg", &config)
+            .expect_err("sub-threshold signer set should fail validation");
+
+        assert!(matches!(
+            error,
+            HarnessError::InvalidConfig("signing participants below threshold")
+        ));
+    }
+
+    #[test]
+    fn dkg_harness_rejects_duplicate_signers() {
+        let config = HarnessConfig {
+            min_signers: 2,
+            max_signers: 3,
+            signing_participants: vec![1, 1],
+            rng_seed: [8; 32],
+        };
+
+        let error = run_dkg_signing_with_config(b"msg", &config)
+            .expect_err("duplicate signers should fail validation");
+
+        assert!(matches!(
+            error,
+            HarnessError::InvalidConfig("signing participants must be unique")
+        ));
+    }
+
+    #[test]
+    fn dkg_harness_rejects_signer_out_of_range() {
+        let config = HarnessConfig {
+            min_signers: 2,
+            max_signers: 3,
+            signing_participants: vec![1, 4],
+            rng_seed: [9; 32],
+        };
+
+        let error = run_dkg_signing_with_config(b"msg", &config)
+            .expect_err("out-of-range signer id should fail validation");
+
+        assert!(matches!(
+            error,
+            HarnessError::InvalidConfig("signing participant out of DKG range")
+        ));
     }
 }
