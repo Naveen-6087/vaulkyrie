@@ -47,6 +47,14 @@ pub struct HarnessReport {
     pub signer_set: Vec<u16>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RefreshReport {
+    pub original_group_public_key: [u8; 32],
+    pub refreshed_group_public_key: [u8; 32],
+    pub signature: [u8; 64],
+    pub signer_set: Vec<u16>,
+}
+
 pub fn run_dkg_signing_harness(message: &[u8]) -> Result<HarnessReport, HarnessError> {
     let config = HarnessConfig::default();
     run_dkg_signing_with_config(message, &config)
@@ -78,7 +86,116 @@ pub fn run_dkg_signing_with_config(
     validate_config(config)?;
     let mut rng = ChaCha20Rng::from_seed(config.rng_seed);
     let signing_participants = parse_signing_participants(config)?;
+    let (key_packages, public_key_package) = run_dkg(config, &mut rng)?;
+    let (public_key_bytes, signature_bytes) = sign_with_key_packages(
+        message,
+        &key_packages,
+        &public_key_package,
+        &signing_participants,
+        &mut rng,
+    )?;
 
+    Ok(HarnessReport {
+        group_public_key: public_key_bytes,
+        signature: signature_bytes,
+        signer_set: config.signing_participants.clone(),
+    })
+}
+
+pub fn run_share_refresh_harness(message: &[u8]) -> Result<RefreshReport, HarnessError> {
+    let config = HarnessConfig::default();
+    run_share_refresh_with_config(message, &config)
+}
+
+pub fn run_share_refresh_with_config(
+    message: &[u8],
+    config: &HarnessConfig,
+) -> Result<RefreshReport, HarnessError> {
+    validate_config(config)?;
+    let mut dkg_rng = ChaCha20Rng::from_seed(config.rng_seed);
+    let signing_participants = parse_signing_participants(config)?;
+    let (initial_key_packages, public_key_package) = run_dkg(config, &mut dkg_rng)?;
+
+    let all_identifiers = participant_identifiers(config.max_signers)?;
+    let mut refresh_rng = ChaCha20Rng::from_seed([29; 32]);
+    let (refreshing_shares, refreshed_public_key_package) = frost::keys::refresh::compute_refreshing_shares::<
+        frost::Ed25519Sha512,
+        _,
+    >(
+        public_key_package.clone(),
+        config.max_signers,
+        config.min_signers,
+        &all_identifiers,
+        &mut refresh_rng,
+    )?;
+
+    let mut refreshed_key_packages = BTreeMap::new();
+    for (identifier, zero_share) in all_identifiers.iter().zip(refreshing_shares.into_iter()) {
+        let old_key_package = initial_key_packages
+            .get(identifier)
+            .ok_or(HarnessError::InvalidConfig("missing original key package"))?;
+        let refreshed_key_package =
+            frost::keys::refresh::refresh_share::<frost::Ed25519Sha512>(
+                zero_share,
+                old_key_package,
+            )?;
+        refreshed_key_packages.insert(*identifier, refreshed_key_package);
+    }
+
+    let (original_group_public_key, _) = sign_with_key_packages(
+        message,
+        &initial_key_packages,
+        &public_key_package,
+        &signing_participants,
+        &mut dkg_rng,
+    )?;
+    let (refreshed_group_public_key, signature) = sign_with_key_packages(
+        message,
+        &refreshed_key_packages,
+        &refreshed_public_key_package,
+        &signing_participants,
+        &mut refresh_rng,
+    )?;
+
+    Ok(RefreshReport {
+        original_group_public_key,
+        refreshed_group_public_key,
+        signature,
+        signer_set: config.signing_participants.clone(),
+    })
+}
+
+fn identifier_from_u16(participant: u16) -> Result<frost::Identifier, HarnessError> {
+    participant
+        .try_into()
+        .map_err(|_| HarnessError::InvalidConfig("participant id must be in range"))
+}
+
+fn parse_signing_participants(
+    config: &HarnessConfig,
+) -> Result<Vec<frost::Identifier>, HarnessError> {
+    config
+        .signing_participants
+        .iter()
+        .copied()
+        .map(identifier_from_u16)
+        .collect()
+}
+
+fn participant_identifiers(max_signers: u16) -> Result<Vec<frost::Identifier>, HarnessError> {
+    (1..=max_signers).map(identifier_from_u16).collect()
+}
+
+fn run_dkg(
+    config: &HarnessConfig,
+    rng: &mut ChaCha20Rng,
+) -> Result<
+    (
+        BTreeMap<frost::Identifier, frost::keys::KeyPackage>,
+        frost::keys::PublicKeyPackage,
+    ),
+    HarnessError,
+> {
     let mut round1_secret_packages = BTreeMap::new();
     let mut round1_public_packages = BTreeMap::new();
 
@@ -88,9 +205,8 @@ pub fn run_dkg_signing_with_config(
             identifier,
             config.max_signers,
             config.min_signers,
-            &mut rng,
+            &mut *rng,
         )?;
-
         round1_secret_packages.insert(identifier, secret_package);
         round1_public_packages.insert(identifier, public_package);
     }
@@ -106,10 +222,11 @@ pub fn run_dkg_signing_with_config(
             .map(|(peer_identifier, package)| (*peer_identifier, package.clone()))
             .collect();
 
-        let (secret_package, packages) = frost::keys::dkg::part2(
-            round1_secret_packages[&identifier].clone(),
-            &peer_round1_packages,
-        )?;
+        let round1_secret = round1_secret_packages
+            .get(&identifier)
+            .ok_or(HarnessError::InvalidConfig("missing round1 secret package"))?
+            .clone();
+        let (secret_package, packages) = frost::keys::dkg::part2(round1_secret, &peer_round1_packages)?;
 
         round2_secret_packages.insert(identifier, secret_package);
 
@@ -132,24 +249,40 @@ pub fn run_dkg_signing_with_config(
             .map(|(peer_identifier, package)| (*peer_identifier, package.clone()))
             .collect();
 
-        let (key_package, pubkey_package) = frost::keys::dkg::part3(
-            &round2_secret_packages[&identifier],
-            &peer_round1_packages,
-            &round2_public_packages[&identifier],
-        )?;
+        let round2_secret = round2_secret_packages
+            .get(&identifier)
+            .ok_or(HarnessError::InvalidConfig("missing round2 secret package"))?;
+        let round2_packages = round2_public_packages
+            .get(&identifier)
+            .ok_or(HarnessError::InvalidConfig("missing round2 public package set"))?;
+        let (key_package, participant_public_key_package) =
+            frost::keys::dkg::part3(round2_secret, &peer_round1_packages, round2_packages)?;
 
         key_packages.insert(identifier, key_package);
-        public_key_package = Some(pubkey_package);
+        public_key_package = Some(participant_public_key_package);
     }
 
-    let public_key_package = public_key_package.expect("dkg should produce a public key package");
+    let public_key_package =
+        public_key_package.ok_or(HarnessError::InvalidConfig("dkg produced no public key"))?;
 
+    Ok((key_packages, public_key_package))
+}
+
+fn sign_with_key_packages(
+    message: &[u8],
+    key_packages: &BTreeMap<frost::Identifier, frost::keys::KeyPackage>,
+    public_key_package: &frost::keys::PublicKeyPackage,
+    signing_participants: &[frost::Identifier],
+    rng: &mut ChaCha20Rng,
+) -> Result<([u8; 32], [u8; 64]), HarnessError> {
     let mut nonce_commitments = BTreeMap::new();
     let mut nonces = BTreeMap::new();
 
-    for identifier in &signing_participants {
-        let (nonce, commitments) =
-            frost::round1::commit(key_packages[identifier].signing_share(), &mut rng);
+    for identifier in signing_participants {
+        let key_package = key_packages
+            .get(identifier)
+            .ok_or(HarnessError::InvalidConfig("missing key package for signer"))?;
+        let (nonce, commitments) = frost::round1::commit(key_package.signing_share(), &mut *rng);
         nonces.insert(*identifier, nonce);
         nonce_commitments.insert(*identifier, commitments);
     }
@@ -157,18 +290,18 @@ pub fn run_dkg_signing_with_config(
     let signing_package = frost::SigningPackage::new(nonce_commitments, message);
     let mut signature_shares = BTreeMap::new();
 
-    for identifier in &signing_participants {
-        let signature_share = frost::round2::sign(
-            &signing_package,
-            &nonces[identifier],
-            &key_packages[identifier],
-        )?;
+    for identifier in signing_participants {
+        let key_package = key_packages
+            .get(identifier)
+            .ok_or(HarnessError::InvalidConfig("missing key package for signer"))?;
+        let nonce = nonces
+            .get(identifier)
+            .ok_or(HarnessError::InvalidConfig("missing nonce for signer"))?;
+        let signature_share = frost::round2::sign(&signing_package, nonce, key_package)?;
         signature_shares.insert(*identifier, signature_share);
     }
 
-    let group_signature =
-        frost::aggregate(&signing_package, &signature_shares, &public_key_package)?;
-
+    let group_signature = frost::aggregate(&signing_package, &signature_shares, public_key_package)?;
     public_key_package
         .verifying_key()
         .verify(message, &group_signature)?;
@@ -177,12 +310,11 @@ pub fn run_dkg_signing_with_config(
         .verifying_key()
         .serialize()?
         .try_into()
-        .expect("ed25519 public key serialization should be 32 bytes");
-
+        .map_err(|_| HarnessError::InvalidConfig("ed25519 public key must be 32 bytes"))?;
     let signature_bytes: [u8; 64] = group_signature
         .serialize()?
         .try_into()
-        .expect("ed25519 signature serialization should be 64 bytes");
+        .map_err(|_| HarnessError::InvalidConfig("ed25519 signature must be 64 bytes"))?;
 
     let dalek_key = DalekVerifyingKey::from_bytes(&public_key_bytes)?;
     let dalek_signature = DalekSignature::from_bytes(&signature_bytes);
@@ -190,30 +322,7 @@ pub fn run_dkg_signing_with_config(
         .verify(message, &dalek_signature)
         .map_err(HarnessError::from)?;
 
-    let signer_set = config.signing_participants.clone();
-
-    Ok(HarnessReport {
-        group_public_key: public_key_bytes,
-        signature: signature_bytes,
-        signer_set,
-    })
-}
-
-fn identifier_from_u16(participant: u16) -> Result<frost::Identifier, HarnessError> {
-    participant
-        .try_into()
-        .map_err(|_| HarnessError::InvalidConfig("participant id must be in range"))
-}
-
-fn parse_signing_participants(
-    config: &HarnessConfig,
-) -> Result<Vec<frost::Identifier>, HarnessError> {
-    config
-        .signing_participants
-        .iter()
-        .copied()
-        .map(identifier_from_u16)
-        .collect()
+    Ok((public_key_bytes, signature_bytes))
 }
 
 fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
@@ -254,7 +363,10 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_dkg_signing_harness, run_dkg_signing_with_config, HarnessConfig, HarnessError};
+    use super::{
+        run_dkg_signing_harness, run_dkg_signing_with_config, run_share_refresh_harness,
+        HarnessConfig, HarnessError,
+    };
     use solana_signature::Signature as SolanaSignature;
 
     #[test]
@@ -357,5 +469,15 @@ mod tests {
             error,
             HarnessError::InvalidConfig("signing participant out of DKG range")
         ));
+    }
+
+    #[test]
+    fn share_refresh_harness_preserves_group_key_and_signature_compatibility() {
+        let message = b"vaulkyrie refresh harness";
+        let report = run_share_refresh_harness(message).expect("refresh harness should succeed");
+        let solana_signature = SolanaSignature::from(report.signature);
+
+        assert_eq!(report.original_group_public_key, report.refreshed_group_public_key);
+        assert!(solana_signature.verify(&report.refreshed_group_public_key, message));
     }
 }
