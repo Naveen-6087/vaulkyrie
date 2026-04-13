@@ -341,6 +341,7 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::SessionMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::SessionNotPending => ProgramError::AccountAlreadyInitialized,
         transition::TransitionError::SessionNotReady => ProgramError::InvalidAccountData,
+        transition::TransitionError::AuthorityNoOp => ProgramError::InvalidArgument,
         transition::TransitionError::AuthoritySequenceMismatch => ProgramError::InvalidArgument,
     }
 }
@@ -551,6 +552,30 @@ mod tests {
             },
         )
         .expect_err("mismatched vault and authority should fail");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn rotate_authority_rejects_no_op_hash() {
+        let mut vault_bytes = [0; VaultRegistry::LEN];
+        let mut authority_bytes = [0; QuantumAuthorityState::LEN];
+        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Active, 8);
+        let initial = QuantumAuthorityState::new([7; 32], 1);
+        assert!(vault.encode(&mut vault_bytes));
+        assert!(initial.encode(&mut authority_bytes));
+
+        let error = process_rotate_authority_data(
+            &mut vault_bytes,
+            &mut authority_bytes,
+            &vaulkyrie_protocol::AuthorityRotationStatement {
+                action_hash: sample_action_hash(),
+                next_authority_hash: [7; 32],
+                sequence: 0,
+                expiry_slot: 200,
+            },
+        )
+        .expect_err("no-op authority rotation should fail");
 
         assert_eq!(error, ProgramError::InvalidArgument);
     }

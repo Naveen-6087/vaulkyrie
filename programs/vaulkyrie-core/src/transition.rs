@@ -15,6 +15,7 @@ pub enum TransitionError {
     SessionMismatch,
     SessionNotPending,
     SessionNotReady,
+    AuthorityNoOp,
     AuthoritySequenceMismatch,
 }
 
@@ -176,6 +177,10 @@ pub fn apply_authority_rotation(
     state: &mut QuantumAuthorityState,
     statement: &AuthorityRotationStatement,
 ) -> Result<(), TransitionError> {
+    if state.current_authority_hash == statement.next_authority_hash {
+        return Err(TransitionError::AuthorityNoOp);
+    }
+
     if state.next_sequence != statement.sequence {
         return Err(TransitionError::AuthoritySequenceMismatch);
     }
@@ -590,6 +595,22 @@ mod tests {
             .expect_err("stale sequence should be rejected");
 
         assert_eq!(error, TransitionError::AuthoritySequenceMismatch);
+    }
+
+    #[test]
+    fn authority_rotation_rejects_no_op_hash() {
+        let mut state = QuantumAuthorityState::new([3; 32], 1);
+        let statement = vaulkyrie_protocol::AuthorityRotationStatement {
+            action_hash: sample_action_hash(),
+            next_authority_hash: [3; 32],
+            sequence: 0,
+            expiry_slot: 100,
+        };
+
+        let error = apply_authority_rotation(&mut state, &statement)
+            .expect_err("reusing the same authority hash should fail");
+
+        assert_eq!(error, TransitionError::AuthorityNoOp);
     }
 
     #[test]
