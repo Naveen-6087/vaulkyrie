@@ -1,6 +1,9 @@
 use vaulkyrie_protocol::{AuthorityRotationStatement, PolicyReceipt};
 
-use crate::state::{PolicyReceiptState, QuantumAuthorityState, VaultRegistry, VaultStatus};
+use crate::state::{
+    ActionSessionState, PolicyReceiptState, QuantumAuthorityState, SessionStatus, VaultRegistry,
+    VaultStatus,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionError {
@@ -33,6 +36,15 @@ pub fn stage_policy_receipt(receipt: &PolicyReceipt) -> PolicyReceiptState {
     )
 }
 
+pub fn open_action_session(receipt: &PolicyReceipt) -> ActionSessionState {
+    ActionSessionState::new(
+        receipt.commitment(),
+        receipt.action_hash,
+        receipt.expiry_slot,
+        receipt.threshold.as_byte(),
+    )
+}
+
 pub fn consume_policy_receipt(
     state: &mut PolicyReceiptState,
     receipt: &PolicyReceipt,
@@ -47,6 +59,10 @@ pub fn consume_policy_receipt(
 
     state.consumed = 1;
     Ok(())
+}
+
+pub fn mark_action_session_ready(state: &mut ActionSessionState) {
+    state.status = SessionStatus::Ready as u8;
 }
 
 pub fn apply_authority_rotation(
@@ -69,10 +85,10 @@ mod tests {
     use vaulkyrie_protocol::{ActionDescriptor, ActionKind, ThresholdRequirement};
 
     use super::{
-        apply_authority_rotation, consume_policy_receipt, initialize_vault, stage_policy_receipt,
-        TransitionError,
+        apply_authority_rotation, consume_policy_receipt, initialize_vault,
+        mark_action_session_ready, open_action_session, stage_policy_receipt, TransitionError,
     };
-    use crate::state::QuantumAuthorityState;
+    use crate::state::{QuantumAuthorityState, SessionStatus};
 
     fn sample_action_hash() -> [u8; 32] {
         ActionDescriptor {
@@ -126,6 +142,44 @@ mod tests {
             consume_policy_receipt(&mut state, &receipt).expect_err("second consume should fail");
 
         assert_eq!(error, TransitionError::ReceiptAlreadyConsumed);
+    }
+
+    #[test]
+    fn opening_action_session_copies_receipt_constraints() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+
+        let session = open_action_session(&receipt);
+
+        assert_eq!(session.receipt_commitment, receipt.commitment());
+        assert_eq!(session.action_hash, receipt.action_hash);
+        assert_eq!(session.expiry_slot, receipt.expiry_slot);
+        assert_eq!(
+            session.threshold,
+            ThresholdRequirement::TwoOfThree.as_byte()
+        );
+        assert_eq!(session.status, SessionStatus::Pending as u8);
+    }
+
+    #[test]
+    fn marking_action_session_ready_updates_status() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+        let mut session = open_action_session(&receipt);
+
+        mark_action_session_ready(&mut session);
+
+        assert_eq!(session.status, SessionStatus::Ready as u8);
     }
 
     #[test]

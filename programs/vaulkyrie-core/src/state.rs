@@ -2,6 +2,7 @@ use core::mem::size_of;
 
 pub const VAULT_REGISTRY_DISCRIMINATOR: [u8; 8] = *b"VAULKYR1";
 pub const POLICY_RECEIPT_DISCRIMINATOR: [u8; 8] = *b"POLRCPT1";
+pub const ACTION_SESSION_DISCRIMINATOR: [u8; 8] = *b"SESSION1";
 pub const QUANTUM_STATE_DISCRIMINATOR: [u8; 8] = *b"QSTATE01";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,6 +11,14 @@ pub enum VaultStatus {
     Active = 1,
     Recovery = 2,
     Locked = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SessionStatus {
+    Pending = 1,
+    Ready = 2,
+    Consumed = 3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +187,86 @@ impl PolicyReceiptState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
+pub struct ActionSessionState {
+    pub discriminator: [u8; 8],
+    pub receipt_commitment: [u8; 32],
+    pub action_hash: [u8; 32],
+    pub expiry_slot: u64,
+    pub threshold: u8,
+    pub status: u8,
+    pub reserved: [u8; 14],
+}
+
+impl ActionSessionState {
+    pub const LEN: usize = size_of::<Self>();
+
+    pub const fn new(
+        receipt_commitment: [u8; 32],
+        action_hash: [u8; 32],
+        expiry_slot: u64,
+        threshold: u8,
+    ) -> Self {
+        Self {
+            discriminator: ACTION_SESSION_DISCRIMINATOR,
+            receipt_commitment,
+            action_hash,
+            expiry_slot,
+            threshold,
+            status: SessionStatus::Pending as u8,
+            reserved: [0; 14],
+        }
+    }
+
+    pub fn encode(self, dst: &mut [u8]) -> bool {
+        if dst.len() != Self::LEN {
+            return false;
+        }
+
+        dst[..8].copy_from_slice(&self.discriminator);
+        dst[8..40].copy_from_slice(&self.receipt_commitment);
+        dst[40..72].copy_from_slice(&self.action_hash);
+        dst[72..80].copy_from_slice(&self.expiry_slot.to_le_bytes());
+        dst[80] = self.threshold;
+        dst[81] = self.status;
+        dst[82..96].copy_from_slice(&self.reserved);
+
+        true
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::LEN {
+            return None;
+        }
+
+        let mut discriminator = [0; 8];
+        discriminator.copy_from_slice(&src[..8]);
+
+        let mut receipt_commitment = [0; 32];
+        receipt_commitment.copy_from_slice(&src[8..40]);
+
+        let mut action_hash = [0; 32];
+        action_hash.copy_from_slice(&src[40..72]);
+
+        let mut expiry_slot = [0; 8];
+        expiry_slot.copy_from_slice(&src[72..80]);
+
+        let mut reserved = [0; 14];
+        reserved.copy_from_slice(&src[82..96]);
+
+        Some(Self {
+            discriminator,
+            receipt_commitment,
+            action_hash,
+            expiry_slot: u64::from_le_bytes(expiry_slot),
+            threshold: src[80],
+            status: src[81],
+            reserved,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub struct QuantumAuthorityState {
     pub discriminator: [u8; 8],
     pub current_authority_hash: [u8; 32],
@@ -250,8 +339,9 @@ impl QuantumAuthorityState {
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyReceiptState, QuantumAuthorityState, VaultRegistry, VaultStatus,
-        POLICY_RECEIPT_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
+        ActionSessionState, PolicyReceiptState, QuantumAuthorityState, SessionStatus, VaultRegistry,
+        VaultStatus, ACTION_SESSION_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR,
+        QUANTUM_STATE_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
     };
 
     #[test]
@@ -306,5 +396,17 @@ mod tests {
 
         assert!(state.encode(&mut bytes));
         assert_eq!(QuantumAuthorityState::decode(&bytes), Some(state));
+    }
+
+    #[test]
+    fn action_session_roundtrips_through_bytes() {
+        let state = ActionSessionState::new([6; 32], [7; 32], 99, 2);
+        let mut bytes = [0; ActionSessionState::LEN];
+
+        assert!(state.encode(&mut bytes));
+        assert_eq!(ActionSessionState::decode(&bytes), Some(state));
+        assert_eq!(state.discriminator, ACTION_SESSION_DISCRIMINATOR);
+        assert_eq!(state.status, SessionStatus::Pending as u8);
+        assert_eq!(ActionSessionState::LEN, 96);
     }
 }

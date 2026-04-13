@@ -3,7 +3,7 @@ use vaulkyrie_protocol::{AuthorityRotationStatement, PolicyReceipt};
 
 use crate::{
     instruction::{CoreInstruction, InitVaultArgs},
-    state::{PolicyReceiptState, QuantumAuthorityState, VaultRegistry},
+    state::{ActionSessionState, PolicyReceiptState, QuantumAuthorityState, VaultRegistry},
     transition,
 };
 
@@ -34,6 +34,13 @@ pub fn process(
             require_program_owner(program_id, account)?;
             let mut data = account.try_borrow_mut_data()?;
             process_consume_receipt_data(&mut data, &receipt)
+        }
+        CoreInstruction::OpenSession(receipt) => {
+            let account = get_account_info!(accounts, 0);
+            require_writable(account)?;
+            require_program_owner(program_id, account)?;
+            let mut data = account.try_borrow_mut_data()?;
+            process_open_session_data(&mut data, &receipt)
         }
         CoreInstruction::RotateAuthority(statement) => {
             let account = get_account_info!(accounts, 0);
@@ -99,6 +106,22 @@ pub fn process_consume_receipt_data(dst: &mut [u8], receipt: &PolicyReceipt) -> 
     Ok(())
 }
 
+pub fn process_open_session_data(dst: &mut [u8], receipt: &PolicyReceipt) -> ProgramResult {
+    if dst.len() != ActionSessionState::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    if !is_zeroed(dst) {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+
+    let state = transition::open_action_session(receipt);
+    if !state.encode(dst) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Ok(())
+}
+
 pub fn process_rotate_authority_data(
     dst: &mut [u8],
     statement: &AuthorityRotationStatement,
@@ -155,12 +178,12 @@ mod tests {
     use vaulkyrie_protocol::{ActionDescriptor, ActionKind, PolicyReceipt, ThresholdRequirement};
 
     use super::{
-        process_consume_receipt_data, process_init_vault_data, process_rotate_authority_data,
-        process_stage_receipt_data,
+        process_consume_receipt_data, process_init_vault_data, process_open_session_data,
+        process_rotate_authority_data, process_stage_receipt_data,
     };
     use crate::{
         instruction::InitVaultArgs,
-        state::{PolicyReceiptState, QuantumAuthorityState, VaultRegistry},
+        state::{ActionSessionState, PolicyReceiptState, QuantumAuthorityState, SessionStatus, VaultRegistry},
     };
 
     fn sample_action_hash() -> [u8; 32] {
@@ -255,5 +278,22 @@ mod tests {
         let state = QuantumAuthorityState::decode(&bytes).expect("state should decode");
         assert_eq!(state.current_authority_hash, [8; 32]);
         assert_eq!(state.next_sequence, 1);
+    }
+
+    #[test]
+    fn open_session_writes_encoded_state() {
+        let receipt = sample_receipt();
+        let mut bytes = [0; ActionSessionState::LEN];
+
+        process_open_session_data(&mut bytes, &receipt).expect("open session should succeed");
+
+        let state = ActionSessionState::decode(&bytes).expect("state should decode");
+        assert_eq!(state.receipt_commitment, receipt.commitment());
+        assert_eq!(state.action_hash, receipt.action_hash);
+        assert_eq!(
+            state.threshold,
+            ThresholdRequirement::TwoOfThree.as_byte()
+        );
+        assert_eq!(state.status, SessionStatus::Pending as u8);
     }
 }
