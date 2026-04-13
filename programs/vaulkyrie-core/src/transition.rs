@@ -25,6 +25,7 @@ pub enum TransitionError {
     SessionRequiresPqc,
     AuthorityNoOp,
     AuthoritySequenceMismatch,
+    AuthorityActionMismatch,
 }
 
 pub fn initialize_vault(
@@ -294,11 +295,23 @@ pub fn rotate_vault_authority(
     current_slot: u64,
 ) -> Result<(), TransitionError> {
     validate_vault_recovery_mode(vault)?;
+    validate_authority_action_binding(vault, statement)?;
     validate_vault_authority_alignment(vault, authority)?;
     apply_authority_rotation(authority, statement, current_slot)?;
     vault.current_authority_hash = authority.current_authority_hash;
 
     Ok(())
+}
+
+pub fn validate_authority_action_binding(
+    vault: &VaultRegistry,
+    statement: &AuthorityRotationStatement,
+) -> Result<(), TransitionError> {
+    if statement.is_action_bound(vault.wallet_pubkey, vault.policy_version) {
+        Ok(())
+    } else {
+        Err(TransitionError::AuthorityActionMismatch)
+    }
 }
 
 pub fn validate_vault_for_session(
@@ -324,12 +337,15 @@ fn validate_spend_threshold(threshold: u8) -> Result<(), TransitionError> {
 
 #[cfg(test)]
 mod tests {
-    use vaulkyrie_protocol::{ActionDescriptor, ActionKind, ThresholdRequirement};
+    use vaulkyrie_protocol::{
+        ActionDescriptor, ActionKind, AuthorityRotationStatement, ThresholdRequirement,
+    };
 
     use super::{
         apply_authority_rotation, consume_action_session, consume_policy_receipt,
         finalize_action_session, initialize_quantum_authority, initialize_vault, parse_vault_status,
         mark_action_session_ready, rotate_vault_authority, validate_vault_authority_alignment,
+        validate_authority_action_binding,
         validate_vault_active, validate_vault_for_receipt, validate_vault_for_session,
         validate_vault_recovery_mode,
         open_action_session, open_action_session_from_receipt, stage_policy_receipt, update_vault_status,
@@ -345,6 +361,23 @@ mod tests {
             kind: ActionKind::Spend,
         }
         .hash()
+    }
+
+    fn sample_rotation_statement(
+        vault_wallet: [u8; 32],
+        policy_version: u64,
+        next_authority_hash: [u8; 32],
+        sequence: u64,
+        expiry_slot: u64,
+    ) -> AuthorityRotationStatement {
+        let mut statement = AuthorityRotationStatement {
+            action_hash: [0; 32],
+            next_authority_hash,
+            sequence,
+            expiry_slot,
+        };
+        statement.action_hash = statement.expected_action_hash(vault_wallet, policy_version);
+        statement
     }
 
     #[test]
@@ -982,12 +1015,7 @@ mod tests {
         let mut vault = initialize_vault([1; 32], [3; 32], 9, 4);
         vault.status = VaultStatus::Recovery as u8;
         let mut authority = initialize_quantum_authority([3; 32], 1);
-        let statement = vaulkyrie_protocol::AuthorityRotationStatement {
-            action_hash: sample_action_hash(),
-            next_authority_hash: [4; 32],
-            sequence: 0,
-            expiry_slot: 100,
-        };
+        let statement = sample_rotation_statement(vault.wallet_pubkey, vault.policy_version, [4; 32], 0, 100);
 
         rotate_vault_authority(&mut vault, &mut authority, &statement, 10)
             .expect("aligned authority should rotate");
@@ -1001,7 +1029,20 @@ mod tests {
     fn rotate_vault_authority_rejects_active_vault() {
         let mut vault = initialize_vault([1; 32], [3; 32], 9, 4);
         let mut authority = initialize_quantum_authority([3; 32], 1);
-        let statement = vaulkyrie_protocol::AuthorityRotationStatement {
+        let statement = sample_rotation_statement(vault.wallet_pubkey, vault.policy_version, [4; 32], 0, 100);
+
+        let error = rotate_vault_authority(&mut vault, &mut authority, &statement, 10)
+            .expect_err("active vault should not allow authority rotation");
+
+        assert_eq!(error, TransitionError::VaultNotRecovery);
+    }
+
+    #[test]
+    fn rotate_vault_authority_rejects_unbound_action_hash() {
+        let mut vault = initialize_vault([1; 32], [3; 32], 9, 4);
+        vault.status = VaultStatus::Recovery as u8;
+        let mut authority = initialize_quantum_authority([3; 32], 1);
+        let statement = AuthorityRotationStatement {
             action_hash: sample_action_hash(),
             next_authority_hash: [4; 32],
             sequence: 0,
@@ -1009,9 +1050,18 @@ mod tests {
         };
 
         let error = rotate_vault_authority(&mut vault, &mut authority, &statement, 10)
-            .expect_err("active vault should not allow authority rotation");
+            .expect_err("rotation must require rekey-bound action hash");
 
-        assert_eq!(error, TransitionError::VaultNotRecovery);
+        assert_eq!(error, TransitionError::AuthorityActionMismatch);
+    }
+
+    #[test]
+    fn validate_authority_action_binding_accepts_rekey_bound_hash() {
+        let vault = initialize_vault([1; 32], [3; 32], 9, 4);
+        let statement = sample_rotation_statement(vault.wallet_pubkey, vault.policy_version, [4; 32], 0, 100);
+
+        validate_authority_action_binding(&vault, &statement)
+            .expect("rekey-bound action hash should pass");
     }
 
     #[test]

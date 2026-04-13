@@ -548,6 +548,7 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::SessionRequiresPqc => ProgramError::InvalidArgument,
         transition::TransitionError::AuthorityNoOp => ProgramError::InvalidArgument,
         transition::TransitionError::AuthoritySequenceMismatch => ProgramError::InvalidArgument,
+        transition::TransitionError::AuthorityActionMismatch => ProgramError::InvalidArgument,
     }
 }
 
@@ -588,6 +589,22 @@ mod tests {
             nonce: 9,
             expiry_slot: 100,
         }
+    }
+
+    fn sample_rotation_statement(
+        vault: &VaultRegistry,
+        next_authority_hash: [u8; 32],
+        sequence: u64,
+        expiry_slot: u64,
+    ) -> vaulkyrie_protocol::AuthorityRotationStatement {
+        let mut statement = vaulkyrie_protocol::AuthorityRotationStatement {
+            action_hash: [0; 32],
+            next_authority_hash,
+            sequence,
+            expiry_slot,
+        };
+        statement.action_hash = statement.expected_action_hash(vault.wallet_pubkey, vault.policy_version);
+        statement
     }
 
     #[test]
@@ -794,16 +811,12 @@ mod tests {
         let initial = QuantumAuthorityState::new([7; 32], 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut bytes));
+        let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
 
         process_rotate_authority_data(
             &mut vault_bytes,
             &mut bytes,
-            &vaulkyrie_protocol::AuthorityRotationStatement {
-                action_hash: sample_action_hash(),
-                next_authority_hash: [8; 32],
-                sequence: 0,
-                expiry_slot: 200,
-            },
+            &statement,
             10,
         )
         .expect("rotation should succeed");
@@ -823,16 +836,12 @@ mod tests {
         let initial = QuantumAuthorityState::new([9; 32], 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
+        let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
 
         let error = process_rotate_authority_data(
             &mut vault_bytes,
             &mut authority_bytes,
-            &vaulkyrie_protocol::AuthorityRotationStatement {
-                action_hash: sample_action_hash(),
-                next_authority_hash: [8; 32],
-                sequence: 0,
-                expiry_slot: 200,
-            },
+            &statement,
             10,
         )
         .expect_err("mismatched vault and authority should fail");
@@ -848,16 +857,12 @@ mod tests {
         let initial = QuantumAuthorityState::new([7; 32], 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
+        let statement = sample_rotation_statement(&vault, [7; 32], 0, 200);
 
         let error = process_rotate_authority_data(
             &mut vault_bytes,
             &mut authority_bytes,
-            &vaulkyrie_protocol::AuthorityRotationStatement {
-                action_hash: sample_action_hash(),
-                next_authority_hash: [7; 32],
-                sequence: 0,
-                expiry_slot: 200,
-            },
+            &statement,
             10,
         )
         .expect_err("no-op authority rotation should fail");
@@ -873,16 +878,12 @@ mod tests {
         let initial = QuantumAuthorityState::new([7; 32], 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
+        let statement = sample_rotation_statement(&vault, [8; 32], 0, 9);
 
         let error = process_rotate_authority_data(
             &mut vault_bytes,
             &mut authority_bytes,
-            &vaulkyrie_protocol::AuthorityRotationStatement {
-                action_hash: sample_action_hash(),
-                next_authority_hash: [8; 32],
-                sequence: 0,
-                expiry_slot: 9,
-            },
+            &statement,
             10,
         )
         .expect_err("expired authority statement should fail");
@@ -898,21 +899,43 @@ mod tests {
         let initial = QuantumAuthorityState::new([7; 32], 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
+        let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
 
         let error = process_rotate_authority_data(
             &mut vault_bytes,
             &mut authority_bytes,
-            &vaulkyrie_protocol::AuthorityRotationStatement {
-                action_hash: sample_action_hash(),
-                next_authority_hash: [8; 32],
-                sequence: 0,
-                expiry_slot: 200,
-            },
+            &statement,
             10,
         )
         .expect_err("active vault should fail recovery-mode rotation");
 
         assert_eq!(error, ProgramError::InvalidAccountData);
+    }
+
+    #[test]
+    fn rotate_authority_rejects_unbound_action_hash() {
+        let mut vault_bytes = [0; VaultRegistry::LEN];
+        let mut authority_bytes = [0; QuantumAuthorityState::LEN];
+        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Recovery, 8);
+        let initial = QuantumAuthorityState::new([7; 32], 1);
+        assert!(vault.encode(&mut vault_bytes));
+        assert!(initial.encode(&mut authority_bytes));
+        let statement = vaulkyrie_protocol::AuthorityRotationStatement {
+            action_hash: sample_action_hash(),
+            next_authority_hash: [8; 32],
+            sequence: 0,
+            expiry_slot: 200,
+        };
+
+        let error = process_rotate_authority_data(
+            &mut vault_bytes,
+            &mut authority_bytes,
+            &statement,
+            10,
+        )
+        .expect_err("rotation should require rekey-bound action hash");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
     }
 
     #[test]

@@ -97,6 +97,29 @@ pub struct AuthorityRotationStatement {
 }
 
 impl AuthorityRotationStatement {
+    pub fn payload_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.next_authority_hash);
+        hasher.update(self.sequence.to_le_bytes());
+        hasher.update(self.expiry_slot.to_le_bytes());
+
+        hasher.finalize().into()
+    }
+
+    pub fn expected_action_hash(&self, vault_id: [u8; 32], policy_version: u64) -> [u8; 32] {
+        ActionDescriptor {
+            vault_id,
+            payload_hash: self.payload_hash(),
+            policy_version,
+            kind: ActionKind::Rekey,
+        }
+        .hash()
+    }
+
+    pub fn is_action_bound(&self, vault_id: [u8; 32], policy_version: u64) -> bool {
+        self.action_hash == self.expected_action_hash(vault_id, policy_version)
+    }
+
     pub fn digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(self.action_hash);
@@ -166,17 +189,45 @@ mod tests {
 
     #[test]
     fn authority_rotation_digest_changes_with_next_authority() {
-        let statement = AuthorityRotationStatement {
-            action_hash: descriptor(ActionKind::Rekey).hash(),
+        let mut statement = AuthorityRotationStatement {
+            action_hash: [0; 32],
             next_authority_hash: [1; 32],
             sequence: 1,
             expiry_slot: 700,
         };
+        statement.action_hash = statement.expected_action_hash([7; 32], 42);
 
         let mut changed = statement.clone();
         changed.next_authority_hash = [2; 32];
+        changed.action_hash = changed.expected_action_hash([7; 32], 42);
 
         assert_ne!(statement.digest(), changed.digest());
+    }
+
+    #[test]
+    fn authority_rotation_binding_accepts_expected_action_hash() {
+        let mut statement = AuthorityRotationStatement {
+            action_hash: [0; 32],
+            next_authority_hash: [3; 32],
+            sequence: 4,
+            expiry_slot: 900,
+        };
+        statement.action_hash = statement.expected_action_hash([7; 32], 42);
+
+        assert!(statement.is_action_bound([7; 32], 42));
+    }
+
+    #[test]
+    fn authority_rotation_binding_rejects_wrong_policy_version() {
+        let mut statement = AuthorityRotationStatement {
+            action_hash: [0; 32],
+            next_authority_hash: [3; 32],
+            sequence: 4,
+            expiry_slot: 900,
+        };
+        statement.action_hash = statement.expected_action_hash([7; 32], 42);
+
+        assert!(!statement.is_action_bound([7; 32], 43));
     }
 
     #[test]
