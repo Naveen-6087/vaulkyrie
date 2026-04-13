@@ -65,6 +65,19 @@ pub fn process(
             let mut data = account.try_borrow_mut_data()?;
             process_consume_session_data(&mut data, action_hash)
         }
+        CoreInstruction::FinalizeSession(receipt) => {
+            let receipt_account = get_account_info!(accounts, 0);
+            require_writable(receipt_account)?;
+            require_program_owner(program_id, receipt_account)?;
+            let mut receipt_data = receipt_account.try_borrow_mut_data()?;
+
+            let session_account = get_account_info!(accounts, 1);
+            require_writable(session_account)?;
+            require_program_owner(program_id, session_account)?;
+            let mut session_data = session_account.try_borrow_mut_data()?;
+
+            process_finalize_session_data(&mut receipt_data, &mut session_data, &receipt)
+        }
         CoreInstruction::RotateAuthority(statement) => {
             let account = get_account_info!(accounts, 0);
             require_writable(account)?;
@@ -191,6 +204,34 @@ pub fn process_consume_session_data(dst: &mut [u8], action_hash: [u8; 32]) -> Pr
     Ok(())
 }
 
+pub fn process_finalize_session_data(
+    receipt_dst: &mut [u8],
+    session_dst: &mut [u8],
+    receipt: &PolicyReceipt,
+) -> ProgramResult {
+    if receipt_dst.len() != PolicyReceiptState::LEN || session_dst.len() != ActionSessionState::LEN
+    {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let mut receipt_state =
+        PolicyReceiptState::decode(receipt_dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&receipt_state.discriminator, &POLICY_RECEIPT_DISCRIMINATOR)?;
+
+    let mut session_state =
+        ActionSessionState::decode(session_dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&session_state.discriminator, &ACTION_SESSION_DISCRIMINATOR)?;
+
+    transition::finalize_action_session(&mut session_state, &mut receipt_state, receipt)
+        .map_err(map_transition_error)?;
+
+    if !receipt_state.encode(receipt_dst) || !session_state.encode(session_dst) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Ok(())
+}
+
 pub fn process_rotate_authority_data(
     dst: &mut [u8],
     statement: &AuthorityRotationStatement,
@@ -260,8 +301,8 @@ mod tests {
 
     use super::{
         process_activate_session_data, process_consume_receipt_data, process_consume_session_data,
-        process_init_vault_data, process_open_session_data, process_rotate_authority_data,
-        process_stage_receipt_data,
+        process_finalize_session_data, process_init_vault_data, process_open_session_data,
+        process_rotate_authority_data, process_stage_receipt_data,
     };
     use crate::{
         instruction::InitVaultArgs,
@@ -486,6 +527,53 @@ mod tests {
             .expect("open session should succeed");
         let error = process_consume_session_data(&mut session_bytes, receipt.action_hash)
             .expect_err("pending session should not be consumable");
+
+        assert_eq!(error, ProgramError::InvalidAccountData);
+    }
+
+    #[test]
+    fn finalize_session_consumes_receipt_and_session() {
+        let receipt = sample_receipt();
+        let staged = PolicyReceiptState::new(
+            receipt.commitment(),
+            receipt.action_hash,
+            receipt.nonce,
+            receipt.expiry_slot,
+        );
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
+        let mut session_bytes = [0; ActionSessionState::LEN];
+
+        assert!(staged.encode(&mut receipt_bytes));
+        process_open_session_data(&receipt_bytes, &mut session_bytes, &receipt)
+            .expect("open session should succeed");
+        process_activate_session_data(&mut session_bytes, receipt.action_hash)
+            .expect("activate session should succeed");
+        process_finalize_session_data(&mut receipt_bytes, &mut session_bytes, &receipt)
+            .expect("finalize session should succeed");
+
+        let receipt_state = PolicyReceiptState::decode(&receipt_bytes).expect("receipt should decode");
+        let session_state = ActionSessionState::decode(&session_bytes).expect("session should decode");
+        assert_eq!(receipt_state.consumed, 1);
+        assert_eq!(session_state.status, SessionStatus::Consumed as u8);
+    }
+
+    #[test]
+    fn finalize_session_rejects_pending_session() {
+        let receipt = sample_receipt();
+        let staged = PolicyReceiptState::new(
+            receipt.commitment(),
+            receipt.action_hash,
+            receipt.nonce,
+            receipt.expiry_slot,
+        );
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
+        let mut session_bytes = [0; ActionSessionState::LEN];
+
+        assert!(staged.encode(&mut receipt_bytes));
+        process_open_session_data(&receipt_bytes, &mut session_bytes, &receipt)
+            .expect("open session should succeed");
+        let error = process_finalize_session_data(&mut receipt_bytes, &mut session_bytes, &receipt)
+            .expect_err("pending session should not finalize");
 
         assert_eq!(error, ProgramError::InvalidAccountData);
     }

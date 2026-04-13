@@ -115,6 +115,27 @@ pub fn consume_action_session(
     Ok(())
 }
 
+pub fn finalize_action_session(
+    session: &mut ActionSessionState,
+    receipt_state: &mut PolicyReceiptState,
+    receipt: &PolicyReceipt,
+) -> Result<(), TransitionError> {
+    if session.action_hash != receipt.action_hash
+        || session.receipt_commitment != receipt.commitment()
+    {
+        return Err(TransitionError::SessionMismatch);
+    }
+
+    if session.status != SessionStatus::Ready as u8 {
+        return Err(TransitionError::SessionNotReady);
+    }
+
+    consume_policy_receipt(receipt_state, receipt)?;
+    session.status = SessionStatus::Consumed as u8;
+
+    Ok(())
+}
+
 pub fn apply_authority_rotation(
     state: &mut QuantumAuthorityState,
     statement: &AuthorityRotationStatement,
@@ -135,9 +156,10 @@ mod tests {
     use vaulkyrie_protocol::{ActionDescriptor, ActionKind, ThresholdRequirement};
 
     use super::{
-        apply_authority_rotation, consume_action_session, consume_policy_receipt, initialize_vault,
-        mark_action_session_ready, open_action_session, open_action_session_from_receipt,
-        stage_policy_receipt, TransitionError,
+        apply_authority_rotation, consume_action_session, consume_policy_receipt,
+        finalize_action_session, initialize_vault, mark_action_session_ready,
+        open_action_session, open_action_session_from_receipt, stage_policy_receipt,
+        TransitionError,
     };
     use crate::state::{QuantumAuthorityState, SessionStatus};
 
@@ -360,6 +382,51 @@ mod tests {
             .expect_err("pending session should not be consumable");
 
         assert_eq!(error, TransitionError::SessionNotReady);
+    }
+
+    #[test]
+    fn finalizing_action_session_consumes_session_and_receipt() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+        let mut session = open_action_session(&receipt);
+        let mut staged = stage_policy_receipt(&receipt);
+        mark_action_session_ready(&mut session, receipt.action_hash)
+            .expect("matching action hash should mark session ready");
+
+        finalize_action_session(&mut session, &mut staged, &receipt)
+            .expect("ready session should finalize against staged receipt");
+
+        assert_eq!(session.status, SessionStatus::Consumed as u8);
+        assert_eq!(staged.consumed, 1);
+    }
+
+    #[test]
+    fn finalizing_action_session_rejects_mismatched_receipt() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+        let mut session = open_action_session(&receipt);
+        let mut staged = stage_policy_receipt(&receipt);
+        let mismatched = vaulkyrie_protocol::PolicyReceipt {
+            nonce: 77,
+            ..receipt
+        };
+        mark_action_session_ready(&mut session, receipt.action_hash)
+            .expect("matching action hash should mark session ready");
+
+        let error = finalize_action_session(&mut session, &mut staged, &mismatched)
+            .expect_err("mismatched receipt should be rejected");
+
+        assert_eq!(error, TransitionError::SessionMismatch);
     }
 
     #[test]
