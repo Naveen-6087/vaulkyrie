@@ -11,6 +11,7 @@ pub enum TransitionError {
     ReceiptMismatch,
     SessionMismatch,
     SessionNotPending,
+    SessionNotReady,
     AuthoritySequenceMismatch,
 }
 
@@ -98,6 +99,22 @@ pub fn mark_action_session_ready(
     Ok(())
 }
 
+pub fn consume_action_session(
+    state: &mut ActionSessionState,
+    action_hash: [u8; 32],
+) -> Result<(), TransitionError> {
+    if state.action_hash != action_hash {
+        return Err(TransitionError::SessionMismatch);
+    }
+
+    if state.status != SessionStatus::Ready as u8 {
+        return Err(TransitionError::SessionNotReady);
+    }
+
+    state.status = SessionStatus::Consumed as u8;
+    Ok(())
+}
+
 pub fn apply_authority_rotation(
     state: &mut QuantumAuthorityState,
     statement: &AuthorityRotationStatement,
@@ -118,7 +135,7 @@ mod tests {
     use vaulkyrie_protocol::{ActionDescriptor, ActionKind, ThresholdRequirement};
 
     use super::{
-        apply_authority_rotation, consume_policy_receipt, initialize_vault,
+        apply_authority_rotation, consume_action_session, consume_policy_receipt, initialize_vault,
         mark_action_session_ready, open_action_session, open_action_session_from_receipt,
         stage_policy_receipt, TransitionError,
     };
@@ -307,6 +324,42 @@ mod tests {
             .expect_err("ready session should not transition twice");
 
         assert_eq!(error, TransitionError::SessionNotPending);
+    }
+
+    #[test]
+    fn consuming_ready_action_session_updates_status() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+        let mut session = open_action_session(&receipt);
+        mark_action_session_ready(&mut session, receipt.action_hash)
+            .expect("matching action hash should mark session ready");
+
+        consume_action_session(&mut session, receipt.action_hash)
+            .expect("ready session should be consumable");
+
+        assert_eq!(session.status, SessionStatus::Consumed as u8);
+    }
+
+    #[test]
+    fn consuming_pending_action_session_rejects_transition() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+        let mut session = open_action_session(&receipt);
+
+        let error = consume_action_session(&mut session, receipt.action_hash)
+            .expect_err("pending session should not be consumable");
+
+        assert_eq!(error, TransitionError::SessionNotReady);
     }
 
     #[test]
