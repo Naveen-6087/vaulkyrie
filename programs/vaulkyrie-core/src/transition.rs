@@ -30,6 +30,13 @@ pub fn initialize_vault(
     )
 }
 
+pub fn initialize_quantum_authority(
+    current_authority_hash: [u8; 32],
+    bump: u8,
+) -> QuantumAuthorityState {
+    QuantumAuthorityState::new(current_authority_hash, bump)
+}
+
 pub fn stage_policy_receipt(receipt: &PolicyReceipt) -> PolicyReceiptState {
     PolicyReceiptState::new(
         receipt.commitment(),
@@ -157,7 +164,8 @@ mod tests {
 
     use super::{
         apply_authority_rotation, consume_action_session, consume_policy_receipt,
-        finalize_action_session, initialize_vault, mark_action_session_ready,
+        finalize_action_session, initialize_quantum_authority, initialize_vault,
+        mark_action_session_ready,
         open_action_session, open_action_session_from_receipt, stage_policy_receipt,
         TransitionError,
     };
@@ -181,6 +189,15 @@ mod tests {
         assert_eq!(vault.current_authority_hash, [2; 32]);
         assert_eq!(vault.policy_version, 3);
         assert_eq!(vault.status, 1);
+    }
+
+    #[test]
+    fn initialize_quantum_authority_sets_sequence_zero() {
+        let state = initialize_quantum_authority([8; 32], 6);
+
+        assert_eq!(state.current_authority_hash, [8; 32]);
+        assert_eq!(state.bump, 6);
+        assert_eq!(state.next_sequence, 0);
     }
 
     #[test]

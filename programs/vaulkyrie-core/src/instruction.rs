@@ -9,10 +9,17 @@ pub struct InitVaultArgs {
     pub bump: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitAuthorityArgs {
+    pub current_authority_hash: [u8; 32],
+    pub bump: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreInstruction {
     Ping,
     InitVault(InitVaultArgs),
+    InitAuthority(InitAuthorityArgs),
     StageReceipt(PolicyReceipt),
     ConsumeReceipt(PolicyReceipt),
     OpenSession(PolicyReceipt),
@@ -29,13 +36,14 @@ impl TryFrom<&[u8]> for CoreInstruction {
         match data {
             [0] => Ok(Self::Ping),
             [1, rest @ ..] => Ok(Self::InitVault(parse_init_vault(rest)?)),
-            [2, rest @ ..] => Ok(Self::StageReceipt(parse_policy_receipt(rest)?)),
-            [3, rest @ ..] => Ok(Self::ConsumeReceipt(parse_policy_receipt(rest)?)),
-            [4, rest @ ..] => Ok(Self::OpenSession(parse_policy_receipt(rest)?)),
-            [5, rest @ ..] => Ok(Self::ActivateSession(parse_action_hash(rest)?)),
-            [6, rest @ ..] => Ok(Self::ConsumeSession(parse_action_hash(rest)?)),
-            [7, rest @ ..] => Ok(Self::FinalizeSession(parse_policy_receipt(rest)?)),
-            [8, rest @ ..] => Ok(Self::RotateAuthority(parse_authority_rotation(rest)?)),
+            [2, rest @ ..] => Ok(Self::InitAuthority(parse_init_authority(rest)?)),
+            [3, rest @ ..] => Ok(Self::StageReceipt(parse_policy_receipt(rest)?)),
+            [4, rest @ ..] => Ok(Self::ConsumeReceipt(parse_policy_receipt(rest)?)),
+            [5, rest @ ..] => Ok(Self::OpenSession(parse_policy_receipt(rest)?)),
+            [6, rest @ ..] => Ok(Self::ActivateSession(parse_action_hash(rest)?)),
+            [7, rest @ ..] => Ok(Self::ConsumeSession(parse_action_hash(rest)?)),
+            [8, rest @ ..] => Ok(Self::FinalizeSession(parse_policy_receipt(rest)?)),
+            [9, rest @ ..] => Ok(Self::RotateAuthority(parse_authority_rotation(rest)?)),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -70,6 +78,20 @@ fn parse_init_vault(data: &[u8]) -> Result<InitVaultArgs, ProgramError> {
         authority_hash,
         policy_version: u64::from_le_bytes(policy_version),
         bump: data[72],
+    })
+}
+
+fn parse_init_authority(data: &[u8]) -> Result<InitAuthorityArgs, ProgramError> {
+    if data.len() != 33 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut current_authority_hash = [0; 32];
+    current_authority_hash.copy_from_slice(&data[..32]);
+
+    Ok(InitAuthorityArgs {
+        current_authority_hash,
+        bump: data[32],
     })
 }
 
@@ -129,7 +151,7 @@ fn parse_authority_rotation(data: &[u8]) -> Result<AuthorityRotationStatement, P
 
 #[cfg(test)]
 mod tests {
-    use super::{CoreInstruction, InitVaultArgs};
+    use super::{CoreInstruction, InitAuthorityArgs, InitVaultArgs};
     use pinocchio::program_error::ProgramError;
     use vaulkyrie_protocol::{AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement};
 
@@ -167,7 +189,7 @@ mod tests {
 
     #[test]
     fn parses_stage_receipt_instruction() {
-        let mut data = vec![2];
+        let mut data = vec![3];
         data.extend_from_slice(&[4; 32]);
         data.extend_from_slice(&10u64.to_le_bytes());
         data.push(2);
@@ -187,8 +209,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_init_authority_instruction() {
+        let mut data = vec![2];
+        data.extend_from_slice(&[3; 32]);
+        data.push(4);
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::InitAuthority(InitAuthorityArgs {
+                current_authority_hash: [3; 32],
+                bump: 4,
+            }))
+        );
+    }
+
+    #[test]
     fn parses_open_session_instruction() {
-        let mut data = vec![4];
+        let mut data = vec![5];
         data.extend_from_slice(&[4; 32]);
         data.extend_from_slice(&10u64.to_le_bytes());
         data.push(2);
@@ -209,7 +246,7 @@ mod tests {
 
     #[test]
     fn parses_activate_session_instruction() {
-        let mut data = vec![5];
+        let mut data = vec![6];
         data.extend_from_slice(&[7; 32]);
 
         assert_eq!(
@@ -220,7 +257,7 @@ mod tests {
 
     #[test]
     fn parses_consume_session_instruction() {
-        let mut data = vec![6];
+        let mut data = vec![7];
         data.extend_from_slice(&[8; 32]);
 
         assert_eq!(
@@ -231,7 +268,7 @@ mod tests {
 
     #[test]
     fn parses_finalize_session_instruction() {
-        let mut data = vec![7];
+        let mut data = vec![8];
         data.extend_from_slice(&[4; 32]);
         data.extend_from_slice(&10u64.to_le_bytes());
         data.push(2);
@@ -252,7 +289,7 @@ mod tests {
 
     #[test]
     fn parses_rotate_authority_instruction() {
-        let mut data = vec![8];
+        let mut data = vec![9];
         data.extend_from_slice(&[5; 32]);
         data.extend_from_slice(&[6; 32]);
         data.extend_from_slice(&13u64.to_le_bytes());
@@ -271,7 +308,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_threshold_encoding() {
-        let mut data = vec![2];
+        let mut data = vec![3];
         data.extend_from_slice(&[4; 32]);
         data.extend_from_slice(&10u64.to_le_bytes());
         data.push(99);

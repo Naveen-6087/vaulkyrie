@@ -2,7 +2,7 @@ use pinocchio::{account_info::AccountInfo, get_account_info, program_error::Prog
 use vaulkyrie_protocol::{AuthorityRotationStatement, PolicyReceipt};
 
 use crate::{
-    instruction::{CoreInstruction, InitVaultArgs},
+    instruction::{CoreInstruction, InitAuthorityArgs, InitVaultArgs},
     state::{
         ActionSessionState, PolicyReceiptState, QuantumAuthorityState, VaultRegistry,
         ACTION_SESSION_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR,
@@ -24,6 +24,13 @@ pub fn process(
             require_program_owner(program_id, account)?;
             let mut data = account.try_borrow_mut_data()?;
             process_init_vault_data(&mut data, args)
+        }
+        CoreInstruction::InitAuthority(args) => {
+            let account = get_account_info!(accounts, 0);
+            require_writable(account)?;
+            require_program_owner(program_id, account)?;
+            let mut data = account.try_borrow_mut_data()?;
+            process_init_authority_data(&mut data, args)
         }
         CoreInstruction::StageReceipt(receipt) => {
             let account = get_account_info!(accounts, 0);
@@ -103,6 +110,22 @@ pub fn process_init_vault_data(dst: &mut [u8], args: InitVaultArgs) -> ProgramRe
         args.bump,
     );
 
+    if !state.encode(dst) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Ok(())
+}
+
+pub fn process_init_authority_data(dst: &mut [u8], args: InitAuthorityArgs) -> ProgramResult {
+    if dst.len() != QuantumAuthorityState::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    if !is_zeroed(dst) {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+
+    let state = transition::initialize_quantum_authority(args.current_authority_hash, args.bump);
     if !state.encode(dst) {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -301,11 +324,11 @@ mod tests {
 
     use super::{
         process_activate_session_data, process_consume_receipt_data, process_consume_session_data,
-        process_finalize_session_data, process_init_vault_data, process_open_session_data,
-        process_rotate_authority_data, process_stage_receipt_data,
+        process_finalize_session_data, process_init_authority_data, process_init_vault_data,
+        process_open_session_data, process_rotate_authority_data, process_stage_receipt_data,
     };
     use crate::{
-        instruction::InitVaultArgs,
+        instruction::{InitAuthorityArgs, InitVaultArgs},
         state::{
             ActionSessionState, PolicyReceiptState, QuantumAuthorityState, SessionStatus,
             VaultRegistry, ACTION_SESSION_DISCRIMINATOR,
@@ -365,6 +388,41 @@ mod tests {
                 authority_hash: [6; 32],
                 policy_version: 7,
                 bump: 8,
+            },
+        )
+        .expect_err("preinitialized bytes should fail");
+
+        assert_eq!(error, ProgramError::AccountAlreadyInitialized);
+    }
+
+    #[test]
+    fn init_authority_writes_encoded_state() {
+        let mut bytes = [0; QuantumAuthorityState::LEN];
+
+        process_init_authority_data(
+            &mut bytes,
+            InitAuthorityArgs {
+                current_authority_hash: [7; 32],
+                bump: 2,
+            },
+        )
+        .expect("authority init should succeed");
+
+        let state = QuantumAuthorityState::decode(&bytes).expect("state should decode");
+        assert_eq!(state.current_authority_hash, [7; 32]);
+        assert_eq!(state.bump, 2);
+        assert_eq!(state.next_sequence, 0);
+    }
+
+    #[test]
+    fn init_authority_rejects_preinitialized_bytes() {
+        let mut bytes = [1; QuantumAuthorityState::LEN];
+
+        let error = process_init_authority_data(
+            &mut bytes,
+            InitAuthorityArgs {
+                current_authority_hash: [7; 32],
+                bump: 2,
             },
         )
         .expect_err("preinitialized bytes should fail");
