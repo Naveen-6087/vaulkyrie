@@ -865,6 +865,22 @@ mod tests {
     }
 
     #[test]
+    fn stage_receipt_rejects_replayed_nonce() {
+        let receipt = sample_receipt();
+        let mut vault =
+            VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+        vault.last_consumed_receipt_nonce = receipt.nonce;
+        let mut vault_bytes = [0; VaultRegistry::LEN];
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
+
+        assert!(vault.encode(&mut vault_bytes));
+        let error = process_stage_receipt_data(&vault_bytes, &mut receipt_bytes, &receipt, 10)
+            .expect_err("replayed nonce should fail stage");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
+    }
+
+    #[test]
     fn rotate_authority_updates_current_hash() {
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut bytes = [0; QuantumAuthorityState::LEN];

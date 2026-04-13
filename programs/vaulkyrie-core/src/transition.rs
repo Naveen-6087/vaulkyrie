@@ -97,6 +97,9 @@ pub fn validate_vault_for_receipt(
     if receipt.expiry_slot < current_slot {
         return Err(TransitionError::ReceiptExpired);
     }
+    if receipt.nonce <= vault.last_consumed_receipt_nonce {
+        return Err(TransitionError::ReceiptNonceReplay);
+    }
 
     Ok(())
 }
@@ -524,6 +527,24 @@ mod tests {
             .expect_err("expired receipt should not stage");
 
         assert_eq!(error, TransitionError::ReceiptExpired);
+    }
+
+    #[test]
+    fn validate_vault_for_receipt_rejects_replayed_nonce() {
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        vault.last_consumed_receipt_nonce = 5;
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+
+        let error = validate_vault_for_receipt(&vault, &receipt, 10)
+            .expect_err("replayed nonce should fail fast");
+
+        assert_eq!(error, TransitionError::ReceiptNonceReplay);
     }
 
     #[test]
