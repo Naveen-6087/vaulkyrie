@@ -47,6 +47,25 @@ pub fn open_action_session(receipt: &PolicyReceipt) -> ActionSessionState {
     )
 }
 
+pub fn open_action_session_from_receipt(
+    state: &PolicyReceiptState,
+    receipt: &PolicyReceipt,
+) -> Result<ActionSessionState, TransitionError> {
+    if state.consumed != 0 {
+        return Err(TransitionError::ReceiptAlreadyConsumed);
+    }
+
+    if state.receipt_commitment != receipt.commitment()
+        || state.action_hash != receipt.action_hash
+        || state.nonce != receipt.nonce
+        || state.expiry_slot != receipt.expiry_slot
+    {
+        return Err(TransitionError::ReceiptMismatch);
+    }
+
+    Ok(open_action_session(receipt))
+}
+
 pub fn consume_policy_receipt(
     state: &mut PolicyReceiptState,
     receipt: &PolicyReceipt,
@@ -100,7 +119,8 @@ mod tests {
 
     use super::{
         apply_authority_rotation, consume_policy_receipt, initialize_vault,
-        mark_action_session_ready, open_action_session, stage_policy_receipt, TransitionError,
+        mark_action_session_ready, open_action_session, open_action_session_from_receipt,
+        stage_policy_receipt, TransitionError,
     };
     use crate::state::{QuantumAuthorityState, SessionStatus};
 
@@ -178,6 +198,63 @@ mod tests {
             ThresholdRequirement::TwoOfThree.as_byte()
         );
         assert_eq!(session.status, SessionStatus::Pending as u8);
+    }
+
+    #[test]
+    fn opening_action_session_from_staged_receipt_validates_commitment() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+        let staged = stage_policy_receipt(&receipt);
+
+        let session = open_action_session_from_receipt(&staged, &receipt)
+            .expect("matching receipt should open a session");
+
+        assert_eq!(session.receipt_commitment, receipt.commitment());
+        assert_eq!(session.action_hash, receipt.action_hash);
+    }
+
+    #[test]
+    fn opening_action_session_from_consumed_receipt_fails() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+        let mut staged = stage_policy_receipt(&receipt);
+        staged.consumed = 1;
+
+        let error = open_action_session_from_receipt(&staged, &receipt)
+            .expect_err("consumed receipts should not open new sessions");
+
+        assert_eq!(error, TransitionError::ReceiptAlreadyConsumed);
+    }
+
+    #[test]
+    fn opening_action_session_from_mismatched_receipt_fails() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+        let staged = stage_policy_receipt(&receipt);
+        let mismatched = vaulkyrie_protocol::PolicyReceipt {
+            nonce: 99,
+            ..receipt
+        };
+
+        let error = open_action_session_from_receipt(&staged, &mismatched)
+            .expect_err("mismatched receipt should be rejected");
+
+        assert_eq!(error, TransitionError::ReceiptMismatch);
     }
 
     #[test]

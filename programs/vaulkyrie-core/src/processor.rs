@@ -40,11 +40,16 @@ pub fn process(
             process_consume_receipt_data(&mut data, &receipt)
         }
         CoreInstruction::OpenSession(receipt) => {
-            let account = get_account_info!(accounts, 0);
-            require_writable(account)?;
-            require_program_owner(program_id, account)?;
-            let mut data = account.try_borrow_mut_data()?;
-            process_open_session_data(&mut data, &receipt)
+            let receipt_account = get_account_info!(accounts, 0);
+            require_program_owner(program_id, receipt_account)?;
+            let receipt_data = receipt_account.try_borrow_data()?;
+
+            let session_account = get_account_info!(accounts, 1);
+            require_writable(session_account)?;
+            require_program_owner(program_id, session_account)?;
+            let mut session_data = session_account.try_borrow_mut_data()?;
+
+            process_open_session_data(&receipt_data, &mut session_data, &receipt)
         }
         CoreInstruction::ActivateSession(action_hash) => {
             let account = get_account_info!(accounts, 0);
@@ -118,16 +123,28 @@ pub fn process_consume_receipt_data(dst: &mut [u8], receipt: &PolicyReceipt) -> 
     Ok(())
 }
 
-pub fn process_open_session_data(dst: &mut [u8], receipt: &PolicyReceipt) -> ProgramResult {
-    if dst.len() != ActionSessionState::LEN {
+pub fn process_open_session_data(
+    receipt_src: &[u8],
+    session_dst: &mut [u8],
+    receipt: &PolicyReceipt,
+) -> ProgramResult {
+    if receipt_src.len() != PolicyReceiptState::LEN {
         return Err(ProgramError::AccountDataTooSmall);
     }
-    if !is_zeroed(dst) {
+    if session_dst.len() != ActionSessionState::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    if !is_zeroed(session_dst) {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
 
-    let state = transition::open_action_session(receipt);
-    if !state.encode(dst) {
+    let receipt_state =
+        PolicyReceiptState::decode(receipt_src).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&receipt_state.discriminator, &POLICY_RECEIPT_DISCRIMINATOR)?;
+
+    let state = transition::open_action_session_from_receipt(&receipt_state, receipt)
+        .map_err(map_transition_error)?;
+    if !state.encode(session_dst) {
         return Err(ProgramError::InvalidAccountData);
     }
 
@@ -326,11 +343,20 @@ mod tests {
     #[test]
     fn open_session_writes_encoded_state() {
         let receipt = sample_receipt();
-        let mut bytes = [0; ActionSessionState::LEN];
+        let receipt_state = PolicyReceiptState::new(
+            receipt.commitment(),
+            receipt.action_hash,
+            receipt.nonce,
+            receipt.expiry_slot,
+        );
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
+        let mut session_bytes = [0; ActionSessionState::LEN];
 
-        process_open_session_data(&mut bytes, &receipt).expect("open session should succeed");
+        assert!(receipt_state.encode(&mut receipt_bytes));
+        process_open_session_data(&receipt_bytes, &mut session_bytes, &receipt)
+            .expect("open session should succeed");
 
-        let state = ActionSessionState::decode(&bytes).expect("state should decode");
+        let state = ActionSessionState::decode(&session_bytes).expect("state should decode");
         assert_eq!(state.receipt_commitment, receipt.commitment());
         assert_eq!(state.action_hash, receipt.action_hash);
         assert_eq!(
@@ -343,9 +369,18 @@ mod tests {
     #[test]
     fn activate_session_marks_state_ready() {
         let receipt = sample_receipt();
+        let receipt_state = PolicyReceiptState::new(
+            receipt.commitment(),
+            receipt.action_hash,
+            receipt.nonce,
+            receipt.expiry_slot,
+        );
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
         let mut bytes = [0; ActionSessionState::LEN];
 
-        process_open_session_data(&mut bytes, &receipt).expect("open session should succeed");
+        assert!(receipt_state.encode(&mut receipt_bytes));
+        process_open_session_data(&receipt_bytes, &mut bytes, &receipt)
+            .expect("open session should succeed");
         process_activate_session_data(&mut bytes, receipt.action_hash)
             .expect("activate session should succeed");
 
@@ -367,9 +402,18 @@ mod tests {
     #[test]
     fn activate_session_rejects_wrong_action_hash() {
         let receipt = sample_receipt();
+        let receipt_state = PolicyReceiptState::new(
+            receipt.commitment(),
+            receipt.action_hash,
+            receipt.nonce,
+            receipt.expiry_slot,
+        );
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
         let mut bytes = [0; ActionSessionState::LEN];
 
-        process_open_session_data(&mut bytes, &receipt).expect("open session should succeed");
+        assert!(receipt_state.encode(&mut receipt_bytes));
+        process_open_session_data(&receipt_bytes, &mut bytes, &receipt)
+            .expect("open session should succeed");
         let error = process_activate_session_data(&mut bytes, [9; 32])
             .expect_err("wrong action hash should fail");
 
@@ -379,10 +423,58 @@ mod tests {
     #[test]
     fn open_session_writes_expected_discriminator() {
         let receipt = sample_receipt();
+        let receipt_state = PolicyReceiptState::new(
+            receipt.commitment(),
+            receipt.action_hash,
+            receipt.nonce,
+            receipt.expiry_slot,
+        );
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
         let mut bytes = [0; ActionSessionState::LEN];
 
-        process_open_session_data(&mut bytes, &receipt).expect("open session should succeed");
+        assert!(receipt_state.encode(&mut receipt_bytes));
+        process_open_session_data(&receipt_bytes, &mut bytes, &receipt)
+            .expect("open session should succeed");
 
         assert_eq!(&bytes[..8], &ACTION_SESSION_DISCRIMINATOR);
+    }
+
+    #[test]
+    fn open_session_rejects_mismatched_staged_receipt() {
+        let receipt = sample_receipt();
+        let staged = PolicyReceiptState::new(
+            receipt.commitment(),
+            receipt.action_hash,
+            receipt.nonce + 1,
+            receipt.expiry_slot,
+        );
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
+        let mut session_bytes = [0; ActionSessionState::LEN];
+
+        assert!(staged.encode(&mut receipt_bytes));
+        let error = process_open_session_data(&receipt_bytes, &mut session_bytes, &receipt)
+            .expect_err("mismatched staged receipt should fail");
+
+        assert_eq!(error, ProgramError::InvalidAccountData);
+    }
+
+    #[test]
+    fn open_session_rejects_consumed_receipt() {
+        let receipt = sample_receipt();
+        let mut staged = PolicyReceiptState::new(
+            receipt.commitment(),
+            receipt.action_hash,
+            receipt.nonce,
+            receipt.expiry_slot,
+        );
+        staged.consumed = 1;
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
+        let mut session_bytes = [0; ActionSessionState::LEN];
+
+        assert!(staged.encode(&mut receipt_bytes));
+        let error = process_open_session_data(&receipt_bytes, &mut session_bytes, &receipt)
+            .expect_err("consumed staged receipt should fail");
+
+        assert_eq!(error, ProgramError::AccountAlreadyInitialized);
     }
 }
