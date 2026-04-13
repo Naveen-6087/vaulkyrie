@@ -44,6 +44,53 @@ impl VaultRegistry {
             reserved: [0; 14],
         }
     }
+
+    pub fn encode(self, dst: &mut [u8]) -> bool {
+        if dst.len() != Self::LEN {
+            return false;
+        }
+
+        dst[..8].copy_from_slice(&self.discriminator);
+        dst[8..40].copy_from_slice(&self.wallet_pubkey);
+        dst[40..72].copy_from_slice(&self.current_authority_hash);
+        dst[72..80].copy_from_slice(&self.policy_version.to_le_bytes());
+        dst[80] = self.status;
+        dst[81] = self.bump;
+        dst[82..96].copy_from_slice(&self.reserved);
+
+        true
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::LEN {
+            return None;
+        }
+
+        let mut discriminator = [0; 8];
+        discriminator.copy_from_slice(&src[..8]);
+
+        let mut wallet_pubkey = [0; 32];
+        wallet_pubkey.copy_from_slice(&src[8..40]);
+
+        let mut current_authority_hash = [0; 32];
+        current_authority_hash.copy_from_slice(&src[40..72]);
+
+        let mut policy_version = [0; 8];
+        policy_version.copy_from_slice(&src[72..80]);
+
+        let mut reserved = [0; 14];
+        reserved.copy_from_slice(&src[82..96]);
+
+        Some(Self {
+            discriminator,
+            wallet_pubkey,
+            current_authority_hash,
+            policy_version: u64::from_le_bytes(policy_version),
+            status: src[80],
+            bump: src[81],
+            reserved,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +124,56 @@ impl PolicyReceiptState {
             reserved: [0; 7],
         }
     }
+
+    pub fn encode(self, dst: &mut [u8]) -> bool {
+        if dst.len() != Self::LEN {
+            return false;
+        }
+
+        dst[..8].copy_from_slice(&self.discriminator);
+        dst[8..40].copy_from_slice(&self.receipt_commitment);
+        dst[40..72].copy_from_slice(&self.action_hash);
+        dst[72..80].copy_from_slice(&self.nonce.to_le_bytes());
+        dst[80..88].copy_from_slice(&self.expiry_slot.to_le_bytes());
+        dst[88] = self.consumed;
+        dst[89..96].copy_from_slice(&self.reserved);
+
+        true
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::LEN {
+            return None;
+        }
+
+        let mut discriminator = [0; 8];
+        discriminator.copy_from_slice(&src[..8]);
+
+        let mut receipt_commitment = [0; 32];
+        receipt_commitment.copy_from_slice(&src[8..40]);
+
+        let mut action_hash = [0; 32];
+        action_hash.copy_from_slice(&src[40..72]);
+
+        let mut nonce = [0; 8];
+        nonce.copy_from_slice(&src[72..80]);
+
+        let mut expiry_slot = [0; 8];
+        expiry_slot.copy_from_slice(&src[80..88]);
+
+        let mut reserved = [0; 7];
+        reserved.copy_from_slice(&src[89..96]);
+
+        Some(Self {
+            discriminator,
+            receipt_commitment,
+            action_hash,
+            nonce: u64::from_le_bytes(nonce),
+            expiry_slot: u64::from_le_bytes(expiry_slot),
+            consumed: src[88],
+            reserved,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +200,51 @@ impl QuantumAuthorityState {
             reserved: [0; 15],
         }
     }
+
+    pub fn encode(self, dst: &mut [u8]) -> bool {
+        if dst.len() != Self::LEN {
+            return false;
+        }
+
+        dst[..8].copy_from_slice(&self.discriminator);
+        dst[8..40].copy_from_slice(&self.current_authority_hash);
+        dst[40..72].copy_from_slice(&self.last_consumed_digest);
+        dst[72..80].copy_from_slice(&self.next_sequence.to_le_bytes());
+        dst[80] = self.bump;
+        dst[81..96].copy_from_slice(&self.reserved);
+
+        true
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::LEN {
+            return None;
+        }
+
+        let mut discriminator = [0; 8];
+        discriminator.copy_from_slice(&src[..8]);
+
+        let mut current_authority_hash = [0; 32];
+        current_authority_hash.copy_from_slice(&src[8..40]);
+
+        let mut last_consumed_digest = [0; 32];
+        last_consumed_digest.copy_from_slice(&src[40..72]);
+
+        let mut next_sequence = [0; 8];
+        next_sequence.copy_from_slice(&src[72..80]);
+
+        let mut reserved = [0; 15];
+        reserved.copy_from_slice(&src[81..96]);
+
+        Some(Self {
+            discriminator,
+            current_authority_hash,
+            last_consumed_digest,
+            next_sequence: u64::from_le_bytes(next_sequence),
+            bump: src[80],
+            reserved,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +264,15 @@ mod tests {
     }
 
     #[test]
+    fn vault_registry_roundtrips_through_bytes() {
+        let state = VaultRegistry::new([1; 32], [2; 32], 7, VaultStatus::Active, 9);
+        let mut bytes = [0; VaultRegistry::LEN];
+
+        assert!(state.encode(&mut bytes));
+        assert_eq!(VaultRegistry::decode(&bytes), Some(state));
+    }
+
+    #[test]
     fn policy_receipt_state_defaults_to_unconsumed() {
         let state = PolicyReceiptState::new([3; 32], [4; 32], 5, 6);
 
@@ -131,11 +282,29 @@ mod tests {
     }
 
     #[test]
+    fn policy_receipt_roundtrips_through_bytes() {
+        let state = PolicyReceiptState::new([3; 32], [4; 32], 5, 6);
+        let mut bytes = [0; PolicyReceiptState::LEN];
+
+        assert!(state.encode(&mut bytes));
+        assert_eq!(PolicyReceiptState::decode(&bytes), Some(state));
+    }
+
+    #[test]
     fn quantum_state_starts_at_sequence_zero() {
         let state = QuantumAuthorityState::new([5; 32], 1);
 
         assert_eq!(state.discriminator, QUANTUM_STATE_DISCRIMINATOR);
         assert_eq!(QuantumAuthorityState::LEN, 96);
         assert_eq!(state.next_sequence, 0);
+    }
+
+    #[test]
+    fn quantum_state_roundtrips_through_bytes() {
+        let state = QuantumAuthorityState::new([5; 32], 1);
+        let mut bytes = [0; QuantumAuthorityState::LEN];
+
+        assert!(state.encode(&mut bytes));
+        assert_eq!(QuantumAuthorityState::decode(&bytes), Some(state));
     }
 }
