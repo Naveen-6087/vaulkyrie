@@ -55,6 +55,13 @@ pub struct RefreshReport {
     pub signer_set: Vec<u16>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RetryReport {
+    pub attempts: u16,
+    pub successful_signer_set: Vec<u16>,
+    pub report: HarnessReport,
+}
+
 pub fn run_dkg_signing_harness(message: &[u8]) -> Result<HarnessReport, HarnessError> {
     let config = HarnessConfig::default();
     run_dkg_signing_with_config(message, &config)
@@ -163,6 +170,41 @@ pub fn run_share_refresh_with_config(
         signature,
         signer_set: config.signing_participants.clone(),
     })
+}
+
+pub fn run_dkg_signing_with_retries(
+    message: &[u8],
+    base_config: &HarnessConfig,
+    retry_signer_sets: &[Vec<u16>],
+) -> Result<RetryReport, HarnessError> {
+    if retry_signer_sets.is_empty() {
+        return Err(HarnessError::InvalidConfig(
+            "retry signer set list must be non-empty",
+        ));
+    }
+
+    let mut last_error: Option<HarnessError> = None;
+
+    for (index, signer_set) in retry_signer_sets.iter().enumerate() {
+        let mut attempt_config = base_config.clone();
+        attempt_config.signing_participants = signer_set.clone();
+        match run_dkg_signing_with_config(message, &attempt_config) {
+            Ok(report) => {
+                return Ok(RetryReport {
+                    attempts: u16::try_from(index + 1)
+                        .map_err(|_| HarnessError::InvalidConfig("retry attempts exceed u16"))?,
+                    successful_signer_set: signer_set.clone(),
+                    report,
+                });
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error
+        .unwrap_or(HarnessError::InvalidConfig("retry attempts exhausted without error")))
 }
 
 fn identifier_from_u16(participant: u16) -> Result<frost::Identifier, HarnessError> {
@@ -364,8 +406,8 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        run_dkg_signing_harness, run_dkg_signing_with_config, run_share_refresh_harness,
-        HarnessConfig, HarnessError,
+        run_dkg_signing_harness, run_dkg_signing_with_config, run_dkg_signing_with_retries,
+        run_share_refresh_harness, HarnessConfig, HarnessError,
     };
     use solana_signature::Signature as SolanaSignature;
 
@@ -479,5 +521,41 @@ mod tests {
 
         assert_eq!(report.original_group_public_key, report.refreshed_group_public_key);
         assert!(solana_signature.verify(&report.refreshed_group_public_key, message));
+    }
+
+    #[test]
+    fn retry_harness_falls_back_to_later_signer_set() {
+        let message = b"vaulkyrie retry harness";
+        let base = HarnessConfig {
+            min_signers: 3,
+            max_signers: 5,
+            signing_participants: vec![1, 2, 3],
+            rng_seed: [31; 32],
+        };
+        let retry_sets = vec![vec![1, 2], vec![1, 3, 5]];
+
+        let retry_report = run_dkg_signing_with_retries(message, &base, &retry_sets)
+            .expect("retry flow should succeed on second signer set");
+        let solana_signature = SolanaSignature::from(retry_report.report.signature);
+
+        assert_eq!(retry_report.attempts, 2);
+        assert_eq!(retry_report.successful_signer_set, vec![1, 3, 5]);
+        assert!(solana_signature.verify(&retry_report.report.group_public_key, message));
+    }
+
+    #[test]
+    fn retry_harness_fails_when_all_sets_are_invalid() {
+        let base = HarnessConfig {
+            min_signers: 3,
+            max_signers: 5,
+            signing_participants: vec![1, 2, 3],
+            rng_seed: [32; 32],
+        };
+        let retry_sets = vec![vec![1, 2], vec![2, 2, 3], vec![1, 6, 5]];
+
+        let error = run_dkg_signing_with_retries(b"msg", &base, &retry_sets)
+            .expect_err("all invalid retry sets should fail");
+
+        assert!(matches!(error, HarnessError::InvalidConfig(_)));
     }
 }
