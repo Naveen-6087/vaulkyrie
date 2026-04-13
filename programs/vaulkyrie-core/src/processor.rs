@@ -75,18 +75,22 @@ pub fn process(
         }
         CoreInstruction::ConsumeReceipt(receipt) => {
             let vault_account = get_account_info!(accounts, 0);
+            require_writable(vault_account)?;
             require_program_owner(program_id, vault_account)?;
             let vault_data = vault_account.try_borrow_data()?;
             let vault = decode_vault_state(&vault_data)?;
             transition::validate_vault_active(&vault).map_err(map_transition_error)?;
             let wallet_signer = get_account_info!(accounts, 2);
             require_wallet_authority(&vault, wallet_signer)?;
+            drop(vault_data);
+
+            let mut vault_data = vault_account.try_borrow_mut_data()?;
 
             let receipt_account = get_account_info!(accounts, 1);
             require_writable(receipt_account)?;
             require_program_owner(program_id, receipt_account)?;
             let mut receipt_data = receipt_account.try_borrow_mut_data()?;
-            process_consume_receipt_data(&mut receipt_data, &receipt)
+            process_consume_receipt_data(&mut vault_data, &mut receipt_data, &receipt)
         }
         CoreInstruction::OpenSession(receipt) => {
             let current_slot = current_slot()?;
@@ -155,12 +159,15 @@ pub fn process(
         CoreInstruction::FinalizeSession(receipt) => {
             let current_slot = current_slot()?;
             let vault_account = get_account_info!(accounts, 2);
+            require_writable(vault_account)?;
             require_program_owner(program_id, vault_account)?;
             let vault_data = vault_account.try_borrow_data()?;
             let vault = decode_vault_state(&vault_data)?;
             transition::validate_vault_active(&vault).map_err(map_transition_error)?;
             let wallet_signer = get_account_info!(accounts, 3);
             require_wallet_authority(&vault, wallet_signer)?;
+            drop(vault_data);
+            let mut vault_data = vault_account.try_borrow_mut_data()?;
 
             let receipt_account = get_account_info!(accounts, 0);
             require_writable(receipt_account)?;
@@ -173,6 +180,7 @@ pub fn process(
             let mut session_data = session_account.try_borrow_mut_data()?;
 
             process_finalize_session_data(
+                &mut vault_data,
                 &mut receipt_data,
                 &mut session_data,
                 &receipt,
@@ -303,17 +311,28 @@ pub fn process_stage_receipt_data(
     Ok(())
 }
 
-pub fn process_consume_receipt_data(dst: &mut [u8], receipt: &PolicyReceipt) -> ProgramResult {
-    if dst.len() != PolicyReceiptState::LEN {
+pub fn process_consume_receipt_data(
+    vault_dst: &mut [u8],
+    receipt_dst: &mut [u8],
+    receipt: &PolicyReceipt,
+) -> ProgramResult {
+    if vault_dst.len() != VaultRegistry::LEN || receipt_dst.len() != PolicyReceiptState::LEN {
         return Err(ProgramError::AccountDataTooSmall);
     }
 
-    let mut state = PolicyReceiptState::decode(dst).ok_or(ProgramError::InvalidAccountData)?;
+    let mut vault = VaultRegistry::decode(vault_dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&vault.discriminator, &VAULT_REGISTRY_DISCRIMINATOR)?;
+    transition::validate_vault_active(&vault).map_err(map_transition_error)?;
+    if vault.policy_version != receipt.policy_version {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let mut state = PolicyReceiptState::decode(receipt_dst).ok_or(ProgramError::InvalidAccountData)?;
     require_discriminator(&state.discriminator, &POLICY_RECEIPT_DISCRIMINATOR)?;
-    transition::consume_policy_receipt(&mut state, receipt)
+    transition::consume_policy_receipt_for_vault(&mut vault, &mut state, receipt)
         .map_err(map_transition_error)?;
 
-    if !state.encode(dst) {
+    if !vault.encode(vault_dst) || !state.encode(receipt_dst) {
         return Err(ProgramError::InvalidAccountData);
     }
 
@@ -400,15 +419,27 @@ pub fn process_consume_session_data(
 }
 
 pub fn process_finalize_session_data(
+    vault_dst: &mut [u8],
     receipt_dst: &mut [u8],
     session_dst: &mut [u8],
     receipt: &PolicyReceipt,
     current_slot: u64,
     expected_policy_version: u64,
 ) -> ProgramResult {
-    if receipt_dst.len() != PolicyReceiptState::LEN || session_dst.len() != ActionSessionState::LEN
+    if vault_dst.len() != VaultRegistry::LEN
+        || receipt_dst.len() != PolicyReceiptState::LEN
+        || session_dst.len() != ActionSessionState::LEN
     {
         return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let mut vault_state = VaultRegistry::decode(vault_dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&vault_state.discriminator, &VAULT_REGISTRY_DISCRIMINATOR)?;
+    transition::validate_vault_active(&vault_state).map_err(map_transition_error)?;
+    if vault_state.policy_version != expected_policy_version
+        || receipt.policy_version != expected_policy_version
+    {
+        return Err(ProgramError::InvalidArgument);
     }
 
     let mut receipt_state =
@@ -418,13 +449,12 @@ pub fn process_finalize_session_data(
     let mut session_state =
         ActionSessionState::decode(session_dst).ok_or(ProgramError::InvalidAccountData)?;
     require_discriminator(&session_state.discriminator, &ACTION_SESSION_DISCRIMINATOR)?;
-    if session_state.policy_version != expected_policy_version
-        || receipt.policy_version != expected_policy_version
-    {
+    if session_state.policy_version != expected_policy_version {
         return Err(ProgramError::InvalidArgument);
     }
 
     transition::finalize_action_session(
+        &mut vault_state,
         &mut session_state,
         &mut receipt_state,
         receipt,
@@ -432,7 +462,10 @@ pub fn process_finalize_session_data(
     )
         .map_err(map_transition_error)?;
 
-    if !receipt_state.encode(receipt_dst) || !session_state.encode(session_dst) {
+    if !vault_state.encode(vault_dst)
+        || !receipt_state.encode(receipt_dst)
+        || !session_state.encode(session_dst)
+    {
         return Err(ProgramError::InvalidAccountData);
     }
 
@@ -533,6 +566,7 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::ReceiptAlreadyConsumed => ProgramError::AccountAlreadyInitialized,
         transition::TransitionError::ReceiptMismatch => ProgramError::InvalidAccountData,
         transition::TransitionError::ReceiptExpired => ProgramError::InvalidArgument,
+        transition::TransitionError::ReceiptNonceReplay => ProgramError::InvalidArgument,
         transition::TransitionError::SessionExpired => ProgramError::InvalidArgument,
         transition::TransitionError::AuthorityStatementExpired => ProgramError::InvalidArgument,
         transition::TransitionError::VaultAuthorityMismatch => ProgramError::InvalidArgument,
@@ -746,16 +780,43 @@ mod tests {
         let receipt = sample_receipt();
         let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
         let mut vault_bytes = [0; VaultRegistry::LEN];
-        let mut bytes = [0; PolicyReceiptState::LEN];
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
 
         assert!(vault.encode(&mut vault_bytes));
 
-        process_stage_receipt_data(&vault_bytes, &mut bytes, &receipt, 10)
+        process_stage_receipt_data(&vault_bytes, &mut receipt_bytes, &receipt, 10)
             .expect("stage should succeed");
-        process_consume_receipt_data(&mut bytes, &receipt).expect("consume should succeed");
+        process_consume_receipt_data(&mut vault_bytes, &mut receipt_bytes, &receipt)
+            .expect("consume should succeed");
 
-        let state = PolicyReceiptState::decode(&bytes).expect("state should decode");
+        let state = PolicyReceiptState::decode(&receipt_bytes).expect("state should decode");
+        let vault = VaultRegistry::decode(&vault_bytes).expect("vault should decode");
         assert_eq!(state.consumed, 1);
+        assert_eq!(vault.last_consumed_receipt_nonce, receipt.nonce);
+    }
+
+    #[test]
+    fn consume_receipt_rejects_replayed_nonce() {
+        let receipt = sample_receipt();
+        let mut vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+        vault.last_consumed_receipt_nonce = receipt.nonce;
+        let staged = PolicyReceiptState::new(
+            receipt.commitment(),
+            receipt.action_hash,
+            receipt.nonce,
+            receipt.expiry_slot,
+        );
+        let mut vault_bytes = [0; VaultRegistry::LEN];
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
+
+        assert!(vault.encode(&mut vault_bytes));
+        assert!(staged.encode(&mut receipt_bytes));
+        let error = process_consume_receipt_data(&mut vault_bytes, &mut receipt_bytes, &receipt)
+            .expect_err("replayed nonce should fail");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
+        let state = PolicyReceiptState::decode(&receipt_bytes).expect("state should decode");
+        assert_eq!(state.consumed, 0);
     }
 
     #[test]
@@ -1191,9 +1252,12 @@ mod tests {
             receipt.nonce,
             receipt.expiry_slot,
         );
+        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+        let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
         let mut session_bytes = [0; ActionSessionState::LEN];
 
+        assert!(vault.encode(&mut vault_bytes));
         assert!(staged.encode(&mut receipt_bytes));
         process_open_session_data(&receipt_bytes, &mut session_bytes, &receipt, 10)
             .expect("open session should succeed");
@@ -1205,6 +1269,7 @@ mod tests {
         )
             .expect("activate session should succeed");
         process_finalize_session_data(
+            &mut vault_bytes,
             &mut receipt_bytes,
             &mut session_bytes,
             &receipt,
@@ -1215,8 +1280,10 @@ mod tests {
 
         let receipt_state = PolicyReceiptState::decode(&receipt_bytes).expect("receipt should decode");
         let session_state = ActionSessionState::decode(&session_bytes).expect("session should decode");
+        let vault_state = VaultRegistry::decode(&vault_bytes).expect("vault should decode");
         assert_eq!(receipt_state.consumed, 1);
         assert_eq!(session_state.status, SessionStatus::Consumed as u8);
+        assert_eq!(vault_state.last_consumed_receipt_nonce, receipt.nonce);
     }
 
     #[test]
@@ -1228,13 +1295,17 @@ mod tests {
             receipt.nonce,
             receipt.expiry_slot,
         );
+        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+        let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
         let mut session_bytes = [0; ActionSessionState::LEN];
 
+        assert!(vault.encode(&mut vault_bytes));
         assert!(staged.encode(&mut receipt_bytes));
         process_open_session_data(&receipt_bytes, &mut session_bytes, &receipt, 10)
             .expect("open session should succeed");
         let error = process_finalize_session_data(
+            &mut vault_bytes,
             &mut receipt_bytes,
             &mut session_bytes,
             &receipt,
@@ -1258,9 +1329,12 @@ mod tests {
             receipt.nonce,
             receipt.expiry_slot,
         );
+        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+        let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
         let mut session_bytes = [0; ActionSessionState::LEN];
 
+        assert!(vault.encode(&mut vault_bytes));
         assert!(staged.encode(&mut receipt_bytes));
         process_open_session_data(&receipt_bytes, &mut session_bytes, &receipt, 10)
             .expect("open session should succeed");
@@ -1272,6 +1346,7 @@ mod tests {
         }
 
         let error = process_finalize_session_data(
+            &mut vault_bytes,
             &mut receipt_bytes,
             &mut session_bytes,
             &receipt,
@@ -1279,6 +1354,46 @@ mod tests {
             receipt.policy_version,
         )
         .expect_err("pqc-only threshold should reject spend finalization");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn finalize_session_rejects_replayed_nonce() {
+        let receipt = sample_receipt();
+        let staged = PolicyReceiptState::new(
+            receipt.commitment(),
+            receipt.action_hash,
+            receipt.nonce,
+            receipt.expiry_slot,
+        );
+        let mut vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+        vault.last_consumed_receipt_nonce = receipt.nonce;
+        let mut vault_bytes = [0; VaultRegistry::LEN];
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
+        let mut session_bytes = [0; ActionSessionState::LEN];
+
+        assert!(vault.encode(&mut vault_bytes));
+        assert!(staged.encode(&mut receipt_bytes));
+        process_open_session_data(&receipt_bytes, &mut session_bytes, &receipt, 10)
+            .expect("open session should succeed");
+        process_activate_session_data(
+            &mut session_bytes,
+            receipt.action_hash,
+            10,
+            receipt.policy_version,
+        )
+        .expect("activate session should succeed");
+
+        let error = process_finalize_session_data(
+            &mut vault_bytes,
+            &mut receipt_bytes,
+            &mut session_bytes,
+            &receipt,
+            10,
+            receipt.policy_version,
+        )
+        .expect_err("replayed nonce should fail finalize");
 
         assert_eq!(error, ProgramError::InvalidArgument);
     }

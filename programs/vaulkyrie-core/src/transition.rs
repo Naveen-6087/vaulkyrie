@@ -10,6 +10,7 @@ pub enum TransitionError {
     ReceiptAlreadyConsumed,
     ReceiptMismatch,
     ReceiptExpired,
+    ReceiptNonceReplay,
     SessionExpired,
     AuthorityStatementExpired,
     VaultAuthorityMismatch,
@@ -186,6 +187,27 @@ pub fn consume_policy_receipt(
     Ok(())
 }
 
+pub fn validate_and_advance_receipt_nonce(
+    vault: &mut VaultRegistry,
+    receipt: &PolicyReceipt,
+) -> Result<(), TransitionError> {
+    if receipt.nonce <= vault.last_consumed_receipt_nonce {
+        return Err(TransitionError::ReceiptNonceReplay);
+    }
+
+    vault.last_consumed_receipt_nonce = receipt.nonce;
+    Ok(())
+}
+
+pub fn consume_policy_receipt_for_vault(
+    vault: &mut VaultRegistry,
+    state: &mut PolicyReceiptState,
+    receipt: &PolicyReceipt,
+) -> Result<(), TransitionError> {
+    validate_and_advance_receipt_nonce(vault, receipt)?;
+    consume_policy_receipt(state, receipt)
+}
+
 pub fn mark_action_session_ready(
     state: &mut ActionSessionState,
     action_hash: [u8; 32],
@@ -233,6 +255,7 @@ pub fn consume_action_session(
 }
 
 pub fn finalize_action_session(
+    vault: &mut VaultRegistry,
     session: &mut ActionSessionState,
     receipt_state: &mut PolicyReceiptState,
     receipt: &PolicyReceipt,
@@ -258,7 +281,7 @@ pub fn finalize_action_session(
         return Err(TransitionError::SessionNotReady);
     }
 
-    consume_policy_receipt(receipt_state, receipt)?;
+    consume_policy_receipt_for_vault(vault, receipt_state, receipt)?;
     session.status = SessionStatus::Consumed as u8;
 
     Ok(())
@@ -346,6 +369,7 @@ mod tests {
         finalize_action_session, initialize_quantum_authority, initialize_vault, parse_vault_status,
         mark_action_session_ready, rotate_vault_authority, validate_vault_authority_alignment,
         validate_authority_action_binding,
+        validate_and_advance_receipt_nonce,
         validate_vault_active, validate_vault_for_receipt, validate_vault_for_session,
         validate_vault_recovery_mode,
         open_action_session, open_action_session_from_receipt, stage_policy_receipt, update_vault_status,
@@ -584,6 +608,25 @@ mod tests {
             consume_policy_receipt(&mut state, &receipt).expect_err("second consume should fail");
 
         assert_eq!(error, TransitionError::ReceiptAlreadyConsumed);
+    }
+
+    #[test]
+    fn validate_and_advance_receipt_nonce_rejects_replay() {
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+
+        validate_and_advance_receipt_nonce(&mut vault, &receipt)
+            .expect("first nonce should advance");
+        let error = validate_and_advance_receipt_nonce(&mut vault, &receipt)
+            .expect_err("reusing nonce should fail");
+
+        assert_eq!(error, TransitionError::ReceiptNonceReplay);
     }
 
     #[test]
@@ -850,16 +893,18 @@ mod tests {
             nonce: 5,
             expiry_slot: 10,
         };
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
         let mut session = open_action_session(&receipt);
         let mut staged = stage_policy_receipt(&receipt);
         mark_action_session_ready(&mut session, receipt.action_hash, 10)
             .expect("matching action hash should mark session ready");
 
-        finalize_action_session(&mut session, &mut staged, &receipt, 10)
+        finalize_action_session(&mut vault, &mut session, &mut staged, &receipt, 10)
             .expect("ready session should finalize against staged receipt");
 
         assert_eq!(session.status, SessionStatus::Consumed as u8);
         assert_eq!(staged.consumed, 1);
+        assert_eq!(vault.last_consumed_receipt_nonce, receipt.nonce);
     }
 
     #[test]
@@ -873,6 +918,7 @@ mod tests {
         };
         let mut session = open_action_session(&receipt);
         let mut staged = stage_policy_receipt(&receipt);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
         let mismatched = vaulkyrie_protocol::PolicyReceipt {
             nonce: 77,
             ..receipt
@@ -880,7 +926,7 @@ mod tests {
         mark_action_session_ready(&mut session, receipt.action_hash, 10)
             .expect("matching action hash should mark session ready");
 
-        let error = finalize_action_session(&mut session, &mut staged, &mismatched, 10)
+        let error = finalize_action_session(&mut vault, &mut session, &mut staged, &mismatched, 10)
             .expect_err("mismatched receipt should be rejected");
 
         assert_eq!(error, TransitionError::SessionMismatch);
@@ -897,10 +943,11 @@ mod tests {
         };
         let mut session = open_action_session(&receipt);
         let mut staged = stage_policy_receipt(&receipt);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
         session.status = SessionStatus::Ready as u8;
         session.policy_version = 10;
 
-        let error = finalize_action_session(&mut session, &mut staged, &receipt, 10)
+        let error = finalize_action_session(&mut vault, &mut session, &mut staged, &receipt, 10)
             .expect_err("mismatched policy version should fail");
 
         assert_eq!(error, TransitionError::SessionPolicyMismatch);
@@ -917,9 +964,10 @@ mod tests {
         };
         let mut session = open_action_session(&receipt);
         let mut staged = stage_policy_receipt(&receipt);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
         session.status = SessionStatus::Ready as u8;
 
-        let error = finalize_action_session(&mut session, &mut staged, &receipt, 10)
+        let error = finalize_action_session(&mut vault, &mut session, &mut staged, &receipt, 10)
             .expect_err("expired session should not finalize");
 
         assert_eq!(error, TransitionError::SessionExpired);
@@ -934,14 +982,36 @@ mod tests {
             nonce: 5,
             expiry_slot: 10,
         };
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
         let mut session = open_action_session(&receipt);
         let mut staged = stage_policy_receipt(&receipt);
         session.status = SessionStatus::Ready as u8;
 
-        let error = finalize_action_session(&mut session, &mut staged, &receipt, 10)
+        let error = finalize_action_session(&mut vault, &mut session, &mut staged, &receipt, 10)
             .expect_err("pqc-only threshold should not finalize through spend path");
 
         assert_eq!(error, TransitionError::SessionRequiresPqc);
+    }
+
+    #[test]
+    fn finalizing_action_session_rejects_replayed_nonce() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        vault.last_consumed_receipt_nonce = 5;
+        let mut session = open_action_session(&receipt);
+        let mut staged = stage_policy_receipt(&receipt);
+        session.status = SessionStatus::Ready as u8;
+
+        let error = finalize_action_session(&mut vault, &mut session, &mut staged, &receipt, 10)
+            .expect_err("replayed nonce should fail finalize");
+
+        assert_eq!(error, TransitionError::ReceiptNonceReplay);
     }
 
     #[test]

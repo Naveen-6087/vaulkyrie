@@ -28,9 +28,10 @@ pub struct VaultRegistry {
     pub wallet_pubkey: [u8; 32],
     pub current_authority_hash: [u8; 32],
     pub policy_version: u64,
+    pub last_consumed_receipt_nonce: u64,
     pub status: u8,
     pub bump: u8,
-    pub reserved: [u8; 14],
+    pub reserved: [u8; 6],
 }
 
 impl VaultRegistry {
@@ -48,9 +49,10 @@ impl VaultRegistry {
             wallet_pubkey,
             current_authority_hash,
             policy_version,
+            last_consumed_receipt_nonce: 0,
             status: status as u8,
             bump,
-            reserved: [0; 14],
+            reserved: [0; 6],
         }
     }
 
@@ -63,9 +65,10 @@ impl VaultRegistry {
         dst[8..40].copy_from_slice(&self.wallet_pubkey);
         dst[40..72].copy_from_slice(&self.current_authority_hash);
         dst[72..80].copy_from_slice(&self.policy_version.to_le_bytes());
-        dst[80] = self.status;
-        dst[81] = self.bump;
-        dst[82..96].copy_from_slice(&self.reserved);
+        dst[80..88].copy_from_slice(&self.last_consumed_receipt_nonce.to_le_bytes());
+        dst[88] = self.status;
+        dst[89] = self.bump;
+        dst[90..96].copy_from_slice(&self.reserved);
 
         true
     }
@@ -87,16 +90,20 @@ impl VaultRegistry {
         let mut policy_version = [0; 8];
         policy_version.copy_from_slice(&src[72..80]);
 
-        let mut reserved = [0; 14];
-        reserved.copy_from_slice(&src[82..96]);
+        let mut last_consumed_receipt_nonce = [0; 8];
+        last_consumed_receipt_nonce.copy_from_slice(&src[80..88]);
+
+        let mut reserved = [0; 6];
+        reserved.copy_from_slice(&src[90..96]);
 
         Some(Self {
             discriminator,
             wallet_pubkey,
             current_authority_hash,
             policy_version: u64::from_le_bytes(policy_version),
-            status: src[80],
-            bump: src[81],
+            last_consumed_receipt_nonce: u64::from_le_bytes(last_consumed_receipt_nonce),
+            status: src[88],
+            bump: src[89],
             reserved,
         })
     }
@@ -359,6 +366,7 @@ mod tests {
         assert_eq!(state.discriminator, VAULT_REGISTRY_DISCRIMINATOR);
         assert_eq!(VaultRegistry::LEN, 96);
         assert_eq!(state.status, VaultStatus::Active as u8);
+        assert_eq!(state.last_consumed_receipt_nonce, 0);
     }
 
     #[test]
