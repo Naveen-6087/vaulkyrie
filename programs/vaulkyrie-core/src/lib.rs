@@ -5,6 +5,7 @@ use pinocchio::{account_info::AccountInfo, pubkey::Pubkey, ProgramResult};
 use pinocchio::{default_allocator, default_panic_handler, program_entrypoint};
 
 pub mod instruction;
+pub mod processor;
 pub mod state;
 pub mod transition;
 
@@ -22,10 +23,10 @@ fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
 }
 
 pub fn process_instruction(
-    _program_id: &Pubkey,
-    _accounts: &[AccountInfo],
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
-    let _ = instruction::CoreInstruction::try_from(instruction_data)?;
-    Ok(())
+    let instruction = instruction::CoreInstruction::try_from(instruction_data)?;
+    processor::process(program_id, accounts, instruction)
 }
