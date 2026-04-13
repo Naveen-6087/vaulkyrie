@@ -286,6 +286,7 @@ pub fn rotate_vault_authority(
     statement: &AuthorityRotationStatement,
     current_slot: u64,
 ) -> Result<(), TransitionError> {
+    validate_vault_recovery_mode(vault)?;
     validate_vault_authority_alignment(vault, authority)?;
     apply_authority_rotation(authority, statement, current_slot)?;
     vault.current_authority_hash = authority.current_authority_hash;
@@ -910,6 +911,7 @@ mod tests {
     #[test]
     fn rotate_vault_authority_updates_both_states() {
         let mut vault = initialize_vault([1; 32], [3; 32], 9, 4);
+        vault.status = VaultStatus::Recovery as u8;
         let mut authority = initialize_quantum_authority([3; 32], 1);
         let statement = vaulkyrie_protocol::AuthorityRotationStatement {
             action_hash: sample_action_hash(),
@@ -924,6 +926,23 @@ mod tests {
         assert_eq!(vault.current_authority_hash, [4; 32]);
         assert_eq!(authority.current_authority_hash, [4; 32]);
         assert_eq!(authority.next_sequence, 1);
+    }
+
+    #[test]
+    fn rotate_vault_authority_rejects_active_vault() {
+        let mut vault = initialize_vault([1; 32], [3; 32], 9, 4);
+        let mut authority = initialize_quantum_authority([3; 32], 1);
+        let statement = vaulkyrie_protocol::AuthorityRotationStatement {
+            action_hash: sample_action_hash(),
+            next_authority_hash: [4; 32],
+            sequence: 0,
+            expiry_slot: 100,
+        };
+
+        let error = rotate_vault_authority(&mut vault, &mut authority, &statement, 10)
+            .expect_err("active vault should not allow authority rotation");
+
+        assert_eq!(error, TransitionError::VaultNotRecovery);
     }
 
     #[test]
