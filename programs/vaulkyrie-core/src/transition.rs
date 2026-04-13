@@ -9,6 +9,8 @@ use crate::state::{
 pub enum TransitionError {
     ReceiptAlreadyConsumed,
     ReceiptMismatch,
+    VaultPolicyMismatch,
+    VaultNotActive,
     SessionMismatch,
     SessionNotPending,
     SessionNotReady,
@@ -35,6 +37,21 @@ pub fn initialize_quantum_authority(
     bump: u8,
 ) -> QuantumAuthorityState {
     QuantumAuthorityState::new(current_authority_hash, bump)
+}
+
+pub fn validate_vault_for_receipt(
+    vault: &VaultRegistry,
+    receipt: &PolicyReceipt,
+) -> Result<(), TransitionError> {
+    if vault.policy_version != receipt.policy_version {
+        return Err(TransitionError::VaultPolicyMismatch);
+    }
+
+    if vault.status != VaultStatus::Active as u8 {
+        return Err(TransitionError::VaultNotActive);
+    }
+
+    Ok(())
 }
 
 pub fn stage_policy_receipt(receipt: &PolicyReceipt) -> PolicyReceiptState {
@@ -165,11 +182,11 @@ mod tests {
     use super::{
         apply_authority_rotation, consume_action_session, consume_policy_receipt,
         finalize_action_session, initialize_quantum_authority, initialize_vault,
-        mark_action_session_ready,
+        mark_action_session_ready, validate_vault_for_receipt,
         open_action_session, open_action_session_from_receipt, stage_policy_receipt,
         TransitionError,
     };
-    use crate::state::{QuantumAuthorityState, SessionStatus};
+    use crate::state::{QuantumAuthorityState, SessionStatus, VaultStatus};
 
     fn sample_action_hash() -> [u8; 32] {
         ActionDescriptor {
@@ -198,6 +215,56 @@ mod tests {
         assert_eq!(state.current_authority_hash, [8; 32]);
         assert_eq!(state.bump, 6);
         assert_eq!(state.next_sequence, 0);
+    }
+
+    #[test]
+    fn validate_vault_for_receipt_accepts_matching_active_policy() {
+        let vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+
+        validate_vault_for_receipt(&vault, &receipt)
+            .expect("active vault with matching policy should pass");
+    }
+
+    #[test]
+    fn validate_vault_for_receipt_rejects_policy_mismatch() {
+        let vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 10,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+
+        let error = validate_vault_for_receipt(&vault, &receipt)
+            .expect_err("mismatched policy version should fail");
+
+        assert_eq!(error, TransitionError::VaultPolicyMismatch);
+    }
+
+    #[test]
+    fn validate_vault_for_receipt_rejects_non_active_vault() {
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        vault.status = VaultStatus::Locked as u8;
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+
+        let error = validate_vault_for_receipt(&vault, &receipt)
+            .expect_err("locked vault should not stage receipts");
+
+        assert_eq!(error, TransitionError::VaultNotActive);
     }
 
     #[test]

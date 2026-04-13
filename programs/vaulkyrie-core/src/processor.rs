@@ -6,7 +6,7 @@ use crate::{
     state::{
         ActionSessionState, PolicyReceiptState, QuantumAuthorityState, VaultRegistry,
         ACTION_SESSION_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR,
-        QUANTUM_STATE_DISCRIMINATOR,
+        QUANTUM_STATE_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
     },
     transition,
 };
@@ -33,11 +33,16 @@ pub fn process(
             process_init_authority_data(&mut data, args)
         }
         CoreInstruction::StageReceipt(receipt) => {
-            let account = get_account_info!(accounts, 0);
-            require_writable(account)?;
-            require_program_owner(program_id, account)?;
-            let mut data = account.try_borrow_mut_data()?;
-            process_stage_receipt_data(&mut data, &receipt)
+            let vault_account = get_account_info!(accounts, 0);
+            require_program_owner(program_id, vault_account)?;
+            let vault_data = vault_account.try_borrow_data()?;
+
+            let receipt_account = get_account_info!(accounts, 1);
+            require_writable(receipt_account)?;
+            require_program_owner(program_id, receipt_account)?;
+            let mut receipt_data = receipt_account.try_borrow_mut_data()?;
+
+            process_stage_receipt_data(&vault_data, &mut receipt_data, &receipt)
         }
         CoreInstruction::ConsumeReceipt(receipt) => {
             let account = get_account_info!(accounts, 0);
@@ -133,16 +138,24 @@ pub fn process_init_authority_data(dst: &mut [u8], args: InitAuthorityArgs) -> P
     Ok(())
 }
 
-pub fn process_stage_receipt_data(dst: &mut [u8], receipt: &PolicyReceipt) -> ProgramResult {
-    if dst.len() != PolicyReceiptState::LEN {
+pub fn process_stage_receipt_data(
+    vault_src: &[u8],
+    receipt_dst: &mut [u8],
+    receipt: &PolicyReceipt,
+) -> ProgramResult {
+    if vault_src.len() != VaultRegistry::LEN || receipt_dst.len() != PolicyReceiptState::LEN {
         return Err(ProgramError::AccountDataTooSmall);
     }
-    if !is_zeroed(dst) {
+    if !is_zeroed(receipt_dst) {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
 
+    let vault = VaultRegistry::decode(vault_src).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&vault.discriminator, &VAULT_REGISTRY_DISCRIMINATOR)?;
+    transition::validate_vault_for_receipt(&vault, receipt).map_err(map_transition_error)?;
+
     let state = transition::stage_policy_receipt(receipt);
-    if !state.encode(dst) {
+    if !state.encode(receipt_dst) {
         return Err(ProgramError::InvalidAccountData);
     }
 
@@ -310,6 +323,8 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
     match error {
         transition::TransitionError::ReceiptAlreadyConsumed => ProgramError::AccountAlreadyInitialized,
         transition::TransitionError::ReceiptMismatch => ProgramError::InvalidAccountData,
+        transition::TransitionError::VaultPolicyMismatch => ProgramError::InvalidArgument,
+        transition::TransitionError::VaultNotActive => ProgramError::InvalidAccountData,
         transition::TransitionError::SessionMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::SessionNotPending => ProgramError::AccountAlreadyInitialized,
         transition::TransitionError::SessionNotReady => ProgramError::InvalidAccountData,
@@ -433,13 +448,46 @@ mod tests {
     #[test]
     fn stage_and_consume_receipt_updates_consumed_flag() {
         let receipt = sample_receipt();
+        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+        let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut bytes = [0; PolicyReceiptState::LEN];
 
-        process_stage_receipt_data(&mut bytes, &receipt).expect("stage should succeed");
+        assert!(vault.encode(&mut vault_bytes));
+
+        process_stage_receipt_data(&vault_bytes, &mut bytes, &receipt)
+            .expect("stage should succeed");
         process_consume_receipt_data(&mut bytes, &receipt).expect("consume should succeed");
 
         let state = PolicyReceiptState::decode(&bytes).expect("state should decode");
         assert_eq!(state.consumed, 1);
+    }
+
+    #[test]
+    fn stage_receipt_rejects_policy_mismatch() {
+        let receipt = sample_receipt();
+        let vault = VaultRegistry::new([5; 32], [6; 32], 99, crate::state::VaultStatus::Active, 8);
+        let mut vault_bytes = [0; VaultRegistry::LEN];
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
+
+        assert!(vault.encode(&mut vault_bytes));
+        let error = process_stage_receipt_data(&vault_bytes, &mut receipt_bytes, &receipt)
+            .expect_err("policy mismatch should fail");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn stage_receipt_rejects_non_active_vault() {
+        let receipt = sample_receipt();
+        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Locked, 8);
+        let mut vault_bytes = [0; VaultRegistry::LEN];
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
+
+        assert!(vault.encode(&mut vault_bytes));
+        let error = process_stage_receipt_data(&vault_bytes, &mut receipt_bytes, &receipt)
+            .expect_err("non-active vault should fail");
+
+        assert_eq!(error, ProgramError::InvalidAccountData);
     }
 
     #[test]
