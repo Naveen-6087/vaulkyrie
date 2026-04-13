@@ -9,6 +9,7 @@ use crate::state::{
 pub enum TransitionError {
     ReceiptAlreadyConsumed,
     ReceiptMismatch,
+    VaultAuthorityMismatch,
     VaultPolicyMismatch,
     VaultNotActive,
     SessionMismatch,
@@ -49,6 +50,17 @@ pub fn validate_vault_for_receipt(
 
     if vault.status != VaultStatus::Active as u8 {
         return Err(TransitionError::VaultNotActive);
+    }
+
+    Ok(())
+}
+
+pub fn validate_vault_authority_alignment(
+    vault: &VaultRegistry,
+    authority: &QuantumAuthorityState,
+) -> Result<(), TransitionError> {
+    if vault.current_authority_hash != authority.current_authority_hash {
+        return Err(TransitionError::VaultAuthorityMismatch);
     }
 
     Ok(())
@@ -175,6 +187,18 @@ pub fn apply_authority_rotation(
     Ok(())
 }
 
+pub fn rotate_vault_authority(
+    vault: &mut VaultRegistry,
+    authority: &mut QuantumAuthorityState,
+    statement: &AuthorityRotationStatement,
+) -> Result<(), TransitionError> {
+    validate_vault_authority_alignment(vault, authority)?;
+    apply_authority_rotation(authority, statement)?;
+    vault.current_authority_hash = authority.current_authority_hash;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use vaulkyrie_protocol::{ActionDescriptor, ActionKind, ThresholdRequirement};
@@ -182,7 +206,8 @@ mod tests {
     use super::{
         apply_authority_rotation, consume_action_session, consume_policy_receipt,
         finalize_action_session, initialize_quantum_authority, initialize_vault,
-        mark_action_session_ready, validate_vault_for_receipt,
+        mark_action_session_ready, rotate_vault_authority, validate_vault_authority_alignment,
+        validate_vault_for_receipt,
         open_action_session, open_action_session_from_receipt, stage_policy_receipt,
         TransitionError,
     };
@@ -265,6 +290,26 @@ mod tests {
             .expect_err("locked vault should not stage receipts");
 
         assert_eq!(error, TransitionError::VaultNotActive);
+    }
+
+    #[test]
+    fn validate_vault_authority_alignment_accepts_matching_hashes() {
+        let vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let authority = initialize_quantum_authority([2; 32], 1);
+
+        validate_vault_authority_alignment(&vault, &authority)
+            .expect("matching authority hashes should pass");
+    }
+
+    #[test]
+    fn validate_vault_authority_alignment_rejects_mismatch() {
+        let vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let authority = initialize_quantum_authority([3; 32], 1);
+
+        let error = validate_vault_authority_alignment(&vault, &authority)
+            .expect_err("mismatched authority hashes should fail");
+
+        assert_eq!(error, TransitionError::VaultAuthorityMismatch);
     }
 
     #[test]
@@ -545,5 +590,24 @@ mod tests {
             .expect_err("stale sequence should be rejected");
 
         assert_eq!(error, TransitionError::AuthoritySequenceMismatch);
+    }
+
+    #[test]
+    fn rotate_vault_authority_updates_both_states() {
+        let mut vault = initialize_vault([1; 32], [3; 32], 9, 4);
+        let mut authority = initialize_quantum_authority([3; 32], 1);
+        let statement = vaulkyrie_protocol::AuthorityRotationStatement {
+            action_hash: sample_action_hash(),
+            next_authority_hash: [4; 32],
+            sequence: 0,
+            expiry_slot: 100,
+        };
+
+        rotate_vault_authority(&mut vault, &mut authority, &statement)
+            .expect("aligned authority should rotate");
+
+        assert_eq!(vault.current_authority_hash, [4; 32]);
+        assert_eq!(authority.current_authority_hash, [4; 32]);
+        assert_eq!(authority.next_sequence, 1);
     }
 }

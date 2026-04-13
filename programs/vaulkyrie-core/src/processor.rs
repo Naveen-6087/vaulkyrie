@@ -91,11 +91,17 @@ pub fn process(
             process_finalize_session_data(&mut receipt_data, &mut session_data, &receipt)
         }
         CoreInstruction::RotateAuthority(statement) => {
-            let account = get_account_info!(accounts, 0);
-            require_writable(account)?;
-            require_program_owner(program_id, account)?;
-            let mut data = account.try_borrow_mut_data()?;
-            process_rotate_authority_data(&mut data, &statement)
+            let vault_account = get_account_info!(accounts, 0);
+            require_writable(vault_account)?;
+            require_program_owner(program_id, vault_account)?;
+            let mut vault_data = vault_account.try_borrow_mut_data()?;
+
+            let authority_account = get_account_info!(accounts, 1);
+            require_writable(authority_account)?;
+            require_program_owner(program_id, authority_account)?;
+            let mut authority_data = authority_account.try_borrow_mut_data()?;
+
+            process_rotate_authority_data(&mut vault_data, &mut authority_data, &statement)
         }
     }
 }
@@ -269,19 +275,25 @@ pub fn process_finalize_session_data(
 }
 
 pub fn process_rotate_authority_data(
-    dst: &mut [u8],
+    vault_dst: &mut [u8],
+    authority_dst: &mut [u8],
     statement: &AuthorityRotationStatement,
 ) -> ProgramResult {
-    if dst.len() != QuantumAuthorityState::LEN {
+    if vault_dst.len() != VaultRegistry::LEN || authority_dst.len() != QuantumAuthorityState::LEN {
         return Err(ProgramError::AccountDataTooSmall);
     }
 
-    let mut state = QuantumAuthorityState::decode(dst).ok_or(ProgramError::InvalidAccountData)?;
-    require_discriminator(&state.discriminator, &QUANTUM_STATE_DISCRIMINATOR)?;
-    transition::apply_authority_rotation(&mut state, statement)
+    let mut vault = VaultRegistry::decode(vault_dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&vault.discriminator, &VAULT_REGISTRY_DISCRIMINATOR)?;
+
+    let mut authority =
+        QuantumAuthorityState::decode(authority_dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&authority.discriminator, &QUANTUM_STATE_DISCRIMINATOR)?;
+
+    transition::rotate_vault_authority(&mut vault, &mut authority, statement)
         .map_err(map_transition_error)?;
 
-    if !state.encode(dst) {
+    if !vault.encode(vault_dst) || !authority.encode(authority_dst) {
         return Err(ProgramError::InvalidAccountData);
     }
 
@@ -323,6 +335,7 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
     match error {
         transition::TransitionError::ReceiptAlreadyConsumed => ProgramError::AccountAlreadyInitialized,
         transition::TransitionError::ReceiptMismatch => ProgramError::InvalidAccountData,
+        transition::TransitionError::VaultAuthorityMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::VaultPolicyMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::VaultNotActive => ProgramError::InvalidAccountData,
         transition::TransitionError::SessionMismatch => ProgramError::InvalidArgument,
@@ -492,11 +505,15 @@ mod tests {
 
     #[test]
     fn rotate_authority_updates_current_hash() {
+        let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut bytes = [0; QuantumAuthorityState::LEN];
+        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Active, 8);
         let initial = QuantumAuthorityState::new([7; 32], 1);
+        assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut bytes));
 
         process_rotate_authority_data(
+            &mut vault_bytes,
             &mut bytes,
             &vaulkyrie_protocol::AuthorityRotationStatement {
                 action_hash: sample_action_hash(),
@@ -507,9 +524,35 @@ mod tests {
         )
         .expect("rotation should succeed");
 
+        let vault = VaultRegistry::decode(&vault_bytes).expect("vault should decode");
         let state = QuantumAuthorityState::decode(&bytes).expect("state should decode");
+        assert_eq!(vault.current_authority_hash, [8; 32]);
         assert_eq!(state.current_authority_hash, [8; 32]);
         assert_eq!(state.next_sequence, 1);
+    }
+
+    #[test]
+    fn rotate_authority_rejects_vault_authority_mismatch() {
+        let mut vault_bytes = [0; VaultRegistry::LEN];
+        let mut authority_bytes = [0; QuantumAuthorityState::LEN];
+        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Active, 8);
+        let initial = QuantumAuthorityState::new([9; 32], 1);
+        assert!(vault.encode(&mut vault_bytes));
+        assert!(initial.encode(&mut authority_bytes));
+
+        let error = process_rotate_authority_data(
+            &mut vault_bytes,
+            &mut authority_bytes,
+            &vaulkyrie_protocol::AuthorityRotationStatement {
+                action_hash: sample_action_hash(),
+                next_authority_hash: [8; 32],
+                sequence: 0,
+                expiry_slot: 200,
+            },
+        )
+        .expect_err("mismatched vault and authority should fail");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
     }
 
     #[test]
