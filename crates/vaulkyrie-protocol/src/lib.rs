@@ -66,6 +66,11 @@ impl TryFrom<u8> for ThresholdRequirement {
     }
 }
 
+pub const WOTS_CHAIN_COUNT: usize = 16;
+pub const WOTS_ELEMENT_BYTES: usize = 32;
+pub const WOTS_CHAIN_MAX_STEPS: u8 = 15;
+pub const WOTS_KEY_BYTES: usize = WOTS_CHAIN_COUNT * WOTS_ELEMENT_BYTES;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyReceipt {
     pub action_hash: [u8; 32],
@@ -94,6 +99,111 @@ pub struct AuthorityRotationStatement {
     pub next_authority_hash: [u8; 32],
     pub sequence: u64,
     pub expiry_slot: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WotsAuthProof {
+    pub public_key: [u8; WOTS_KEY_BYTES],
+    pub signature: [u8; WOTS_KEY_BYTES],
+}
+
+impl WotsAuthProof {
+    pub const ENCODED_LEN: usize = WOTS_KEY_BYTES * 2;
+
+    pub fn encode(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != Self::ENCODED_LEN {
+            return false;
+        }
+
+        dst[..WOTS_KEY_BYTES].copy_from_slice(&self.public_key);
+        dst[WOTS_KEY_BYTES..Self::ENCODED_LEN].copy_from_slice(&self.signature);
+        true
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::ENCODED_LEN {
+            return None;
+        }
+
+        let mut public_key = [0; WOTS_KEY_BYTES];
+        public_key.copy_from_slice(&src[..WOTS_KEY_BYTES]);
+        let mut signature = [0; WOTS_KEY_BYTES];
+        signature.copy_from_slice(&src[WOTS_KEY_BYTES..Self::ENCODED_LEN]);
+
+        Some(Self {
+            public_key,
+            signature,
+        })
+    }
+
+    pub fn authority_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.public_key);
+        hasher.finalize().into()
+    }
+
+    pub fn verify_digest(&self, digest: [u8; 32]) -> bool {
+        let digits = wots_message_digits(digest);
+
+        for (chain_index, steps) in digits.iter().enumerate() {
+            let sig_element = wots_get_element(&self.signature, chain_index);
+            let expected_public_element =
+                wots_hash_chain(sig_element, WOTS_CHAIN_MAX_STEPS.saturating_sub(*steps));
+            if wots_get_element(&self.public_key, chain_index) != expected_public_element {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    pub fn verify_statement(&self, statement: &AuthorityRotationStatement) -> bool {
+        self.verify_digest(statement.digest())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WotsSecretKey {
+    pub elements: [u8; WOTS_KEY_BYTES],
+}
+
+impl WotsSecretKey {
+    pub fn public_key(&self) -> [u8; WOTS_KEY_BYTES] {
+        let mut public_key = [0; WOTS_KEY_BYTES];
+        for chain_index in 0..WOTS_CHAIN_COUNT {
+            let secret_element = wots_get_element(&self.elements, chain_index);
+            let public_element = wots_hash_chain(secret_element, WOTS_CHAIN_MAX_STEPS);
+            wots_set_element(&mut public_key, chain_index, public_element);
+        }
+
+        public_key
+    }
+
+    pub fn authority_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.public_key());
+        hasher.finalize().into()
+    }
+
+    pub fn sign_digest(&self, digest: [u8; 32]) -> WotsAuthProof {
+        let digits = wots_message_digits(digest);
+        let mut signature = [0; WOTS_KEY_BYTES];
+
+        for (chain_index, steps) in digits.iter().enumerate() {
+            let secret_element = wots_get_element(&self.elements, chain_index);
+            let signature_element = wots_hash_chain(secret_element, *steps);
+            wots_set_element(&mut signature, chain_index, signature_element);
+        }
+
+        WotsAuthProof {
+            public_key: self.public_key(),
+            signature,
+        }
+    }
+
+    pub fn sign_statement(&self, statement: &AuthorityRotationStatement) -> WotsAuthProof {
+        self.sign_digest(statement.digest())
+    }
 }
 
 impl AuthorityRotationStatement {
@@ -131,11 +241,49 @@ impl AuthorityRotationStatement {
     }
 }
 
+fn wots_message_digits(digest: [u8; 32]) -> [u8; WOTS_CHAIN_COUNT] {
+    let mut digits = [0; WOTS_CHAIN_COUNT];
+    for (index, value) in digest[..8].iter().enumerate() {
+        digits[index * 2] = value >> 4;
+        digits[(index * 2) + 1] = value & 0x0f;
+    }
+
+    digits
+}
+
+fn wots_hash_chain(mut element: [u8; WOTS_ELEMENT_BYTES], steps: u8) -> [u8; WOTS_ELEMENT_BYTES] {
+    for _ in 0..steps {
+        let mut hasher = Sha256::new();
+        hasher.update(element);
+        element = hasher.finalize().into();
+    }
+
+    element
+}
+
+fn wots_get_element(data: &[u8; WOTS_KEY_BYTES], chain_index: usize) -> [u8; WOTS_ELEMENT_BYTES] {
+    let start = chain_index * WOTS_ELEMENT_BYTES;
+    let end = start + WOTS_ELEMENT_BYTES;
+    let mut element = [0; WOTS_ELEMENT_BYTES];
+    element.copy_from_slice(&data[start..end]);
+    element
+}
+
+fn wots_set_element(
+    dst: &mut [u8; WOTS_KEY_BYTES],
+    chain_index: usize,
+    value: [u8; WOTS_ELEMENT_BYTES],
+) {
+    let start = chain_index * WOTS_ELEMENT_BYTES;
+    let end = start + WOTS_ELEMENT_BYTES;
+    dst[start..end].copy_from_slice(&value);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionDescriptor, ActionKind, AuthorityRotationStatement, PolicyReceipt,
-        ThresholdRequirement,
+        ActionDescriptor, ActionKind, AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement,
+        WotsAuthProof, WotsSecretKey, WOTS_KEY_BYTES,
     };
 
     fn descriptor(kind: ActionKind) -> ActionDescriptor {
@@ -247,5 +395,53 @@ mod tests {
             Ok(ThresholdRequirement::RequirePqcAuth)
         );
         assert_eq!(ThresholdRequirement::try_from(99), Err(()));
+    }
+
+    fn sample_wots_secret(seed: u8) -> WotsSecretKey {
+        let mut elements = [0u8; WOTS_KEY_BYTES];
+        for (index, byte) in elements.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(index as u8);
+        }
+        WotsSecretKey { elements }
+    }
+
+    #[test]
+    fn wots_signature_verifies_for_statement_digest() {
+        let secret = sample_wots_secret(7);
+        let statement = AuthorityRotationStatement {
+            action_hash: [11; 32],
+            next_authority_hash: [12; 32],
+            sequence: 2,
+            expiry_slot: 900,
+        };
+        let proof = secret.sign_statement(&statement);
+
+        assert!(proof.verify_statement(&statement));
+    }
+
+    #[test]
+    fn wots_signature_rejects_tampered_signature() {
+        let secret = sample_wots_secret(7);
+        let statement = AuthorityRotationStatement {
+            action_hash: [11; 32],
+            next_authority_hash: [12; 32],
+            sequence: 2,
+            expiry_slot: 900,
+        };
+        let mut proof = secret.sign_statement(&statement);
+        proof.signature[0] ^= 1;
+
+        assert!(!proof.verify_statement(&statement));
+    }
+
+    #[test]
+    fn wots_proof_roundtrips_through_bytes() {
+        let proof = WotsAuthProof {
+            public_key: [3; WOTS_KEY_BYTES],
+            signature: [4; WOTS_KEY_BYTES],
+        };
+        let mut bytes = [0u8; WotsAuthProof::ENCODED_LEN];
+        assert!(proof.encode(&mut bytes));
+        assert_eq!(WotsAuthProof::decode(&bytes), Some(proof));
     }
 }

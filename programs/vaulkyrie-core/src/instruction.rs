@@ -1,5 +1,7 @@
 use pinocchio::program_error::ProgramError;
-use vaulkyrie_protocol::{AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement};
+use vaulkyrie_protocol::{
+    AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement, WotsAuthProof,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitVaultArgs {
@@ -16,6 +18,12 @@ pub struct InitAuthorityArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotateAuthorityArgs {
+    pub statement: AuthorityRotationStatement,
+    pub proof: WotsAuthProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreInstruction {
     Ping,
     InitVault(InitVaultArgs),
@@ -27,7 +35,7 @@ pub enum CoreInstruction {
     ConsumeSession([u8; 32]),
     FinalizeSession(PolicyReceipt),
     SetVaultStatus(u8),
-    RotateAuthority(AuthorityRotationStatement),
+    RotateAuthority(RotateAuthorityArgs),
 }
 
 impl TryFrom<&[u8]> for CoreInstruction {
@@ -45,7 +53,7 @@ impl TryFrom<&[u8]> for CoreInstruction {
             [7, rest @ ..] => Ok(Self::ConsumeSession(parse_action_hash(rest)?)),
             [8, rest @ ..] => Ok(Self::FinalizeSession(parse_policy_receipt(rest)?)),
             [9, rest @ ..] => Ok(Self::SetVaultStatus(parse_vault_status(rest)?)),
-            [10, rest @ ..] => Ok(Self::RotateAuthority(parse_authority_rotation(rest)?)),
+            [10, rest @ ..] => Ok(Self::RotateAuthority(parse_rotate_authority_args(rest)?)),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -134,7 +142,7 @@ fn parse_policy_receipt(data: &[u8]) -> Result<PolicyReceipt, ProgramError> {
     })
 }
 
-fn parse_authority_rotation(data: &[u8]) -> Result<AuthorityRotationStatement, ProgramError> {
+fn parse_authority_rotation_statement(data: &[u8]) -> Result<AuthorityRotationStatement, ProgramError> {
     if data.len() != 80 {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -159,11 +167,24 @@ fn parse_authority_rotation(data: &[u8]) -> Result<AuthorityRotationStatement, P
     })
 }
 
+fn parse_rotate_authority_args(data: &[u8]) -> Result<RotateAuthorityArgs, ProgramError> {
+    if data.len() != 80 + WotsAuthProof::ENCODED_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let statement = parse_authority_rotation_statement(&data[..80])?;
+    let proof = WotsAuthProof::decode(&data[80..]).ok_or(ProgramError::InvalidInstructionData)?;
+
+    Ok(RotateAuthorityArgs { statement, proof })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CoreInstruction, InitAuthorityArgs, InitVaultArgs};
+    use super::{CoreInstruction, InitAuthorityArgs, InitVaultArgs, RotateAuthorityArgs};
     use pinocchio::program_error::ProgramError;
-    use vaulkyrie_protocol::{AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement};
+    use vaulkyrie_protocol::{
+        AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement, WotsAuthProof, WOTS_KEY_BYTES,
+    };
 
     #[test]
     fn parses_ping_instruction() {
@@ -304,14 +325,22 @@ mod tests {
         data.extend_from_slice(&[6; 32]);
         data.extend_from_slice(&13u64.to_le_bytes());
         data.extend_from_slice(&14u64.to_le_bytes());
+        data.extend_from_slice(&[7; WOTS_KEY_BYTES]);
+        data.extend_from_slice(&[8; WOTS_KEY_BYTES]);
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
-            Ok(CoreInstruction::RotateAuthority(AuthorityRotationStatement {
-                action_hash: [5; 32],
-                next_authority_hash: [6; 32],
-                sequence: 13,
-                expiry_slot: 14,
+            Ok(CoreInstruction::RotateAuthority(RotateAuthorityArgs {
+                statement: AuthorityRotationStatement {
+                    action_hash: [5; 32],
+                    next_authority_hash: [6; 32],
+                    sequence: 13,
+                    expiry_slot: 14,
+                },
+                proof: WotsAuthProof {
+                    public_key: [7; WOTS_KEY_BYTES],
+                    signature: [8; WOTS_KEY_BYTES],
+                },
             }))
         );
     }

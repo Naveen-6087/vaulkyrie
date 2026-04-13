@@ -201,7 +201,7 @@ pub fn process(
             let mut vault_data = vault_account.try_borrow_mut_data()?;
             process_set_vault_status_data(&mut vault_data, status)
         }
-        CoreInstruction::RotateAuthority(statement) => {
+        CoreInstruction::RotateAuthority(args) => {
             let current_slot = current_slot()?;
             let vault_account = get_account_info!(accounts, 0);
             require_program_owner(program_id, vault_account)?;
@@ -223,7 +223,8 @@ pub fn process(
             process_rotate_authority_data(
                 &mut vault_data,
                 &mut authority_data,
-                &statement,
+                &args.statement,
+                &args.proof,
                 current_slot,
             )
         }
@@ -476,6 +477,7 @@ pub fn process_rotate_authority_data(
     vault_dst: &mut [u8],
     authority_dst: &mut [u8],
     statement: &AuthorityRotationStatement,
+    proof: &vaulkyrie_protocol::WotsAuthProof,
     current_slot: u64,
 ) -> ProgramResult {
     if vault_dst.len() != VaultRegistry::LEN || authority_dst.len() != QuantumAuthorityState::LEN {
@@ -490,7 +492,7 @@ pub fn process_rotate_authority_data(
         QuantumAuthorityState::decode(authority_dst).ok_or(ProgramError::InvalidAccountData)?;
     require_discriminator(&authority.discriminator, &QUANTUM_STATE_DISCRIMINATOR)?;
 
-    transition::rotate_vault_authority(&mut vault, &mut authority, statement, current_slot)
+    transition::rotate_vault_authority(&mut vault, &mut authority, statement, proof, current_slot)
         .map_err(map_transition_error)?;
 
     if !vault.encode(vault_dst) || !authority.encode(authority_dst) {
@@ -583,13 +585,18 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::AuthorityNoOp => ProgramError::InvalidArgument,
         transition::TransitionError::AuthoritySequenceMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::AuthorityActionMismatch => ProgramError::InvalidArgument,
+        transition::TransitionError::AuthorityProofInvalid => ProgramError::InvalidArgument,
+        transition::TransitionError::AuthorityProofMismatch => ProgramError::InvalidArgument,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use pinocchio::program_error::ProgramError;
-    use vaulkyrie_protocol::{ActionDescriptor, ActionKind, PolicyReceipt, ThresholdRequirement};
+    use vaulkyrie_protocol::{
+        ActionDescriptor, ActionKind, PolicyReceipt, ThresholdRequirement, WotsSecretKey,
+        WOTS_KEY_BYTES,
+    };
 
     use super::{
         process_activate_session_data, process_consume_receipt_data, process_consume_session_data,
@@ -639,6 +646,14 @@ mod tests {
         };
         statement.action_hash = statement.expected_action_hash(vault.wallet_pubkey, vault.policy_version);
         statement
+    }
+
+    fn sample_wots_secret(seed: u8) -> WotsSecretKey {
+        let mut elements = [0u8; WOTS_KEY_BYTES];
+        for (index, byte) in elements.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(index as u8);
+        }
+        WotsSecretKey { elements }
     }
 
     #[test]
@@ -884,16 +899,25 @@ mod tests {
     fn rotate_authority_updates_current_hash() {
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut bytes = [0; QuantumAuthorityState::LEN];
-        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Recovery, 8);
-        let initial = QuantumAuthorityState::new([7; 32], 1);
+        let secret = sample_wots_secret(41);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            secret.authority_hash(),
+            3,
+            crate::state::VaultStatus::Recovery,
+            8,
+        );
+        let initial = QuantumAuthorityState::new(secret.authority_hash(), 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut bytes));
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
+        let proof = secret.sign_statement(&statement);
 
         process_rotate_authority_data(
             &mut vault_bytes,
             &mut bytes,
             &statement,
+            &proof,
             10,
         )
         .expect("rotation should succeed");
@@ -909,16 +933,25 @@ mod tests {
     fn rotate_authority_rejects_vault_authority_mismatch() {
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut authority_bytes = [0; QuantumAuthorityState::LEN];
-        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Recovery, 8);
+        let secret = sample_wots_secret(41);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            secret.authority_hash(),
+            3,
+            crate::state::VaultStatus::Recovery,
+            8,
+        );
         let initial = QuantumAuthorityState::new([9; 32], 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
+        let proof = secret.sign_statement(&statement);
 
         let error = process_rotate_authority_data(
             &mut vault_bytes,
             &mut authority_bytes,
             &statement,
+            &proof,
             10,
         )
         .expect_err("mismatched vault and authority should fail");
@@ -930,16 +963,25 @@ mod tests {
     fn rotate_authority_rejects_no_op_hash() {
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut authority_bytes = [0; QuantumAuthorityState::LEN];
-        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Recovery, 8);
-        let initial = QuantumAuthorityState::new([7; 32], 1);
+        let secret = sample_wots_secret(41);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            secret.authority_hash(),
+            3,
+            crate::state::VaultStatus::Recovery,
+            8,
+        );
+        let initial = QuantumAuthorityState::new(secret.authority_hash(), 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
-        let statement = sample_rotation_statement(&vault, [7; 32], 0, 200);
+        let statement = sample_rotation_statement(&vault, secret.authority_hash(), 0, 200);
+        let proof = secret.sign_statement(&statement);
 
         let error = process_rotate_authority_data(
             &mut vault_bytes,
             &mut authority_bytes,
             &statement,
+            &proof,
             10,
         )
         .expect_err("no-op authority rotation should fail");
@@ -951,16 +993,25 @@ mod tests {
     fn rotate_authority_rejects_expired_statement() {
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut authority_bytes = [0; QuantumAuthorityState::LEN];
-        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Recovery, 8);
-        let initial = QuantumAuthorityState::new([7; 32], 1);
+        let secret = sample_wots_secret(41);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            secret.authority_hash(),
+            3,
+            crate::state::VaultStatus::Recovery,
+            8,
+        );
+        let initial = QuantumAuthorityState::new(secret.authority_hash(), 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 9);
+        let proof = secret.sign_statement(&statement);
 
         let error = process_rotate_authority_data(
             &mut vault_bytes,
             &mut authority_bytes,
             &statement,
+            &proof,
             10,
         )
         .expect_err("expired authority statement should fail");
@@ -972,16 +1023,25 @@ mod tests {
     fn rotate_authority_rejects_active_vault() {
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut authority_bytes = [0; QuantumAuthorityState::LEN];
-        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Active, 8);
-        let initial = QuantumAuthorityState::new([7; 32], 1);
+        let secret = sample_wots_secret(41);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            secret.authority_hash(),
+            3,
+            crate::state::VaultStatus::Active,
+            8,
+        );
+        let initial = QuantumAuthorityState::new(secret.authority_hash(), 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
+        let proof = secret.sign_statement(&statement);
 
         let error = process_rotate_authority_data(
             &mut vault_bytes,
             &mut authority_bytes,
             &statement,
+            &proof,
             10,
         )
         .expect_err("active vault should fail recovery-mode rotation");
@@ -993,8 +1053,15 @@ mod tests {
     fn rotate_authority_rejects_unbound_action_hash() {
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut authority_bytes = [0; QuantumAuthorityState::LEN];
-        let vault = VaultRegistry::new([5; 32], [7; 32], 3, crate::state::VaultStatus::Recovery, 8);
-        let initial = QuantumAuthorityState::new([7; 32], 1);
+        let secret = sample_wots_secret(41);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            secret.authority_hash(),
+            3,
+            crate::state::VaultStatus::Recovery,
+            8,
+        );
+        let initial = QuantumAuthorityState::new(secret.authority_hash(), 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
         let statement = vaulkyrie_protocol::AuthorityRotationStatement {
@@ -1003,14 +1070,47 @@ mod tests {
             sequence: 0,
             expiry_slot: 200,
         };
+        let proof = secret.sign_statement(&statement);
 
         let error = process_rotate_authority_data(
             &mut vault_bytes,
             &mut authority_bytes,
             &statement,
+            &proof,
             10,
         )
         .expect_err("rotation should require rekey-bound action hash");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn rotate_authority_rejects_invalid_wots_proof() {
+        let mut vault_bytes = [0; VaultRegistry::LEN];
+        let mut authority_bytes = [0; QuantumAuthorityState::LEN];
+        let secret = sample_wots_secret(41);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            secret.authority_hash(),
+            3,
+            crate::state::VaultStatus::Recovery,
+            8,
+        );
+        let initial = QuantumAuthorityState::new(secret.authority_hash(), 1);
+        assert!(vault.encode(&mut vault_bytes));
+        assert!(initial.encode(&mut authority_bytes));
+        let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
+        let mut proof = secret.sign_statement(&statement);
+        proof.signature[0] ^= 1;
+
+        let error = process_rotate_authority_data(
+            &mut vault_bytes,
+            &mut authority_bytes,
+            &statement,
+            &proof,
+            10,
+        )
+        .expect_err("tampered proof should fail");
 
         assert_eq!(error, ProgramError::InvalidArgument);
     }
