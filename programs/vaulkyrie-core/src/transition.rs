@@ -1,4 +1,4 @@
-use vaulkyrie_protocol::{AuthorityRotationStatement, PolicyReceipt};
+use vaulkyrie_protocol::{AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement};
 
 use crate::state::{
     ActionSessionState, PolicyReceiptState, QuantumAuthorityState, SessionStatus, VaultRegistry,
@@ -22,6 +22,7 @@ pub enum TransitionError {
     SessionMismatch,
     SessionNotPending,
     SessionNotReady,
+    SessionRequiresPqc,
     AuthorityNoOp,
     AuthoritySequenceMismatch,
 }
@@ -189,6 +190,8 @@ pub fn mark_action_session_ready(
     action_hash: [u8; 32],
     current_slot: u64,
 ) -> Result<(), TransitionError> {
+    validate_spend_threshold(state.threshold)?;
+
     if state.action_hash != action_hash {
         return Err(TransitionError::SessionMismatch);
     }
@@ -210,6 +213,8 @@ pub fn consume_action_session(
     action_hash: [u8; 32],
     current_slot: u64,
 ) -> Result<(), TransitionError> {
+    validate_spend_threshold(state.threshold)?;
+
     if state.action_hash != action_hash {
         return Err(TransitionError::SessionMismatch);
     }
@@ -232,6 +237,8 @@ pub fn finalize_action_session(
     receipt: &PolicyReceipt,
     current_slot: u64,
 ) -> Result<(), TransitionError> {
+    validate_spend_threshold(session.threshold)?;
+
     if session.action_hash != receipt.action_hash
         || session.receipt_commitment != receipt.commitment()
     {
@@ -302,6 +309,14 @@ pub fn validate_vault_for_session(
 
     if vault.policy_version != session.policy_version {
         return Err(TransitionError::SessionPolicyMismatch);
+    }
+
+    Ok(())
+}
+
+fn validate_spend_threshold(threshold: u8) -> Result<(), TransitionError> {
+    if threshold == ThresholdRequirement::RequirePqcAuth.as_byte() {
+        return Err(TransitionError::SessionRequiresPqc);
     }
 
     Ok(())
@@ -705,6 +720,23 @@ mod tests {
     }
 
     #[test]
+    fn marking_action_session_ready_rejects_pqc_only_threshold() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::RequirePqcAuth,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+        let mut session = open_action_session(&receipt);
+
+        let error = mark_action_session_ready(&mut session, receipt.action_hash, 10)
+            .expect_err("pqc-only threshold should not pass spend path");
+
+        assert_eq!(error, TransitionError::SessionRequiresPqc);
+    }
+
+    #[test]
     fn consuming_ready_action_session_updates_status() {
         let receipt = vaulkyrie_protocol::PolicyReceipt {
             action_hash: sample_action_hash(),
@@ -756,6 +788,24 @@ mod tests {
             .expect_err("expired ready session should not be consumable");
 
         assert_eq!(error, TransitionError::SessionExpired);
+    }
+
+    #[test]
+    fn consuming_action_session_rejects_pqc_only_threshold() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::RequirePqcAuth,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+        let mut session = open_action_session(&receipt);
+        session.status = SessionStatus::Ready as u8;
+
+        let error = consume_action_session(&mut session, receipt.action_hash, 10)
+            .expect_err("pqc-only threshold should not be consumable by spend path");
+
+        assert_eq!(error, TransitionError::SessionRequiresPqc);
     }
 
     #[test]
@@ -840,6 +890,25 @@ mod tests {
             .expect_err("expired session should not finalize");
 
         assert_eq!(error, TransitionError::SessionExpired);
+    }
+
+    #[test]
+    fn finalizing_action_session_rejects_pqc_only_threshold() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::RequirePqcAuth,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+        let mut session = open_action_session(&receipt);
+        let mut staged = stage_policy_receipt(&receipt);
+        session.status = SessionStatus::Ready as u8;
+
+        let error = finalize_action_session(&mut session, &mut staged, &receipt, 10)
+            .expect_err("pqc-only threshold should not finalize through spend path");
+
+        assert_eq!(error, TransitionError::SessionRequiresPqc);
     }
 
     #[test]

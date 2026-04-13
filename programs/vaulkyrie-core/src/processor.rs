@@ -545,6 +545,7 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::SessionMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::SessionNotPending => ProgramError::AccountAlreadyInitialized,
         transition::TransitionError::SessionNotReady => ProgramError::InvalidAccountData,
+        transition::TransitionError::SessionRequiresPqc => ProgramError::InvalidArgument,
         transition::TransitionError::AuthorityNoOp => ProgramError::InvalidArgument,
         transition::TransitionError::AuthoritySequenceMismatch => ProgramError::InvalidArgument,
     }
@@ -1016,6 +1017,31 @@ mod tests {
     }
 
     #[test]
+    fn activate_session_rejects_pqc_only_threshold() {
+        let receipt = PolicyReceipt {
+            threshold: ThresholdRequirement::RequirePqcAuth,
+            ..sample_receipt()
+        };
+        let receipt_state = PolicyReceiptState::new(
+            receipt.commitment(),
+            receipt.action_hash,
+            receipt.nonce,
+            receipt.expiry_slot,
+        );
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
+        let mut bytes = [0; ActionSessionState::LEN];
+
+        assert!(receipt_state.encode(&mut receipt_bytes));
+        process_open_session_data(&receipt_bytes, &mut bytes, &receipt, 10)
+            .expect("open session should succeed");
+        let error =
+            process_activate_session_data(&mut bytes, receipt.action_hash, 10, receipt.policy_version)
+                .expect_err("pqc-only threshold should reject spend activation");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
+    }
+
+    #[test]
     fn open_session_rejects_expired_receipt() {
         let receipt = PolicyReceipt {
             expiry_slot: 9,
@@ -1098,6 +1124,42 @@ mod tests {
     }
 
     #[test]
+    fn consume_session_rejects_pqc_only_threshold() {
+        let receipt = PolicyReceipt {
+            threshold: ThresholdRequirement::RequirePqcAuth,
+            ..sample_receipt()
+        };
+        let receipt_state = PolicyReceiptState::new(
+            receipt.commitment(),
+            receipt.action_hash,
+            receipt.nonce,
+            receipt.expiry_slot,
+        );
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
+        let mut session_bytes = [0; ActionSessionState::LEN];
+
+        assert!(receipt_state.encode(&mut receipt_bytes));
+        process_open_session_data(&receipt_bytes, &mut session_bytes, &receipt, 10)
+            .expect("open session should succeed");
+        {
+            let mut state =
+                ActionSessionState::decode(&session_bytes).expect("session should decode");
+            state.status = SessionStatus::Ready as u8;
+            assert!(state.encode(&mut session_bytes));
+        }
+
+        let error = process_consume_session_data(
+            &mut session_bytes,
+            receipt.action_hash,
+            10,
+            receipt.policy_version,
+        )
+        .expect_err("pqc-only threshold should reject spend consumption");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
+    }
+
+    #[test]
     fn finalize_session_consumes_receipt_and_session() {
         let receipt = sample_receipt();
         let staged = PolicyReceiptState::new(
@@ -1159,6 +1221,43 @@ mod tests {
             .expect_err("pending session should not finalize");
 
         assert_eq!(error, ProgramError::InvalidAccountData);
+    }
+
+    #[test]
+    fn finalize_session_rejects_pqc_only_threshold() {
+        let receipt = PolicyReceipt {
+            threshold: ThresholdRequirement::RequirePqcAuth,
+            ..sample_receipt()
+        };
+        let staged = PolicyReceiptState::new(
+            receipt.commitment(),
+            receipt.action_hash,
+            receipt.nonce,
+            receipt.expiry_slot,
+        );
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
+        let mut session_bytes = [0; ActionSessionState::LEN];
+
+        assert!(staged.encode(&mut receipt_bytes));
+        process_open_session_data(&receipt_bytes, &mut session_bytes, &receipt, 10)
+            .expect("open session should succeed");
+        {
+            let mut state =
+                ActionSessionState::decode(&session_bytes).expect("session should decode");
+            state.status = SessionStatus::Ready as u8;
+            assert!(state.encode(&mut session_bytes));
+        }
+
+        let error = process_finalize_session_data(
+            &mut receipt_bytes,
+            &mut session_bytes,
+            &receipt,
+            10,
+            receipt.policy_version,
+        )
+        .expect_err("pqc-only threshold should reject spend finalization");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
     }
 
     #[test]
