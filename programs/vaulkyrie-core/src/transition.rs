@@ -83,16 +83,22 @@ pub fn validate_vault_for_receipt(
     receipt: &PolicyReceipt,
     current_slot: u64,
 ) -> Result<(), TransitionError> {
+    validate_vault_active(vault)?;
+
     if vault.policy_version != receipt.policy_version {
         return Err(TransitionError::VaultPolicyMismatch);
     }
 
-    if vault.status != VaultStatus::Active as u8 {
-        return Err(TransitionError::VaultNotActive);
-    }
-
     if receipt.expiry_slot < current_slot {
         return Err(TransitionError::ReceiptExpired);
+    }
+
+    Ok(())
+}
+
+pub fn validate_vault_active(vault: &VaultRegistry) -> Result<(), TransitionError> {
+    if vault.status != VaultStatus::Active as u8 {
+        return Err(TransitionError::VaultNotActive);
     }
 
     Ok(())
@@ -280,7 +286,7 @@ mod tests {
         apply_authority_rotation, consume_action_session, consume_policy_receipt,
         finalize_action_session, initialize_quantum_authority, initialize_vault, parse_vault_status,
         mark_action_session_ready, rotate_vault_authority, validate_vault_authority_alignment,
-        validate_vault_for_receipt,
+        validate_vault_active, validate_vault_for_receipt,
         open_action_session, open_action_session_from_receipt, stage_policy_receipt, update_vault_status,
         TransitionError,
     };
@@ -361,6 +367,16 @@ mod tests {
 
         let error = validate_vault_for_receipt(&vault, &receipt, 10)
             .expect_err("locked vault should not stage receipts");
+
+        assert_eq!(error, TransitionError::VaultNotActive);
+    }
+
+    #[test]
+    fn validate_vault_active_rejects_locked_vault() {
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        vault.status = VaultStatus::Locked as u8;
+
+        let error = validate_vault_active(&vault).expect_err("locked vault should fail");
 
         assert_eq!(error, TransitionError::VaultNotActive);
     }

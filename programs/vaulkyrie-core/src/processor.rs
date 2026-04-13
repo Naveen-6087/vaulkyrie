@@ -78,6 +78,7 @@ pub fn process(
             require_program_owner(program_id, vault_account)?;
             let vault_data = vault_account.try_borrow_data()?;
             let vault = decode_vault_state(&vault_data)?;
+            transition::validate_vault_active(&vault).map_err(map_transition_error)?;
             let wallet_signer = get_account_info!(accounts, 2);
             require_wallet_authority(&vault, wallet_signer)?;
 
@@ -93,6 +94,7 @@ pub fn process(
             require_program_owner(program_id, vault_account)?;
             let vault_data = vault_account.try_borrow_data()?;
             let vault = decode_vault_state(&vault_data)?;
+            transition::validate_vault_active(&vault).map_err(map_transition_error)?;
             let wallet_signer = get_account_info!(accounts, 3);
             require_wallet_authority(&vault, wallet_signer)?;
 
@@ -113,6 +115,7 @@ pub fn process(
             require_program_owner(program_id, vault_account)?;
             let vault_data = vault_account.try_borrow_data()?;
             let vault = decode_vault_state(&vault_data)?;
+            transition::validate_vault_active(&vault).map_err(map_transition_error)?;
             let wallet_signer = get_account_info!(accounts, 2);
             require_wallet_authority(&vault, wallet_signer)?;
 
@@ -128,6 +131,7 @@ pub fn process(
             require_program_owner(program_id, vault_account)?;
             let vault_data = vault_account.try_borrow_data()?;
             let vault = decode_vault_state(&vault_data)?;
+            transition::validate_vault_active(&vault).map_err(map_transition_error)?;
             let wallet_signer = get_account_info!(accounts, 2);
             require_wallet_authority(&vault, wallet_signer)?;
 
@@ -143,6 +147,7 @@ pub fn process(
             require_program_owner(program_id, vault_account)?;
             let vault_data = vault_account.try_borrow_data()?;
             let vault = decode_vault_state(&vault_data)?;
+            transition::validate_vault_active(&vault).map_err(map_transition_error)?;
             let wallet_signer = get_account_info!(accounts, 3);
             require_wallet_authority(&vault, wallet_signer)?;
 
