@@ -191,10 +191,11 @@ pub struct ActionSessionState {
     pub discriminator: [u8; 8],
     pub receipt_commitment: [u8; 32],
     pub action_hash: [u8; 32],
+    pub policy_version: u64,
     pub expiry_slot: u64,
     pub threshold: u8,
     pub status: u8,
-    pub reserved: [u8; 14],
+    pub reserved: [u8; 6],
 }
 
 impl ActionSessionState {
@@ -203,6 +204,7 @@ impl ActionSessionState {
     pub const fn new(
         receipt_commitment: [u8; 32],
         action_hash: [u8; 32],
+        policy_version: u64,
         expiry_slot: u64,
         threshold: u8,
     ) -> Self {
@@ -210,10 +212,11 @@ impl ActionSessionState {
             discriminator: ACTION_SESSION_DISCRIMINATOR,
             receipt_commitment,
             action_hash,
+            policy_version,
             expiry_slot,
             threshold,
             status: SessionStatus::Pending as u8,
-            reserved: [0; 14],
+            reserved: [0; 6],
         }
     }
 
@@ -225,10 +228,11 @@ impl ActionSessionState {
         dst[..8].copy_from_slice(&self.discriminator);
         dst[8..40].copy_from_slice(&self.receipt_commitment);
         dst[40..72].copy_from_slice(&self.action_hash);
-        dst[72..80].copy_from_slice(&self.expiry_slot.to_le_bytes());
-        dst[80] = self.threshold;
-        dst[81] = self.status;
-        dst[82..96].copy_from_slice(&self.reserved);
+        dst[72..80].copy_from_slice(&self.policy_version.to_le_bytes());
+        dst[80..88].copy_from_slice(&self.expiry_slot.to_le_bytes());
+        dst[88] = self.threshold;
+        dst[89] = self.status;
+        dst[90..96].copy_from_slice(&self.reserved);
 
         true
     }
@@ -247,19 +251,23 @@ impl ActionSessionState {
         let mut action_hash = [0; 32];
         action_hash.copy_from_slice(&src[40..72]);
 
-        let mut expiry_slot = [0; 8];
-        expiry_slot.copy_from_slice(&src[72..80]);
+        let mut policy_version = [0; 8];
+        policy_version.copy_from_slice(&src[72..80]);
 
-        let mut reserved = [0; 14];
-        reserved.copy_from_slice(&src[82..96]);
+        let mut expiry_slot = [0; 8];
+        expiry_slot.copy_from_slice(&src[80..88]);
+
+        let mut reserved = [0; 6];
+        reserved.copy_from_slice(&src[90..96]);
 
         Some(Self {
             discriminator,
             receipt_commitment,
             action_hash,
+            policy_version: u64::from_le_bytes(policy_version),
             expiry_slot: u64::from_le_bytes(expiry_slot),
-            threshold: src[80],
-            status: src[81],
+            threshold: src[88],
+            status: src[89],
             reserved,
         })
     }
@@ -400,12 +408,13 @@ mod tests {
 
     #[test]
     fn action_session_roundtrips_through_bytes() {
-        let state = ActionSessionState::new([6; 32], [7; 32], 99, 2);
+        let state = ActionSessionState::new([6; 32], [7; 32], 77, 99, 2);
         let mut bytes = [0; ActionSessionState::LEN];
 
         assert!(state.encode(&mut bytes));
         assert_eq!(ActionSessionState::decode(&bytes), Some(state));
         assert_eq!(state.discriminator, ACTION_SESSION_DISCRIMINATOR);
+        assert_eq!(state.policy_version, 77);
         assert_eq!(state.status, SessionStatus::Pending as u8);
         assert_eq!(ActionSessionState::LEN, 96);
     }

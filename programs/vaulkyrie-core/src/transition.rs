@@ -17,6 +17,7 @@ pub enum TransitionError {
     VaultNotActive,
     VaultStatusInvalid,
     VaultStatusTransitionNotAllowed,
+    SessionPolicyMismatch,
     SessionMismatch,
     SessionNotPending,
     SessionNotReady,
@@ -128,6 +129,7 @@ pub fn open_action_session(receipt: &PolicyReceipt) -> ActionSessionState {
     ActionSessionState::new(
         receipt.commitment(),
         receipt.action_hash,
+        receipt.policy_version,
         receipt.expiry_slot,
         receipt.threshold.as_byte(),
     )
@@ -231,6 +233,10 @@ pub fn finalize_action_session(
         return Err(TransitionError::SessionExpired);
     }
 
+    if session.policy_version != receipt.policy_version {
+        return Err(TransitionError::SessionPolicyMismatch);
+    }
+
     if session.status != SessionStatus::Ready as u8 {
         return Err(TransitionError::SessionNotReady);
     }
@@ -278,6 +284,19 @@ pub fn rotate_vault_authority(
     Ok(())
 }
 
+pub fn validate_vault_for_session(
+    vault: &VaultRegistry,
+    session: &ActionSessionState,
+) -> Result<(), TransitionError> {
+    validate_vault_active(vault)?;
+
+    if vault.policy_version != session.policy_version {
+        return Err(TransitionError::SessionPolicyMismatch);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use vaulkyrie_protocol::{ActionDescriptor, ActionKind, ThresholdRequirement};
@@ -286,7 +305,7 @@ mod tests {
         apply_authority_rotation, consume_action_session, consume_policy_receipt,
         finalize_action_session, initialize_quantum_authority, initialize_vault, parse_vault_status,
         mark_action_session_ready, rotate_vault_authority, validate_vault_authority_alignment,
-        validate_vault_active, validate_vault_for_receipt,
+        validate_vault_active, validate_vault_for_receipt, validate_vault_for_session,
         open_action_session, open_action_session_from_receipt, stage_policy_receipt, update_vault_status,
         TransitionError,
     };
@@ -496,6 +515,7 @@ mod tests {
 
         assert_eq!(session.receipt_commitment, receipt.commitment());
         assert_eq!(session.action_hash, receipt.action_hash);
+        assert_eq!(session.policy_version, receipt.policy_version);
         assert_eq!(session.expiry_slot, receipt.expiry_slot);
         assert_eq!(
             session.threshold,
@@ -747,6 +767,26 @@ mod tests {
     }
 
     #[test]
+    fn finalizing_action_session_rejects_policy_mismatch() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+        let mut session = open_action_session(&receipt);
+        let mut staged = stage_policy_receipt(&receipt);
+        session.status = SessionStatus::Ready as u8;
+        session.policy_version = 10;
+
+        let error = finalize_action_session(&mut session, &mut staged, &receipt, 10)
+            .expect_err("mismatched policy version should fail");
+
+        assert_eq!(error, TransitionError::SessionPolicyMismatch);
+    }
+
+    #[test]
     fn finalizing_expired_action_session_rejects_transition() {
         let receipt = vaulkyrie_protocol::PolicyReceipt {
             action_hash: sample_action_hash(),
@@ -848,5 +888,23 @@ mod tests {
         assert_eq!(vault.current_authority_hash, [4; 32]);
         assert_eq!(authority.current_authority_hash, [4; 32]);
         assert_eq!(authority.next_sequence, 1);
+    }
+
+    #[test]
+    fn validate_vault_for_session_rejects_policy_mismatch() {
+        let vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 10,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 10,
+        };
+        let session = open_action_session(&receipt);
+
+        let error = validate_vault_for_session(&vault, &session)
+            .expect_err("vault/session policy mismatch should fail");
+
+        assert_eq!(error, TransitionError::SessionPolicyMismatch);
     }
 }

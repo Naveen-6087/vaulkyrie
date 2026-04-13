@@ -94,7 +94,8 @@ pub fn process(
             require_program_owner(program_id, vault_account)?;
             let vault_data = vault_account.try_borrow_data()?;
             let vault = decode_vault_state(&vault_data)?;
-            transition::validate_vault_active(&vault).map_err(map_transition_error)?;
+            transition::validate_vault_for_receipt(&vault, &receipt, current_slot)
+                .map_err(map_transition_error)?;
             let wallet_signer = get_account_info!(accounts, 3);
             require_wallet_authority(&vault, wallet_signer)?;
 
@@ -123,7 +124,12 @@ pub fn process(
             require_writable(session_account)?;
             require_program_owner(program_id, session_account)?;
             let mut session_data = session_account.try_borrow_mut_data()?;
-            process_activate_session_data(&mut session_data, action_hash, current_slot)
+            process_activate_session_data(
+                &mut session_data,
+                action_hash,
+                current_slot,
+                vault.policy_version,
+            )
         }
         CoreInstruction::ConsumeSession(action_hash) => {
             let current_slot = current_slot()?;
@@ -139,7 +145,12 @@ pub fn process(
             require_writable(session_account)?;
             require_program_owner(program_id, session_account)?;
             let mut session_data = session_account.try_borrow_mut_data()?;
-            process_consume_session_data(&mut session_data, action_hash, current_slot)
+            process_consume_session_data(
+                &mut session_data,
+                action_hash,
+                current_slot,
+                vault.policy_version,
+            )
         }
         CoreInstruction::FinalizeSession(receipt) => {
             let current_slot = current_slot()?;
@@ -166,6 +177,7 @@ pub fn process(
                 &mut session_data,
                 &receipt,
                 current_slot,
+                vault.policy_version,
             )
         }
         CoreInstruction::SetVaultStatus(status) => {
@@ -340,6 +352,7 @@ pub fn process_activate_session_data(
     dst: &mut [u8],
     action_hash: [u8; 32],
     current_slot: u64,
+    expected_policy_version: u64,
 ) -> ProgramResult {
     if dst.len() != ActionSessionState::LEN {
         return Err(ProgramError::AccountDataTooSmall);
@@ -347,6 +360,9 @@ pub fn process_activate_session_data(
 
     let mut state = ActionSessionState::decode(dst).ok_or(ProgramError::InvalidAccountData)?;
     require_discriminator(&state.discriminator, &ACTION_SESSION_DISCRIMINATOR)?;
+    if state.policy_version != expected_policy_version {
+        return Err(ProgramError::InvalidArgument);
+    }
     transition::mark_action_session_ready(&mut state, action_hash, current_slot)
         .map_err(map_transition_error)?;
 
@@ -361,6 +377,7 @@ pub fn process_consume_session_data(
     dst: &mut [u8],
     action_hash: [u8; 32],
     current_slot: u64,
+    expected_policy_version: u64,
 ) -> ProgramResult {
     if dst.len() != ActionSessionState::LEN {
         return Err(ProgramError::AccountDataTooSmall);
@@ -368,6 +385,9 @@ pub fn process_consume_session_data(
 
     let mut state = ActionSessionState::decode(dst).ok_or(ProgramError::InvalidAccountData)?;
     require_discriminator(&state.discriminator, &ACTION_SESSION_DISCRIMINATOR)?;
+    if state.policy_version != expected_policy_version {
+        return Err(ProgramError::InvalidArgument);
+    }
     transition::consume_action_session(&mut state, action_hash, current_slot)
         .map_err(map_transition_error)?;
 
@@ -383,6 +403,7 @@ pub fn process_finalize_session_data(
     session_dst: &mut [u8],
     receipt: &PolicyReceipt,
     current_slot: u64,
+    expected_policy_version: u64,
 ) -> ProgramResult {
     if receipt_dst.len() != PolicyReceiptState::LEN || session_dst.len() != ActionSessionState::LEN
     {
@@ -396,6 +417,11 @@ pub fn process_finalize_session_data(
     let mut session_state =
         ActionSessionState::decode(session_dst).ok_or(ProgramError::InvalidAccountData)?;
     require_discriminator(&session_state.discriminator, &ACTION_SESSION_DISCRIMINATOR)?;
+    if session_state.policy_version != expected_policy_version
+        || receipt.policy_version != expected_policy_version
+    {
+        return Err(ProgramError::InvalidArgument);
+    }
 
     transition::finalize_action_session(
         &mut session_state,
@@ -512,6 +538,7 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::VaultNotActive => ProgramError::InvalidAccountData,
         transition::TransitionError::VaultStatusInvalid => ProgramError::InvalidInstructionData,
         transition::TransitionError::VaultStatusTransitionNotAllowed => ProgramError::InvalidArgument,
+        transition::TransitionError::SessionPolicyMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::SessionMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::SessionNotPending => ProgramError::AccountAlreadyInitialized,
         transition::TransitionError::SessionNotReady => ProgramError::InvalidAccountData,
@@ -900,7 +927,7 @@ mod tests {
         assert!(receipt_state.encode(&mut receipt_bytes));
         process_open_session_data(&receipt_bytes, &mut bytes, &receipt, 10)
             .expect("open session should succeed");
-        process_activate_session_data(&mut bytes, receipt.action_hash, 10)
+        process_activate_session_data(&mut bytes, receipt.action_hash, 10, receipt.policy_version)
             .expect("activate session should succeed");
 
         let state = ActionSessionState::decode(&bytes).expect("state should decode");
@@ -912,7 +939,7 @@ mod tests {
         let mut bytes = [0; ActionSessionState::LEN];
         bytes[..8].copy_from_slice(b"BADTYPE1");
 
-        let error = process_activate_session_data(&mut bytes, [7; 32], 10)
+        let error = process_activate_session_data(&mut bytes, [7; 32], 10, 3)
             .expect_err("wrong discriminator should fail");
 
         assert_eq!(error, ProgramError::InvalidAccountData);
@@ -933,8 +960,29 @@ mod tests {
         assert!(receipt_state.encode(&mut receipt_bytes));
         process_open_session_data(&receipt_bytes, &mut bytes, &receipt, 10)
             .expect("open session should succeed");
-        let error = process_activate_session_data(&mut bytes, [9; 32], 10)
+        let error = process_activate_session_data(&mut bytes, [9; 32], 10, receipt.policy_version)
             .expect_err("wrong action hash should fail");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn activate_session_rejects_policy_mismatch() {
+        let receipt = sample_receipt();
+        let receipt_state = PolicyReceiptState::new(
+            receipt.commitment(),
+            receipt.action_hash,
+            receipt.nonce,
+            receipt.expiry_slot,
+        );
+        let mut receipt_bytes = [0; PolicyReceiptState::LEN];
+        let mut bytes = [0; ActionSessionState::LEN];
+
+        assert!(receipt_state.encode(&mut receipt_bytes));
+        process_open_session_data(&receipt_bytes, &mut bytes, &receipt, 10)
+            .expect("open session should succeed");
+        let error = process_activate_session_data(&mut bytes, receipt.action_hash, 10, 99)
+            .expect_err("policy mismatch should fail");
 
         assert_eq!(error, ProgramError::InvalidArgument);
     }
@@ -976,9 +1024,19 @@ mod tests {
         assert!(receipt_state.encode(&mut receipt_bytes));
         process_open_session_data(&receipt_bytes, &mut session_bytes, &receipt, 10)
             .expect("open session should succeed");
-        process_activate_session_data(&mut session_bytes, receipt.action_hash, 10)
+        process_activate_session_data(
+            &mut session_bytes,
+            receipt.action_hash,
+            10,
+            receipt.policy_version,
+        )
             .expect("activate session should succeed");
-        process_consume_session_data(&mut session_bytes, receipt.action_hash, 10)
+        process_consume_session_data(
+            &mut session_bytes,
+            receipt.action_hash,
+            10,
+            receipt.policy_version,
+        )
             .expect("consume session should succeed");
 
         let state = ActionSessionState::decode(&session_bytes).expect("state should decode");
@@ -1000,7 +1058,12 @@ mod tests {
         assert!(receipt_state.encode(&mut receipt_bytes));
         process_open_session_data(&receipt_bytes, &mut session_bytes, &receipt, 10)
             .expect("open session should succeed");
-        let error = process_consume_session_data(&mut session_bytes, receipt.action_hash, 10)
+        let error = process_consume_session_data(
+            &mut session_bytes,
+            receipt.action_hash,
+            10,
+            receipt.policy_version,
+        )
             .expect_err("pending session should not be consumable");
 
         assert_eq!(error, ProgramError::InvalidAccountData);
@@ -1021,9 +1084,20 @@ mod tests {
         assert!(staged.encode(&mut receipt_bytes));
         process_open_session_data(&receipt_bytes, &mut session_bytes, &receipt, 10)
             .expect("open session should succeed");
-        process_activate_session_data(&mut session_bytes, receipt.action_hash, 10)
+        process_activate_session_data(
+            &mut session_bytes,
+            receipt.action_hash,
+            10,
+            receipt.policy_version,
+        )
             .expect("activate session should succeed");
-        process_finalize_session_data(&mut receipt_bytes, &mut session_bytes, &receipt, 10)
+        process_finalize_session_data(
+            &mut receipt_bytes,
+            &mut session_bytes,
+            &receipt,
+            10,
+            receipt.policy_version,
+        )
             .expect("finalize session should succeed");
 
         let receipt_state = PolicyReceiptState::decode(&receipt_bytes).expect("receipt should decode");
@@ -1047,7 +1121,13 @@ mod tests {
         assert!(staged.encode(&mut receipt_bytes));
         process_open_session_data(&receipt_bytes, &mut session_bytes, &receipt, 10)
             .expect("open session should succeed");
-        let error = process_finalize_session_data(&mut receipt_bytes, &mut session_bytes, &receipt, 10)
+        let error = process_finalize_session_data(
+            &mut receipt_bytes,
+            &mut session_bytes,
+            &receipt,
+            10,
+            receipt.policy_version,
+        )
             .expect_err("pending session should not finalize");
 
         assert_eq!(error, ProgramError::InvalidAccountData);
