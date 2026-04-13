@@ -9,6 +9,9 @@ use crate::state::{
 pub enum TransitionError {
     ReceiptAlreadyConsumed,
     ReceiptMismatch,
+    ReceiptExpired,
+    SessionExpired,
+    AuthorityStatementExpired,
     VaultAuthorityMismatch,
     VaultPolicyMismatch,
     VaultNotActive,
@@ -44,6 +47,7 @@ pub fn initialize_quantum_authority(
 pub fn validate_vault_for_receipt(
     vault: &VaultRegistry,
     receipt: &PolicyReceipt,
+    current_slot: u64,
 ) -> Result<(), TransitionError> {
     if vault.policy_version != receipt.policy_version {
         return Err(TransitionError::VaultPolicyMismatch);
@@ -51,6 +55,10 @@ pub fn validate_vault_for_receipt(
 
     if vault.status != VaultStatus::Active as u8 {
         return Err(TransitionError::VaultNotActive);
+    }
+
+    if receipt.expiry_slot < current_slot {
+        return Err(TransitionError::ReceiptExpired);
     }
 
     Ok(())
@@ -88,6 +96,7 @@ pub fn open_action_session(receipt: &PolicyReceipt) -> ActionSessionState {
 pub fn open_action_session_from_receipt(
     state: &PolicyReceiptState,
     receipt: &PolicyReceipt,
+    current_slot: u64,
 ) -> Result<ActionSessionState, TransitionError> {
     if state.consumed != 0 {
         return Err(TransitionError::ReceiptAlreadyConsumed);
@@ -99,6 +108,10 @@ pub fn open_action_session_from_receipt(
         || state.expiry_slot != receipt.expiry_slot
     {
         return Err(TransitionError::ReceiptMismatch);
+    }
+
+    if state.expiry_slot < current_slot {
+        return Err(TransitionError::ReceiptExpired);
     }
 
     Ok(open_action_session(receipt))
@@ -123,9 +136,14 @@ pub fn consume_policy_receipt(
 pub fn mark_action_session_ready(
     state: &mut ActionSessionState,
     action_hash: [u8; 32],
+    current_slot: u64,
 ) -> Result<(), TransitionError> {
     if state.action_hash != action_hash {
         return Err(TransitionError::SessionMismatch);
+    }
+
+    if state.expiry_slot < current_slot {
+        return Err(TransitionError::SessionExpired);
     }
 
     if state.status != SessionStatus::Pending as u8 {
@@ -139,9 +157,14 @@ pub fn mark_action_session_ready(
 pub fn consume_action_session(
     state: &mut ActionSessionState,
     action_hash: [u8; 32],
+    current_slot: u64,
 ) -> Result<(), TransitionError> {
     if state.action_hash != action_hash {
         return Err(TransitionError::SessionMismatch);
+    }
+
+    if state.expiry_slot < current_slot {
+        return Err(TransitionError::SessionExpired);
     }
 
     if state.status != SessionStatus::Ready as u8 {
@@ -156,11 +179,16 @@ pub fn finalize_action_session(
     session: &mut ActionSessionState,
     receipt_state: &mut PolicyReceiptState,
     receipt: &PolicyReceipt,
+    current_slot: u64,
 ) -> Result<(), TransitionError> {
     if session.action_hash != receipt.action_hash
         || session.receipt_commitment != receipt.commitment()
     {
         return Err(TransitionError::SessionMismatch);
+    }
+
+    if session.expiry_slot < current_slot || receipt_state.expiry_slot < current_slot {
+        return Err(TransitionError::SessionExpired);
     }
 
     if session.status != SessionStatus::Ready as u8 {
@@ -176,9 +204,14 @@ pub fn finalize_action_session(
 pub fn apply_authority_rotation(
     state: &mut QuantumAuthorityState,
     statement: &AuthorityRotationStatement,
+    current_slot: u64,
 ) -> Result<(), TransitionError> {
     if state.current_authority_hash == statement.next_authority_hash {
         return Err(TransitionError::AuthorityNoOp);
+    }
+
+    if statement.expiry_slot < current_slot {
+        return Err(TransitionError::AuthorityStatementExpired);
     }
 
     if state.next_sequence != statement.sequence {
@@ -196,9 +229,10 @@ pub fn rotate_vault_authority(
     vault: &mut VaultRegistry,
     authority: &mut QuantumAuthorityState,
     statement: &AuthorityRotationStatement,
+    current_slot: u64,
 ) -> Result<(), TransitionError> {
     validate_vault_authority_alignment(vault, authority)?;
-    apply_authority_rotation(authority, statement)?;
+    apply_authority_rotation(authority, statement, current_slot)?;
     vault.current_authority_hash = authority.current_authority_hash;
 
     Ok(())
@@ -258,7 +292,7 @@ mod tests {
             expiry_slot: 10,
         };
 
-        validate_vault_for_receipt(&vault, &receipt)
+        validate_vault_for_receipt(&vault, &receipt, 10)
             .expect("active vault with matching policy should pass");
     }
 
@@ -273,7 +307,7 @@ mod tests {
             expiry_slot: 10,
         };
 
-        let error = validate_vault_for_receipt(&vault, &receipt)
+        let error = validate_vault_for_receipt(&vault, &receipt, 10)
             .expect_err("mismatched policy version should fail");
 
         assert_eq!(error, TransitionError::VaultPolicyMismatch);
@@ -291,10 +325,27 @@ mod tests {
             expiry_slot: 10,
         };
 
-        let error = validate_vault_for_receipt(&vault, &receipt)
+        let error = validate_vault_for_receipt(&vault, &receipt, 10)
             .expect_err("locked vault should not stage receipts");
 
         assert_eq!(error, TransitionError::VaultNotActive);
+    }
+
+    #[test]
+    fn validate_vault_for_receipt_rejects_expired_receipt() {
+        let vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 9,
+        };
+
+        let error = validate_vault_for_receipt(&vault, &receipt, 10)
+            .expect_err("expired receipt should not stage");
+
+        assert_eq!(error, TransitionError::ReceiptExpired);
     }
 
     #[test]
@@ -384,7 +435,7 @@ mod tests {
         };
         let staged = stage_policy_receipt(&receipt);
 
-        let session = open_action_session_from_receipt(&staged, &receipt)
+        let session = open_action_session_from_receipt(&staged, &receipt, 10)
             .expect("matching receipt should open a session");
 
         assert_eq!(session.receipt_commitment, receipt.commitment());
@@ -403,7 +454,7 @@ mod tests {
         let mut staged = stage_policy_receipt(&receipt);
         staged.consumed = 1;
 
-        let error = open_action_session_from_receipt(&staged, &receipt)
+        let error = open_action_session_from_receipt(&staged, &receipt, 10)
             .expect_err("consumed receipts should not open new sessions");
 
         assert_eq!(error, TransitionError::ReceiptAlreadyConsumed);
@@ -424,10 +475,27 @@ mod tests {
             ..receipt
         };
 
-        let error = open_action_session_from_receipt(&staged, &mismatched)
+        let error = open_action_session_from_receipt(&staged, &mismatched, 10)
             .expect_err("mismatched receipt should be rejected");
 
         assert_eq!(error, TransitionError::ReceiptMismatch);
+    }
+
+    #[test]
+    fn opening_action_session_from_expired_receipt_fails() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 9,
+        };
+        let staged = stage_policy_receipt(&receipt);
+
+        let error = open_action_session_from_receipt(&staged, &receipt, 10)
+            .expect_err("expired staged receipt should be rejected");
+
+        assert_eq!(error, TransitionError::ReceiptExpired);
     }
 
     #[test]
@@ -441,7 +509,7 @@ mod tests {
         };
         let mut session = open_action_session(&receipt);
 
-        mark_action_session_ready(&mut session, receipt.action_hash)
+        mark_action_session_ready(&mut session, receipt.action_hash, 10)
             .expect("matching action hash should mark session ready");
 
         assert_eq!(session.status, SessionStatus::Ready as u8);
@@ -458,7 +526,7 @@ mod tests {
         };
         let mut session = open_action_session(&receipt);
 
-        let error = mark_action_session_ready(&mut session, [99; 32])
+        let error = mark_action_session_ready(&mut session, [99; 32], 10)
             .expect_err("wrong action hash should be rejected");
 
         assert_eq!(error, TransitionError::SessionMismatch);
@@ -476,10 +544,27 @@ mod tests {
         let mut session = open_action_session(&receipt);
         session.status = SessionStatus::Ready as u8;
 
-        let error = mark_action_session_ready(&mut session, receipt.action_hash)
+        let error = mark_action_session_ready(&mut session, receipt.action_hash, 10)
             .expect_err("ready session should not transition twice");
 
         assert_eq!(error, TransitionError::SessionNotPending);
+    }
+
+    #[test]
+    fn marking_action_session_ready_rejects_expired_session() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 9,
+        };
+        let mut session = open_action_session(&receipt);
+
+        let error = mark_action_session_ready(&mut session, receipt.action_hash, 10)
+            .expect_err("expired session should not become ready");
+
+        assert_eq!(error, TransitionError::SessionExpired);
     }
 
     #[test]
@@ -492,10 +577,10 @@ mod tests {
             expiry_slot: 10,
         };
         let mut session = open_action_session(&receipt);
-        mark_action_session_ready(&mut session, receipt.action_hash)
+        mark_action_session_ready(&mut session, receipt.action_hash, 10)
             .expect("matching action hash should mark session ready");
 
-        consume_action_session(&mut session, receipt.action_hash)
+        consume_action_session(&mut session, receipt.action_hash, 10)
             .expect("ready session should be consumable");
 
         assert_eq!(session.status, SessionStatus::Consumed as u8);
@@ -512,10 +597,28 @@ mod tests {
         };
         let mut session = open_action_session(&receipt);
 
-        let error = consume_action_session(&mut session, receipt.action_hash)
+        let error = consume_action_session(&mut session, receipt.action_hash, 10)
             .expect_err("pending session should not be consumable");
 
         assert_eq!(error, TransitionError::SessionNotReady);
+    }
+
+    #[test]
+    fn consuming_expired_action_session_rejects_transition() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 9,
+        };
+        let mut session = open_action_session(&receipt);
+        session.status = SessionStatus::Ready as u8;
+
+        let error = consume_action_session(&mut session, receipt.action_hash, 10)
+            .expect_err("expired ready session should not be consumable");
+
+        assert_eq!(error, TransitionError::SessionExpired);
     }
 
     #[test]
@@ -529,10 +632,10 @@ mod tests {
         };
         let mut session = open_action_session(&receipt);
         let mut staged = stage_policy_receipt(&receipt);
-        mark_action_session_ready(&mut session, receipt.action_hash)
+        mark_action_session_ready(&mut session, receipt.action_hash, 10)
             .expect("matching action hash should mark session ready");
 
-        finalize_action_session(&mut session, &mut staged, &receipt)
+        finalize_action_session(&mut session, &mut staged, &receipt, 10)
             .expect("ready session should finalize against staged receipt");
 
         assert_eq!(session.status, SessionStatus::Consumed as u8);
@@ -554,13 +657,32 @@ mod tests {
             nonce: 77,
             ..receipt
         };
-        mark_action_session_ready(&mut session, receipt.action_hash)
+        mark_action_session_ready(&mut session, receipt.action_hash, 10)
             .expect("matching action hash should mark session ready");
 
-        let error = finalize_action_session(&mut session, &mut staged, &mismatched)
+        let error = finalize_action_session(&mut session, &mut staged, &mismatched, 10)
             .expect_err("mismatched receipt should be rejected");
 
         assert_eq!(error, TransitionError::SessionMismatch);
+    }
+
+    #[test]
+    fn finalizing_expired_action_session_rejects_transition() {
+        let receipt = vaulkyrie_protocol::PolicyReceipt {
+            action_hash: sample_action_hash(),
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 5,
+            expiry_slot: 9,
+        };
+        let mut session = open_action_session(&receipt);
+        let mut staged = stage_policy_receipt(&receipt);
+        session.status = SessionStatus::Ready as u8;
+
+        let error = finalize_action_session(&mut session, &mut staged, &receipt, 10)
+            .expect_err("expired session should not finalize");
+
+        assert_eq!(error, TransitionError::SessionExpired);
     }
 
     #[test]
@@ -573,7 +695,7 @@ mod tests {
             expiry_slot: 100,
         };
 
-        apply_authority_rotation(&mut state, &statement).expect("sequence should match");
+        apply_authority_rotation(&mut state, &statement, 10).expect("sequence should match");
 
         assert_eq!(state.current_authority_hash, [4; 32]);
         assert_eq!(state.next_sequence, 1);
@@ -591,7 +713,7 @@ mod tests {
             expiry_slot: 100,
         };
 
-        let error = apply_authority_rotation(&mut state, &statement)
+        let error = apply_authority_rotation(&mut state, &statement, 10)
             .expect_err("stale sequence should be rejected");
 
         assert_eq!(error, TransitionError::AuthoritySequenceMismatch);
@@ -607,10 +729,26 @@ mod tests {
             expiry_slot: 100,
         };
 
-        let error = apply_authority_rotation(&mut state, &statement)
+        let error = apply_authority_rotation(&mut state, &statement, 10)
             .expect_err("reusing the same authority hash should fail");
 
         assert_eq!(error, TransitionError::AuthorityNoOp);
+    }
+
+    #[test]
+    fn authority_rotation_rejects_expired_statement() {
+        let mut state = QuantumAuthorityState::new([3; 32], 1);
+        let statement = vaulkyrie_protocol::AuthorityRotationStatement {
+            action_hash: sample_action_hash(),
+            next_authority_hash: [4; 32],
+            sequence: 0,
+            expiry_slot: 9,
+        };
+
+        let error = apply_authority_rotation(&mut state, &statement, 10)
+            .expect_err("expired authority statement should fail");
+
+        assert_eq!(error, TransitionError::AuthorityStatementExpired);
     }
 
     #[test]
@@ -624,7 +762,7 @@ mod tests {
             expiry_slot: 100,
         };
 
-        rotate_vault_authority(&mut vault, &mut authority, &statement)
+        rotate_vault_authority(&mut vault, &mut authority, &statement, 10)
             .expect("aligned authority should rotate");
 
         assert_eq!(vault.current_authority_hash, [4; 32]);
