@@ -25,6 +25,9 @@ pub fn process(
     match instruction {
         CoreInstruction::Ping => Ok(()),
         CoreInstruction::InitVault(args) => {
+            let wallet_signer = get_account_info!(accounts, 1);
+            ensure_wallet_authority(args.wallet_pubkey, *wallet_signer.key(), wallet_signer.is_signer())?;
+
             let account = get_account_info!(accounts, 0);
             require_writable(account)?;
             require_program_owner(program_id, account)?;
@@ -32,6 +35,17 @@ pub fn process(
             process_init_vault_data(&mut data, args)
         }
         CoreInstruction::InitAuthority(args) => {
+            let vault_account = get_account_info!(accounts, 1);
+            require_program_owner(program_id, vault_account)?;
+            let vault_data = vault_account.try_borrow_data()?;
+            let vault = decode_vault_state(&vault_data)?;
+
+            let wallet_signer = get_account_info!(accounts, 2);
+            require_wallet_authority(&vault, wallet_signer)?;
+            if vault.current_authority_hash != args.current_authority_hash {
+                return Err(ProgramError::InvalidArgument);
+            }
+
             let account = get_account_info!(accounts, 0);
             require_writable(account)?;
             require_program_owner(program_id, account)?;
@@ -42,6 +56,14 @@ pub fn process(
             let current_slot = current_slot()?;
             let vault_account = get_account_info!(accounts, 0);
             require_program_owner(program_id, vault_account)?;
+
+            {
+                let vault_data = vault_account.try_borrow_data()?;
+                let vault = decode_vault_state(&vault_data)?;
+                let wallet_signer = get_account_info!(accounts, 2);
+                require_wallet_authority(&vault, wallet_signer)?;
+            }
+
             let vault_data = vault_account.try_borrow_data()?;
 
             let receipt_account = get_account_info!(accounts, 1);
@@ -52,14 +74,28 @@ pub fn process(
             process_stage_receipt_data(&vault_data, &mut receipt_data, &receipt, current_slot)
         }
         CoreInstruction::ConsumeReceipt(receipt) => {
-            let account = get_account_info!(accounts, 0);
-            require_writable(account)?;
-            require_program_owner(program_id, account)?;
-            let mut data = account.try_borrow_mut_data()?;
-            process_consume_receipt_data(&mut data, &receipt)
+            let vault_account = get_account_info!(accounts, 0);
+            require_program_owner(program_id, vault_account)?;
+            let vault_data = vault_account.try_borrow_data()?;
+            let vault = decode_vault_state(&vault_data)?;
+            let wallet_signer = get_account_info!(accounts, 2);
+            require_wallet_authority(&vault, wallet_signer)?;
+
+            let receipt_account = get_account_info!(accounts, 1);
+            require_writable(receipt_account)?;
+            require_program_owner(program_id, receipt_account)?;
+            let mut receipt_data = receipt_account.try_borrow_mut_data()?;
+            process_consume_receipt_data(&mut receipt_data, &receipt)
         }
         CoreInstruction::OpenSession(receipt) => {
             let current_slot = current_slot()?;
+            let vault_account = get_account_info!(accounts, 2);
+            require_program_owner(program_id, vault_account)?;
+            let vault_data = vault_account.try_borrow_data()?;
+            let vault = decode_vault_state(&vault_data)?;
+            let wallet_signer = get_account_info!(accounts, 3);
+            require_wallet_authority(&vault, wallet_signer)?;
+
             let receipt_account = get_account_info!(accounts, 0);
             require_program_owner(program_id, receipt_account)?;
             let receipt_data = receipt_account.try_borrow_data()?;
@@ -73,22 +109,43 @@ pub fn process(
         }
         CoreInstruction::ActivateSession(action_hash) => {
             let current_slot = current_slot()?;
-            let account = get_account_info!(accounts, 0);
-            require_writable(account)?;
-            require_program_owner(program_id, account)?;
-            let mut data = account.try_borrow_mut_data()?;
-            process_activate_session_data(&mut data, action_hash, current_slot)
+            let vault_account = get_account_info!(accounts, 1);
+            require_program_owner(program_id, vault_account)?;
+            let vault_data = vault_account.try_borrow_data()?;
+            let vault = decode_vault_state(&vault_data)?;
+            let wallet_signer = get_account_info!(accounts, 2);
+            require_wallet_authority(&vault, wallet_signer)?;
+
+            let session_account = get_account_info!(accounts, 0);
+            require_writable(session_account)?;
+            require_program_owner(program_id, session_account)?;
+            let mut session_data = session_account.try_borrow_mut_data()?;
+            process_activate_session_data(&mut session_data, action_hash, current_slot)
         }
         CoreInstruction::ConsumeSession(action_hash) => {
             let current_slot = current_slot()?;
-            let account = get_account_info!(accounts, 0);
-            require_writable(account)?;
-            require_program_owner(program_id, account)?;
-            let mut data = account.try_borrow_mut_data()?;
-            process_consume_session_data(&mut data, action_hash, current_slot)
+            let vault_account = get_account_info!(accounts, 1);
+            require_program_owner(program_id, vault_account)?;
+            let vault_data = vault_account.try_borrow_data()?;
+            let vault = decode_vault_state(&vault_data)?;
+            let wallet_signer = get_account_info!(accounts, 2);
+            require_wallet_authority(&vault, wallet_signer)?;
+
+            let session_account = get_account_info!(accounts, 0);
+            require_writable(session_account)?;
+            require_program_owner(program_id, session_account)?;
+            let mut session_data = session_account.try_borrow_mut_data()?;
+            process_consume_session_data(&mut session_data, action_hash, current_slot)
         }
         CoreInstruction::FinalizeSession(receipt) => {
             let current_slot = current_slot()?;
+            let vault_account = get_account_info!(accounts, 2);
+            require_program_owner(program_id, vault_account)?;
+            let vault_data = vault_account.try_borrow_data()?;
+            let vault = decode_vault_state(&vault_data)?;
+            let wallet_signer = get_account_info!(accounts, 3);
+            require_wallet_authority(&vault, wallet_signer)?;
+
             let receipt_account = get_account_info!(accounts, 0);
             require_writable(receipt_account)?;
             require_program_owner(program_id, receipt_account)?;
@@ -109,8 +166,14 @@ pub fn process(
         CoreInstruction::RotateAuthority(statement) => {
             let current_slot = current_slot()?;
             let vault_account = get_account_info!(accounts, 0);
-            require_writable(vault_account)?;
             require_program_owner(program_id, vault_account)?;
+            {
+                let vault_data = vault_account.try_borrow_data()?;
+                let vault = decode_vault_state(&vault_data)?;
+                let wallet_signer = get_account_info!(accounts, 2);
+                require_wallet_authority(&vault, wallet_signer)?;
+            }
+            require_writable(vault_account)?;
             let mut vault_data = vault_account.try_borrow_mut_data()?;
 
             let authority_account = get_account_info!(accounts, 1);
@@ -372,6 +435,32 @@ fn require_discriminator(actual: &[u8; 8], expected: &[u8; 8]) -> ProgramResult 
     }
 }
 
+fn decode_vault_state(src: &[u8]) -> Result<VaultRegistry, ProgramError> {
+    let vault = VaultRegistry::decode(src).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&vault.discriminator, &VAULT_REGISTRY_DISCRIMINATOR)?;
+    Ok(vault)
+}
+
+fn ensure_wallet_authority(
+    expected_wallet: [u8; 32],
+    signer_wallet: [u8; 32],
+    signer_present: bool,
+) -> ProgramResult {
+    if !signer_present {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if signer_wallet != expected_wallet {
+        return Err(ProgramError::IncorrectAuthority);
+    }
+
+    Ok(())
+}
+
+fn require_wallet_authority(vault: &VaultRegistry, signer: &AccountInfo) -> ProgramResult {
+    ensure_wallet_authority(vault.wallet_pubkey, *signer.key(), signer.is_signer())
+}
+
 fn current_slot() -> Result<u64, ProgramError> {
     Ok(Clock::get()?.slot)
 }
@@ -403,6 +492,7 @@ mod tests {
         process_activate_session_data, process_consume_receipt_data, process_consume_session_data,
         process_finalize_session_data, process_init_authority_data, process_init_vault_data,
         process_open_session_data, process_rotate_authority_data, process_stage_receipt_data,
+        ensure_wallet_authority,
     };
     use crate::{
         instruction::{InitAuthorityArgs, InitVaultArgs},
@@ -430,6 +520,28 @@ mod tests {
             nonce: 9,
             expiry_slot: 100,
         }
+    }
+
+    #[test]
+    fn wallet_authority_requires_signer() {
+        let error = ensure_wallet_authority([1; 32], [1; 32], false)
+            .expect_err("missing signer should fail");
+
+        assert_eq!(error, ProgramError::MissingRequiredSignature);
+    }
+
+    #[test]
+    fn wallet_authority_requires_matching_pubkey() {
+        let error = ensure_wallet_authority([1; 32], [2; 32], true)
+            .expect_err("wrong signer pubkey should fail");
+
+        assert_eq!(error, ProgramError::IncorrectAuthority);
+    }
+
+    #[test]
+    fn wallet_authority_accepts_matching_signer() {
+        ensure_wallet_authority([1; 32], [1; 32], true)
+            .expect("matching signer pubkey should pass");
     }
 
     #[test]
