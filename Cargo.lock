@@ -4058,6 +4058,7 @@ dependencies = [
 name = "vaulkyrie-core"
 version = "0.1.0"
 dependencies = [
+ "curve25519-dalek 4.1.3",
  "pinocchio",
  "solana-nostd-sha256",
  "solana-winternitz",
