@@ -1,9 +1,9 @@
 [package]
 name = "encrypted-ixs"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Naveen"]
 
 # This crate contains Arcis MXE circuit definitions for Vaulkyrie's private
 # policy evaluation plane. It requires the `arcis` toolchain to compile and is
@@ -13,7 +13,10 @@ authors.workspace = true
 #   arcis build --manifest-path crates/encrypted-ixs/Cargo.toml
 #
 # To add to workspace once Arcis SDK is resolved, add "crates/encrypted-ixs"
-# to the [workspace.members] list in the root Cargo.toml.
+# to the [workspace.members] list in the root Cargo.toml and remove from
+# [workspace.exclude].
+
+[workspace]
 
 [dependencies]
 # arcis = "0.x"  # Uncomment when the Arcis Rust SDK is available

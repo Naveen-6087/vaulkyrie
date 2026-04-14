@@ -5,6 +5,9 @@ members = [
     "programs/vaulkyrie-core",
     "programs/vaulkyrie-policy-mxe",
 ]
+exclude = [
+    "crates/encrypted-ixs",
+]
 resolver = "2"
 
 [workspace.package]
