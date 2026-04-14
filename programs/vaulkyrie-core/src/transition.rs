@@ -57,6 +57,9 @@ pub enum TransitionError {
     RecoveryNotPending,
     /// Recovery invalid parameters (threshold must be >= 1 and <= participant_count).
     RecoveryInvalidParams,
+    /// Authority migration requires the current tree to have at least one leaf
+    /// used (prevents no-op migrations on brand new trees).
+    AuthorityMigrationNoOp,
 }
 
 pub fn initialize_vault(
@@ -649,6 +652,24 @@ pub fn complete_recovery(
     Ok(())
 }
 
+// ── Authority migration transition ──────────────────────────────────
+
+/// Migrate an existing authority to a new XMSS tree.
+/// Resets `next_leaf_index` to 0 and sets the new Merkle root.
+/// Requires that at least one leaf has been used on the current tree
+/// (prevents meaningless migrations on brand-new authorities).
+pub fn migrate_authority_tree(
+    authority: &mut crate::state::QuantumAuthorityState,
+    new_authority_root: [u8; 32],
+) -> Result<(), TransitionError> {
+    if authority.next_leaf_index == 0 {
+        return Err(TransitionError::AuthorityMigrationNoOp);
+    }
+    authority.current_authority_root = new_authority_root;
+    authority.next_leaf_index = 0;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use solana_nostd_sha256::hashv;
@@ -662,8 +683,8 @@ mod tests {
         apply_authority_rotation, complete_recovery, consume_action_session,
         consume_policy_receipt, finalize_action_session, init_recovery,
         initialize_quantum_authority, initialize_vault, mark_action_session_ready,
-        open_action_session, open_action_session_from_receipt, parse_vault_status,
-        rotate_vault_authority, stage_policy_receipt, update_vault_status,
+        migrate_authority_tree, open_action_session, open_action_session_from_receipt,
+        parse_vault_status, rotate_vault_authority, stage_policy_receipt, update_vault_status,
         validate_and_advance_receipt_nonce, validate_authority_action_binding,
         validate_bridged_receipt_claim, validate_quantum_vault_close, validate_quantum_vault_split,
         validate_quantum_vault_split_amount, validate_vault_active,
@@ -2005,5 +2026,43 @@ mod tests {
             complete_recovery(&state, 100),
             Err(TransitionError::RecoveryNotPending)
         );
+    }
+
+    // ── Authority migration tests ───────────────────────────────────
+
+    #[test]
+    fn migrate_authority_resets_leaf_index_and_sets_new_root() {
+        let mut authority = initialize_quantum_authority([1; 32], [2; 32], 1);
+        authority.next_leaf_index = 10; // some leaves used
+
+        let new_root = [9; 32];
+        let result = migrate_authority_tree(&mut authority, new_root);
+        assert!(result.is_ok());
+        assert_eq!(authority.current_authority_root, new_root);
+        assert_eq!(authority.next_leaf_index, 0);
+        // hash and sequence must be unchanged
+        assert_eq!(authority.current_authority_hash, [1; 32]);
+        assert_eq!(authority.next_sequence, 0);
+    }
+
+    #[test]
+    fn migrate_authority_rejects_no_op_on_fresh_tree() {
+        let mut authority = initialize_quantum_authority([1; 32], [2; 32], 1);
+        assert_eq!(authority.next_leaf_index, 0);
+
+        let result = migrate_authority_tree(&mut authority, [9; 32]);
+        assert_eq!(result, Err(TransitionError::AuthorityMigrationNoOp));
+    }
+
+    #[test]
+    fn migrate_authority_works_at_exhaustion_boundary() {
+        let mut authority = initialize_quantum_authority([1; 32], [2; 32], 1);
+        authority.next_leaf_index = XMSS_LEAF_COUNT; // fully exhausted
+
+        let new_root = [7; 32];
+        let result = migrate_authority_tree(&mut authority, new_root);
+        assert!(result.is_ok());
+        assert_eq!(authority.next_leaf_index, 0);
+        assert_eq!(authority.current_authority_root, new_root);
     }
 }

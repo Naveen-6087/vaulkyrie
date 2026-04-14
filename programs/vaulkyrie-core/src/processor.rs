@@ -525,6 +525,13 @@ pub fn process(
             let mut recovery_data = recovery_account.try_borrow_mut_data()?;
             process_complete_recovery_data(&mut recovery_data, args, current_slot)
         }
+
+        CoreInstruction::MigrateAuthority(args) => {
+            // [0] = authority_state (writable)
+            let authority_account = get_account_info!(accounts, 0);
+            let mut authority_data = authority_account.try_borrow_mut_data()?;
+            process_migrate_authority_data(&mut authority_data, args.new_authority_root)
+        }
     }
 }
 
@@ -1113,6 +1120,7 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::RecoveryInvalidParams => {
             ProgramError::InvalidInstructionData
         }
+        transition::TransitionError::AuthorityMigrationNoOp => ProgramError::InvalidArgument,
     }
 }
 
@@ -1259,6 +1267,29 @@ pub fn process_complete_recovery_data(
     state.encode(&mut data[..RecoveryState::LEN]);
     Ok(())
 }
+
+pub fn process_migrate_authority_data(
+    data: &mut [u8],
+    new_authority_root: [u8; 32],
+) -> ProgramResult {
+    use crate::state::{QuantumAuthorityState, QUANTUM_STATE_DISCRIMINATOR};
+
+    if data.len() < QuantumAuthorityState::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut authority =
+        QuantumAuthorityState::decode(&data[..QuantumAuthorityState::LEN])
+            .ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&authority.discriminator, &QUANTUM_STATE_DISCRIMINATOR)?;
+
+    transition::migrate_authority_tree(&mut authority, new_authority_root)
+        .map_err(map_transition_error)?;
+
+    authority.encode(&mut data[..QuantumAuthorityState::LEN]);
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use pinocchio::program_error::ProgramError;
     use solana_nostd_sha256::hashv;
@@ -1277,9 +1308,10 @@ mod tests {
         process_finalize_session_data, process_init_authority_data,
         process_init_authority_proof_data, process_init_recovery_data,
         process_init_spend_orchestration_data, process_init_vault_data,
-        process_open_session_data, process_rotate_authority_data,
-        process_rotate_authority_staged_data, process_set_vault_status_data,
-        process_split_quantum_vault, process_stage_bridged_receipt_data, process_stage_receipt_data,
+        process_migrate_authority_data, process_open_session_data,
+        process_rotate_authority_data, process_rotate_authority_staged_data,
+        process_set_vault_status_data, process_split_quantum_vault,
+        process_stage_bridged_receipt_data, process_stage_receipt_data,
         process_write_authority_proof_chunk_data,
     };
     use crate::{
@@ -1293,7 +1325,7 @@ mod tests {
             ActionSessionState, AuthorityProofState, OrchestrationStatus, PolicyReceiptState,
             QuantumAuthorityState, RecoveryState, RecoveryStatus, SessionStatus,
             SpendOrchestrationState, VaultRegistry, VaultStatus, ACTION_SESSION_DISCRIMINATOR,
-            RECOVERY_STATE_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR,
+            QUANTUM_STATE_DISCRIMINATOR, RECOVERY_STATE_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR,
         },
     };
 
@@ -3190,5 +3222,43 @@ mod tests {
         let err = process_complete_recovery_data(&mut buf, args, 200)
             .expect_err("double completion must fail");
         assert_eq!(err, ProgramError::AccountAlreadyInitialized);
+    }
+
+    // ── Authority migration processor tests ─────────────────────────
+
+    fn make_authority_buffer(leaf_index: u32) -> Vec<u8> {
+        let mut authority = crate::transition::initialize_quantum_authority([1; 32], [2; 32], 1);
+        authority.next_leaf_index = leaf_index;
+        let mut buf = vec![0u8; QuantumAuthorityState::LEN];
+        authority.encode(&mut buf);
+        buf
+    }
+
+    #[test]
+    fn migrate_authority_resets_tree() {
+        let mut buf = make_authority_buffer(10);
+        let result = process_migrate_authority_data(&mut buf, [9; 32]);
+        assert!(result.is_ok());
+
+        let state = QuantumAuthorityState::decode(&buf).unwrap();
+        assert_eq!(state.next_leaf_index, 0);
+        assert_eq!(state.current_authority_root, [9; 32]);
+        assert_eq!(state.discriminator, QUANTUM_STATE_DISCRIMINATOR);
+    }
+
+    #[test]
+    fn migrate_authority_rejects_fresh_tree() {
+        let mut buf = make_authority_buffer(0);
+        let err = process_migrate_authority_data(&mut buf, [9; 32])
+            .expect_err("migration on fresh tree is a no-op");
+        assert_eq!(err, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn migrate_authority_rejects_undersized_buffer() {
+        let mut buf = vec![0u8; QuantumAuthorityState::LEN - 1];
+        let err = process_migrate_authority_data(&mut buf, [9; 32])
+            .expect_err("buffer must be at least QuantumAuthorityState::LEN");
+        assert_eq!(err, ProgramError::InvalidAccountData);
     }
 }
