@@ -82,6 +82,22 @@ pub struct FailSpendOrchestrationArgs {
     pub reason_code: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitRecoveryArgs {
+    pub vault_pubkey: [u8; 32],
+    pub recovery_commitment: [u8; 32],
+    pub expiry_slot: u64,
+    pub new_threshold: u8,
+    pub new_participant_count: u8,
+    pub bump: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompleteRecoveryArgs {
+    pub new_group_key: [u8; 32],
+    pub new_authority_hash: [u8; 32],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotateAuthorityArgs {
     pub statement: AuthorityRotationStatement,
@@ -133,6 +149,12 @@ pub enum CoreInstruction {
     /// Stage a policy receipt that has been cross-validated against a
     /// finalized `PolicyEvaluationState` account owned by vaulkyrie-policy-mxe.
     StageBridgedReceipt(PolicyReceipt),
+    /// PQC-authorized recovery initiation when the threshold signing group
+    /// is lost. Requires a valid WOTS+ proof on the authority account.
+    InitRecovery(InitRecoveryArgs),
+    /// Finalize recovery by binding a new group key and authority hash.
+    /// The vault transitions back to Active status.
+    CompleteRecovery(CompleteRecoveryArgs),
 }
 
 impl TryFrom<&[u8]> for CoreInstruction {
@@ -174,6 +196,8 @@ impl TryFrom<&[u8]> for CoreInstruction {
                 parse_fail_spend_orchestration(rest)?,
             )),
             [21, rest @ ..] => Ok(Self::StageBridgedReceipt(parse_policy_receipt(rest)?)),
+            [22, rest @ ..] => Ok(Self::InitRecovery(parse_init_recovery(rest)?)),
+            [23, rest @ ..] => Ok(Self::CompleteRecovery(parse_complete_recovery(rest)?)),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -485,13 +509,57 @@ fn parse_fail_spend_orchestration(
     })
 }
 
+fn parse_init_recovery(data: &[u8]) -> Result<InitRecoveryArgs, ProgramError> {
+    // 32 + 32 + 8 + 1 + 1 + 1 = 75
+    if data.len() != 75 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut vault_pubkey = [0; 32];
+    vault_pubkey.copy_from_slice(&data[..32]);
+
+    let mut recovery_commitment = [0; 32];
+    recovery_commitment.copy_from_slice(&data[32..64]);
+
+    let mut expiry_slot = [0; 8];
+    expiry_slot.copy_from_slice(&data[64..72]);
+
+    Ok(InitRecoveryArgs {
+        vault_pubkey,
+        recovery_commitment,
+        expiry_slot: u64::from_le_bytes(expiry_slot),
+        new_threshold: data[72],
+        new_participant_count: data[73],
+        bump: data[74],
+    })
+}
+
+fn parse_complete_recovery(data: &[u8]) -> Result<CompleteRecoveryArgs, ProgramError> {
+    // 32 + 32 = 64
+    if data.len() != 64 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut new_group_key = [0; 32];
+    new_group_key.copy_from_slice(&data[..32]);
+
+    let mut new_authority_hash = [0; 32];
+    new_authority_hash.copy_from_slice(&data[32..64]);
+
+    Ok(CompleteRecoveryArgs {
+        new_group_key,
+        new_authority_hash,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CloseQuantumVaultArgs, CommitSpendOrchestrationArgs, CompleteSpendOrchestrationArgs,
-        CoreInstruction, FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs,
-        InitQuantumVaultArgs, InitSpendOrchestrationArgs, InitVaultArgs, RotateAuthorityArgs,
-        SplitQuantumVaultArgs, WriteAuthorityProofChunkArgs, WINTERNITZ_SIGNATURE_BYTES,
+        CloseQuantumVaultArgs, CommitSpendOrchestrationArgs, CompleteRecoveryArgs,
+        CompleteSpendOrchestrationArgs, CoreInstruction, FailSpendOrchestrationArgs,
+        InitAuthorityArgs, InitAuthorityProofArgs, InitQuantumVaultArgs, InitRecoveryArgs,
+        InitSpendOrchestrationArgs, InitVaultArgs, RotateAuthorityArgs, SplitQuantumVaultArgs,
+        WriteAuthorityProofChunkArgs, WINTERNITZ_SIGNATURE_BYTES,
     };
     use pinocchio::program_error::ProgramError;
     use vaulkyrie_protocol::{
@@ -909,6 +977,44 @@ mod tests {
                 threshold: ThresholdRequirement::TwoOfThree,
                 nonce: 8,
                 expiry_slot: 900,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_init_recovery_instruction() {
+        let mut data = vec![22];
+        data.extend_from_slice(&[1; 32]); // vault_pubkey
+        data.extend_from_slice(&[2; 32]); // recovery_commitment
+        data.extend_from_slice(&5000u64.to_le_bytes()); // expiry_slot
+        data.push(2); // new_threshold
+        data.push(3); // new_participant_count
+        data.push(7); // bump
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::InitRecovery(InitRecoveryArgs {
+                vault_pubkey: [1; 32],
+                recovery_commitment: [2; 32],
+                expiry_slot: 5000,
+                new_threshold: 2,
+                new_participant_count: 3,
+                bump: 7,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_complete_recovery_instruction() {
+        let mut data = vec![23];
+        data.extend_from_slice(&[3; 32]); // new_group_key
+        data.extend_from_slice(&[4; 32]); // new_authority_hash
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::CompleteRecovery(CompleteRecoveryArgs {
+                new_group_key: [3; 32],
+                new_authority_hash: [4; 32],
             }))
         );
     }

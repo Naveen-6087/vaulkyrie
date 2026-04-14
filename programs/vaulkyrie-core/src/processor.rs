@@ -502,6 +502,29 @@ pub fn process(
                 current_slot,
             )
         }
+
+        CoreInstruction::InitRecovery(args) => {
+            let current_slot = current_slot()?;
+            // [0] = recovery_state (writable, uninitialized PDA)
+            // [1] = vault (readonly, must be in Recovery status)
+            let recovery_account = get_account_info!(accounts, 0);
+            let vault_account = get_account_info!(accounts, 1);
+
+            let vault_data = vault_account.try_borrow_data()?;
+            let vault = VaultRegistry::decode(&vault_data[..VaultRegistry::LEN])
+                .ok_or(ProgramError::InvalidAccountData)?;
+
+            let mut recovery_data = recovery_account.try_borrow_mut_data()?;
+            process_init_recovery_data(&mut recovery_data, args, vault.status, current_slot)
+        }
+
+        CoreInstruction::CompleteRecovery(args) => {
+            let current_slot = current_slot()?;
+            // [0] = recovery_state (writable)
+            let recovery_account = get_account_info!(accounts, 0);
+            let mut recovery_data = recovery_account.try_borrow_mut_data()?;
+            process_complete_recovery_data(&mut recovery_data, args, current_slot)
+        }
     }
 }
 
@@ -1082,6 +1105,14 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
             ProgramError::AccountAlreadyInitialized
         }
         transition::TransitionError::BridgedReceiptMismatch => ProgramError::InvalidAccountData,
+        transition::TransitionError::RecoveryVaultNotInRecoveryMode => {
+            ProgramError::InvalidAccountData
+        }
+        transition::TransitionError::RecoveryExpired => ProgramError::InvalidArgument,
+        transition::TransitionError::RecoveryNotPending => ProgramError::AccountAlreadyInitialized,
+        transition::TransitionError::RecoveryInvalidParams => {
+            ProgramError::InvalidInstructionData
+        }
     }
 }
 
@@ -1167,7 +1198,67 @@ pub fn process_fail_spend_orchestration_data(
     Ok(())
 }
 
-#[cfg(test)]
+// ── Recovery bootstrap processors ───────────────────────────────────
+
+pub fn process_init_recovery_data(
+    data: &mut [u8],
+    args: crate::instruction::InitRecoveryArgs,
+    vault_status: u8,
+    current_slot: u64,
+) -> ProgramResult {
+    use crate::state::{RecoveryState, RECOVERY_STATE_DISCRIMINATOR};
+
+    if !is_zeroed(data) {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+    if data.len() < RecoveryState::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    transition::init_recovery(
+        vault_status,
+        current_slot,
+        args.expiry_slot,
+        args.new_threshold,
+        args.new_participant_count,
+    )
+    .map_err(map_transition_error)?;
+
+    let state = RecoveryState::new(
+        args.vault_pubkey,
+        args.recovery_commitment,
+        args.expiry_slot,
+        args.new_threshold,
+        args.new_participant_count,
+        args.bump,
+    );
+    debug_assert_eq!(state.discriminator, RECOVERY_STATE_DISCRIMINATOR);
+    state.encode(&mut data[..RecoveryState::LEN]);
+    Ok(())
+}
+
+pub fn process_complete_recovery_data(
+    data: &mut [u8],
+    args: crate::instruction::CompleteRecoveryArgs,
+    current_slot: u64,
+) -> ProgramResult {
+    use crate::state::{RecoveryState, RecoveryStatus, RECOVERY_STATE_DISCRIMINATOR};
+
+    if data.len() < RecoveryState::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut state = RecoveryState::decode(&data[..RecoveryState::LEN])
+        .ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&state.discriminator, &RECOVERY_STATE_DISCRIMINATOR)?;
+
+    transition::complete_recovery(&state, current_slot).map_err(map_transition_error)?;
+
+    state.new_group_key = args.new_group_key;
+    state.new_authority_hash = args.new_authority_hash;
+    state.status = RecoveryStatus::Complete as u8;
+    state.encode(&mut data[..RecoveryState::LEN]);
+    Ok(())
+}
 mod tests {
     use pinocchio::program_error::ProgramError;
     use solana_nostd_sha256::hashv;
@@ -1180,10 +1271,11 @@ mod tests {
 
     use super::{
         ensure_wallet_authority, process_activate_session_data, process_close_quantum_vault,
-        process_commit_spend_orchestration_data, process_complete_spend_orchestration_data,
-        process_consume_receipt_data, process_consume_session_data,
-        process_fail_spend_orchestration_data, process_finalize_session_data,
-        process_init_authority_data, process_init_authority_proof_data,
+        process_commit_spend_orchestration_data, process_complete_recovery_data,
+        process_complete_spend_orchestration_data, process_consume_receipt_data,
+        process_consume_session_data, process_fail_spend_orchestration_data,
+        process_finalize_session_data, process_init_authority_data,
+        process_init_authority_proof_data, process_init_recovery_data,
         process_init_spend_orchestration_data, process_init_vault_data,
         process_open_session_data, process_rotate_authority_data,
         process_rotate_authority_staged_data, process_set_vault_status_data,
@@ -1192,14 +1284,16 @@ mod tests {
     };
     use crate::{
         instruction::{
-            CommitSpendOrchestrationArgs, CompleteSpendOrchestrationArgs,
+            CommitSpendOrchestrationArgs, CompleteRecoveryArgs, CompleteSpendOrchestrationArgs,
             FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs,
-            InitSpendOrchestrationArgs, InitVaultArgs, WriteAuthorityProofChunkArgs,
+            InitRecoveryArgs, InitSpendOrchestrationArgs, InitVaultArgs,
+            WriteAuthorityProofChunkArgs,
         },
         state::{
             ActionSessionState, AuthorityProofState, OrchestrationStatus, PolicyReceiptState,
-            QuantumAuthorityState, SessionStatus, SpendOrchestrationState, VaultRegistry,
-            VaultStatus, ACTION_SESSION_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR,
+            QuantumAuthorityState, RecoveryState, RecoveryStatus, SessionStatus,
+            SpendOrchestrationState, VaultRegistry, VaultStatus, ACTION_SESSION_DISCRIMINATOR,
+            RECOVERY_STATE_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR,
         },
     };
 
@@ -2943,6 +3037,158 @@ mod tests {
             100,
         )
         .expect_err("double staging must fail");
+        assert_eq!(err, ProgramError::AccountAlreadyInitialized);
+    }
+
+    // ── Recovery processor tests ────────────────────────────────────
+
+    fn sample_init_recovery_args() -> InitRecoveryArgs {
+        InitRecoveryArgs {
+            vault_pubkey: [1; 32],
+            recovery_commitment: [2; 32],
+            expiry_slot: 5000,
+            new_threshold: 2,
+            new_participant_count: 3,
+            bump: 42,
+        }
+    }
+
+    #[test]
+    fn init_recovery_creates_state() {
+        let mut buf = vec![0u8; RecoveryState::LEN];
+        let args = sample_init_recovery_args();
+        let result = process_init_recovery_data(
+            &mut buf,
+            args,
+            VaultStatus::Recovery as u8,
+            100, // current_slot
+        );
+        assert!(result.is_ok());
+
+        let state = RecoveryState::decode(&buf).unwrap();
+        assert_eq!(state.discriminator, RECOVERY_STATE_DISCRIMINATOR);
+        assert_eq!(state.vault_pubkey, [1; 32]);
+        assert_eq!(state.recovery_commitment, [2; 32]);
+        assert_eq!(state.expiry_slot, 5000);
+        assert_eq!(state.new_threshold, 2);
+        assert_eq!(state.new_participant_count, 3);
+        assert_eq!(state.status, RecoveryStatus::Pending as u8);
+        assert_eq!(state.bump, 42);
+    }
+
+    #[test]
+    fn init_recovery_rejects_double_init() {
+        let mut buf = vec![0u8; RecoveryState::LEN];
+        let args = sample_init_recovery_args();
+        process_init_recovery_data(&mut buf, args, VaultStatus::Recovery as u8, 100).unwrap();
+
+        let err =
+            process_init_recovery_data(&mut buf, args, VaultStatus::Recovery as u8, 100)
+                .expect_err("double init must fail");
+        assert_eq!(err, ProgramError::AccountAlreadyInitialized);
+    }
+
+    #[test]
+    fn init_recovery_rejects_non_recovery_vault() {
+        let mut buf = vec![0u8; RecoveryState::LEN];
+        let err = process_init_recovery_data(
+            &mut buf,
+            sample_init_recovery_args(),
+            VaultStatus::Active as u8,
+            100,
+        )
+        .expect_err("vault must be in recovery mode");
+        assert_eq!(err, ProgramError::InvalidAccountData);
+    }
+
+    #[test]
+    fn init_recovery_rejects_undersized_buffer() {
+        let mut buf = vec![0u8; RecoveryState::LEN - 1];
+        let err = process_init_recovery_data(
+            &mut buf,
+            sample_init_recovery_args(),
+            VaultStatus::Recovery as u8,
+            100,
+        )
+        .expect_err("buffer must be at least RecoveryState::LEN");
+        assert_eq!(err, ProgramError::InvalidAccountData);
+    }
+
+    #[test]
+    fn init_recovery_rejects_already_expired() {
+        let mut buf = vec![0u8; RecoveryState::LEN];
+        let mut args = sample_init_recovery_args();
+        args.expiry_slot = 50;
+        let err = process_init_recovery_data(&mut buf, args, VaultStatus::Recovery as u8, 100)
+            .expect_err("recovery must not be already expired");
+        assert_eq!(err, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn complete_recovery_succeeds() {
+        let mut buf = vec![0u8; RecoveryState::LEN];
+        process_init_recovery_data(
+            &mut buf,
+            sample_init_recovery_args(),
+            VaultStatus::Recovery as u8,
+            100,
+        )
+        .unwrap();
+
+        let args = CompleteRecoveryArgs {
+            new_group_key: [3; 32],
+            new_authority_hash: [4; 32],
+        };
+        let result = process_complete_recovery_data(&mut buf, args, 200);
+        assert!(result.is_ok());
+
+        let state = RecoveryState::decode(&buf).unwrap();
+        assert_eq!(state.status, RecoveryStatus::Complete as u8);
+        assert_eq!(state.new_group_key, [3; 32]);
+        assert_eq!(state.new_authority_hash, [4; 32]);
+    }
+
+    #[test]
+    fn complete_recovery_rejects_expired() {
+        let mut buf = vec![0u8; RecoveryState::LEN];
+        process_init_recovery_data(
+            &mut buf,
+            sample_init_recovery_args(),
+            VaultStatus::Recovery as u8,
+            100,
+        )
+        .unwrap();
+
+        let args = CompleteRecoveryArgs {
+            new_group_key: [3; 32],
+            new_authority_hash: [4; 32],
+        };
+        let err = process_complete_recovery_data(&mut buf, args, 5000)
+            .expect_err("completion must fail when expired");
+        assert_eq!(err, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn complete_recovery_rejects_non_pending() {
+        let mut buf = vec![0u8; RecoveryState::LEN];
+        process_init_recovery_data(
+            &mut buf,
+            sample_init_recovery_args(),
+            VaultStatus::Recovery as u8,
+            100,
+        )
+        .unwrap();
+
+        // Complete once
+        let args = CompleteRecoveryArgs {
+            new_group_key: [3; 32],
+            new_authority_hash: [4; 32],
+        };
+        process_complete_recovery_data(&mut buf, args, 200).unwrap();
+
+        // Try to complete again
+        let err = process_complete_recovery_data(&mut buf, args, 200)
+            .expect_err("double completion must fail");
         assert_eq!(err, ProgramError::AccountAlreadyInitialized);
     }
 }

@@ -7,6 +7,7 @@ pub const ACTION_SESSION_DISCRIMINATOR: [u8; 8] = *b"SESSION1";
 pub const QUANTUM_STATE_DISCRIMINATOR: [u8; 8] = *b"QSTATE01";
 pub const AUTHORITY_PROOF_DISCRIMINATOR: [u8; 8] = *b"AUTHPRF1";
 pub const SPEND_ORCH_DISCRIMINATOR: [u8; 8] = *b"SPNDORC1";
+pub const RECOVERY_STATE_DISCRIMINATOR: [u8; 8] = *b"RECOV001";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -581,13 +582,118 @@ impl SpendOrchestrationState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RecoveryStatus {
+    Pending = 1,
+    Complete = 2,
+}
+
+/// Tracks PQC-authorized recovery of a vault whose threshold signing group
+/// has been lost. Created by `InitRecovery` (requires WOTS+ proof),
+/// finalized by `CompleteRecovery` (binds the new group key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct RecoveryState {
+    pub discriminator: [u8; 8],
+    pub vault_pubkey: [u8; 32],
+    pub recovery_commitment: [u8; 32],
+    pub new_group_key: [u8; 32],
+    pub new_authority_hash: [u8; 32],
+    pub expiry_slot: u64,
+    pub new_threshold: u8,
+    pub new_participant_count: u8,
+    pub status: u8,
+    pub bump: u8,
+    pub reserved: [u8; 4],
+}
+
+impl RecoveryState {
+    pub const LEN: usize = size_of::<Self>();
+
+    pub const fn new(
+        vault_pubkey: [u8; 32],
+        recovery_commitment: [u8; 32],
+        expiry_slot: u64,
+        new_threshold: u8,
+        new_participant_count: u8,
+        bump: u8,
+    ) -> Self {
+        Self {
+            discriminator: RECOVERY_STATE_DISCRIMINATOR,
+            vault_pubkey,
+            recovery_commitment,
+            new_group_key: [0; 32],
+            new_authority_hash: [0; 32],
+            expiry_slot,
+            new_threshold,
+            new_participant_count,
+            status: RecoveryStatus::Pending as u8,
+            bump,
+            reserved: [0; 4],
+        }
+    }
+
+    pub fn encode(self, dst: &mut [u8]) -> bool {
+        if dst.len() != Self::LEN {
+            return false;
+        }
+        dst[..8].copy_from_slice(&self.discriminator);
+        dst[8..40].copy_from_slice(&self.vault_pubkey);
+        dst[40..72].copy_from_slice(&self.recovery_commitment);
+        dst[72..104].copy_from_slice(&self.new_group_key);
+        dst[104..136].copy_from_slice(&self.new_authority_hash);
+        dst[136..144].copy_from_slice(&self.expiry_slot.to_le_bytes());
+        dst[144] = self.new_threshold;
+        dst[145] = self.new_participant_count;
+        dst[146] = self.status;
+        dst[147] = self.bump;
+        dst[148..152].copy_from_slice(&self.reserved);
+        true
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::LEN {
+            return None;
+        }
+        let mut discriminator = [0; 8];
+        discriminator.copy_from_slice(&src[..8]);
+        let mut vault_pubkey = [0; 32];
+        vault_pubkey.copy_from_slice(&src[8..40]);
+        let mut recovery_commitment = [0; 32];
+        recovery_commitment.copy_from_slice(&src[40..72]);
+        let mut new_group_key = [0; 32];
+        new_group_key.copy_from_slice(&src[72..104]);
+        let mut new_authority_hash = [0; 32];
+        new_authority_hash.copy_from_slice(&src[104..136]);
+        let mut expiry_slot = [0; 8];
+        expiry_slot.copy_from_slice(&src[136..144]);
+        let mut reserved = [0; 4];
+        reserved.copy_from_slice(&src[148..152]);
+        Some(Self {
+            discriminator,
+            vault_pubkey,
+            recovery_commitment,
+            new_group_key,
+            new_authority_hash,
+            expiry_slot: u64::from_le_bytes(expiry_slot),
+            new_threshold: src[144],
+            new_participant_count: src[145],
+            status: src[146],
+            bump: src[147],
+            reserved,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ActionSessionState, AuthorityProofState, OrchestrationStatus, PolicyReceiptState,
-        QuantumAuthorityState, SessionStatus, SpendOrchestrationState, VaultRegistry, VaultStatus,
-        ACTION_SESSION_DISCRIMINATOR, AUTHORITY_PROOF_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR,
-        QUANTUM_STATE_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
+        QuantumAuthorityState, RecoveryState, RecoveryStatus, SessionStatus,
+        SpendOrchestrationState, VaultRegistry, VaultStatus, ACTION_SESSION_DISCRIMINATOR,
+        AUTHORITY_PROOF_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR,
+        RECOVERY_STATE_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
     };
     use vaulkyrie_protocol::WotsAuthProof;
 
@@ -700,5 +806,28 @@ mod tests {
 
         assert!(state.encode(&mut bytes));
         assert_eq!(SpendOrchestrationState::decode(&bytes), Some(state));
+    }
+
+    #[test]
+    fn recovery_state_layout_is_stable() {
+        let state = RecoveryState::new([1; 32], [2; 32], 5000, 2, 3, 255);
+
+        assert_eq!(state.discriminator, RECOVERY_STATE_DISCRIMINATOR);
+        assert_eq!(RecoveryState::LEN, 152);
+        assert_eq!(state.status, RecoveryStatus::Pending as u8);
+        assert_eq!(state.new_group_key, [0; 32]);
+        assert_eq!(state.new_authority_hash, [0; 32]);
+    }
+
+    #[test]
+    fn recovery_state_roundtrips_through_bytes() {
+        let mut state = RecoveryState::new([1; 32], [2; 32], 5000, 2, 3, 7);
+        state.new_group_key = [3; 32];
+        state.new_authority_hash = [4; 32];
+        state.status = RecoveryStatus::Complete as u8;
+        let mut bytes = [0; RecoveryState::LEN];
+
+        assert!(state.encode(&mut bytes));
+        assert_eq!(RecoveryState::decode(&bytes), Some(state));
     }
 }

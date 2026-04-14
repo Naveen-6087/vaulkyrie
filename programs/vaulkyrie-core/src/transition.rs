@@ -49,6 +49,14 @@ pub enum TransitionError {
     /// The `PolicyEvaluationState` supplied to `StageBridgedReceipt` does not
     /// match the receipt commitment or is not in `Finalized` status.
     BridgedReceiptMismatch,
+    /// Recovery cannot be initiated because the vault is not in Recovery status.
+    RecoveryVaultNotInRecoveryMode,
+    /// Recovery has already expired.
+    RecoveryExpired,
+    /// Recovery is not in Pending status.
+    RecoveryNotPending,
+    /// Recovery invalid parameters (threshold must be >= 1 and <= participant_count).
+    RecoveryInvalidParams,
 }
 
 pub fn initialize_vault(
@@ -602,6 +610,45 @@ pub fn fail_spend_orchestration(
     Ok(())
 }
 
+// ── Recovery bootstrap transitions ──────────────────────────────────
+
+/// Initialize recovery state.  Validates the vault is in recovery mode and
+/// the params are sane.  `current_slot` must be below `expiry_slot`.
+pub fn init_recovery(
+    vault_status: u8,
+    current_slot: u64,
+    expiry_slot: u64,
+    new_threshold: u8,
+    new_participant_count: u8,
+) -> Result<(), TransitionError> {
+    if parse_vault_status(vault_status) != Ok(VaultStatus::Recovery) {
+        return Err(TransitionError::RecoveryVaultNotInRecoveryMode);
+    }
+    if current_slot >= expiry_slot {
+        return Err(TransitionError::RecoveryExpired);
+    }
+    if new_threshold == 0 || new_participant_count == 0 || new_threshold > new_participant_count {
+        return Err(TransitionError::RecoveryInvalidParams);
+    }
+    Ok(())
+}
+
+/// Complete a pending recovery, returning the `new_group_key` and
+/// `new_authority_hash` that should be written into the vault.
+/// `current_slot` must be below the recovery's `expiry_slot`.
+pub fn complete_recovery(
+    recovery: &crate::state::RecoveryState,
+    current_slot: u64,
+) -> Result<(), TransitionError> {
+    if recovery.status != crate::state::RecoveryStatus::Pending as u8 {
+        return Err(TransitionError::RecoveryNotPending);
+    }
+    if current_slot >= recovery.expiry_slot {
+        return Err(TransitionError::RecoveryExpired);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use solana_nostd_sha256::hashv;
@@ -612,17 +659,20 @@ mod tests {
     };
 
     use super::{
-        apply_authority_rotation, consume_action_session, consume_policy_receipt,
-        finalize_action_session, initialize_quantum_authority, initialize_vault,
-        mark_action_session_ready, open_action_session, open_action_session_from_receipt,
-        parse_vault_status, rotate_vault_authority, stage_policy_receipt, update_vault_status,
+        apply_authority_rotation, complete_recovery, consume_action_session,
+        consume_policy_receipt, finalize_action_session, init_recovery,
+        initialize_quantum_authority, initialize_vault, mark_action_session_ready,
+        open_action_session, open_action_session_from_receipt, parse_vault_status,
+        rotate_vault_authority, stage_policy_receipt, update_vault_status,
         validate_and_advance_receipt_nonce, validate_authority_action_binding,
         validate_bridged_receipt_claim, validate_quantum_vault_close, validate_quantum_vault_split,
         validate_quantum_vault_split_amount, validate_vault_active,
         validate_vault_authority_alignment, validate_vault_for_receipt, validate_vault_for_session,
         validate_vault_recovery_mode, verify_authority_proof, TransitionError,
     };
-    use crate::state::{QuantumAuthorityState, SessionStatus, VaultStatus};
+    use crate::state::{
+        QuantumAuthorityState, RecoveryState, RecoveryStatus, SessionStatus, VaultStatus,
+    };
 
     fn sample_action_hash() -> [u8; 32] {
         ActionDescriptor {
@@ -1846,6 +1896,114 @@ mod tests {
         assert_eq!(
             validate_bridged_receipt_claim(&eval_bytes, &receipt),
             Err(TransitionError::BridgedReceiptMismatch)
+        );
+    }
+
+    // ── Recovery transition tests ───────────────────────────────────
+
+    fn sample_recovery_state(expiry: u64) -> RecoveryState {
+        RecoveryState::new(
+            [1; 32], // vault_pubkey
+            [2; 32], // recovery_commitment
+            expiry,
+            2,  // new_threshold
+            3,  // new_participant_count
+            42, // bump
+        )
+    }
+
+    #[test]
+    fn init_recovery_succeeds_with_valid_params() {
+        let result = init_recovery(
+            VaultStatus::Recovery as u8,
+            100, // current_slot
+            500, // expiry_slot
+            2,   // threshold
+            3,   // participant_count
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn init_recovery_rejects_non_recovery_vault() {
+        let result = init_recovery(
+            VaultStatus::Active as u8,
+            100,
+            500,
+            2,
+            3,
+        );
+        assert_eq!(result, Err(TransitionError::RecoveryVaultNotInRecoveryMode));
+    }
+
+    #[test]
+    fn init_recovery_rejects_expired_slot() {
+        let result = init_recovery(
+            VaultStatus::Recovery as u8,
+            500, // current == expiry
+            500,
+            2,
+            3,
+        );
+        assert_eq!(result, Err(TransitionError::RecoveryExpired));
+
+        let result = init_recovery(
+            VaultStatus::Recovery as u8,
+            501, // current > expiry
+            500,
+            2,
+            3,
+        );
+        assert_eq!(result, Err(TransitionError::RecoveryExpired));
+    }
+
+    #[test]
+    fn init_recovery_rejects_zero_threshold() {
+        let result = init_recovery(
+            VaultStatus::Recovery as u8,
+            100,
+            500,
+            0, // bad
+            3,
+        );
+        assert_eq!(result, Err(TransitionError::RecoveryInvalidParams));
+    }
+
+    #[test]
+    fn init_recovery_rejects_threshold_exceeding_participants() {
+        let result = init_recovery(
+            VaultStatus::Recovery as u8,
+            100,
+            500,
+            4, // threshold > participant_count
+            3,
+        );
+        assert_eq!(result, Err(TransitionError::RecoveryInvalidParams));
+    }
+
+    #[test]
+    fn complete_recovery_succeeds_when_pending() {
+        let state = sample_recovery_state(500);
+        assert_eq!(state.status, RecoveryStatus::Pending as u8);
+        assert!(complete_recovery(&state, 100).is_ok());
+    }
+
+    #[test]
+    fn complete_recovery_rejects_expired() {
+        let state = sample_recovery_state(500);
+        assert_eq!(
+            complete_recovery(&state, 500),
+            Err(TransitionError::RecoveryExpired)
+        );
+    }
+
+    #[test]
+    fn complete_recovery_rejects_non_pending() {
+        let mut state = sample_recovery_state(500);
+        state.status = RecoveryStatus::Complete as u8;
+        assert_eq!(
+            complete_recovery(&state, 100),
+            Err(TransitionError::RecoveryNotPending)
         );
     }
 }
