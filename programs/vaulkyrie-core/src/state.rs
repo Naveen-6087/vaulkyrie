@@ -285,23 +285,31 @@ impl ActionSessionState {
 pub struct QuantumAuthorityState {
     pub discriminator: [u8; 8],
     pub current_authority_hash: [u8; 32],
+    pub current_authority_root: [u8; 32],
     pub last_consumed_digest: [u8; 32],
     pub next_sequence: u64,
+    pub next_leaf_index: u32,
     pub bump: u8,
-    pub reserved: [u8; 15],
+    pub reserved: [u8; 11],
 }
 
 impl QuantumAuthorityState {
     pub const LEN: usize = size_of::<Self>();
 
-    pub const fn new(current_authority_hash: [u8; 32], bump: u8) -> Self {
+    pub const fn new(
+        current_authority_hash: [u8; 32],
+        current_authority_root: [u8; 32],
+        bump: u8,
+    ) -> Self {
         Self {
             discriminator: QUANTUM_STATE_DISCRIMINATOR,
             current_authority_hash,
+            current_authority_root,
             last_consumed_digest: [0; 32],
             next_sequence: 0,
+            next_leaf_index: 0,
             bump,
-            reserved: [0; 15],
+            reserved: [0; 11],
         }
     }
 
@@ -312,10 +320,12 @@ impl QuantumAuthorityState {
 
         dst[..8].copy_from_slice(&self.discriminator);
         dst[8..40].copy_from_slice(&self.current_authority_hash);
-        dst[40..72].copy_from_slice(&self.last_consumed_digest);
-        dst[72..80].copy_from_slice(&self.next_sequence.to_le_bytes());
-        dst[80] = self.bump;
-        dst[81..96].copy_from_slice(&self.reserved);
+        dst[40..72].copy_from_slice(&self.current_authority_root);
+        dst[72..104].copy_from_slice(&self.last_consumed_digest);
+        dst[104..112].copy_from_slice(&self.next_sequence.to_le_bytes());
+        dst[112..116].copy_from_slice(&self.next_leaf_index.to_le_bytes());
+        dst[116] = self.bump;
+        dst[117..128].copy_from_slice(&self.reserved);
 
         true
     }
@@ -331,21 +341,29 @@ impl QuantumAuthorityState {
         let mut current_authority_hash = [0; 32];
         current_authority_hash.copy_from_slice(&src[8..40]);
 
+        let mut current_authority_root = [0; 32];
+        current_authority_root.copy_from_slice(&src[40..72]);
+
         let mut last_consumed_digest = [0; 32];
-        last_consumed_digest.copy_from_slice(&src[40..72]);
+        last_consumed_digest.copy_from_slice(&src[72..104]);
 
         let mut next_sequence = [0; 8];
-        next_sequence.copy_from_slice(&src[72..80]);
+        next_sequence.copy_from_slice(&src[104..112]);
 
-        let mut reserved = [0; 15];
-        reserved.copy_from_slice(&src[81..96]);
+        let mut next_leaf_index = [0; 4];
+        next_leaf_index.copy_from_slice(&src[112..116]);
+
+        let mut reserved = [0; 11];
+        reserved.copy_from_slice(&src[117..128]);
 
         Some(Self {
             discriminator,
             current_authority_hash,
+            current_authority_root,
             last_consumed_digest,
             next_sequence: u64::from_le_bytes(next_sequence),
-            bump: src[80],
+            next_leaf_index: u32::from_le_bytes(next_leaf_index),
+            bump: src[116],
             reserved,
         })
     }
@@ -354,8 +372,8 @@ impl QuantumAuthorityState {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionSessionState, PolicyReceiptState, QuantumAuthorityState, SessionStatus, VaultRegistry,
-        VaultStatus, ACTION_SESSION_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR,
+        ActionSessionState, PolicyReceiptState, QuantumAuthorityState, SessionStatus,
+        VaultRegistry, VaultStatus, ACTION_SESSION_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR,
         QUANTUM_STATE_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
     };
 
@@ -398,16 +416,17 @@ mod tests {
 
     #[test]
     fn quantum_state_starts_at_sequence_zero() {
-        let state = QuantumAuthorityState::new([5; 32], 1);
+        let state = QuantumAuthorityState::new([5; 32], [6; 32], 1);
 
         assert_eq!(state.discriminator, QUANTUM_STATE_DISCRIMINATOR);
-        assert_eq!(QuantumAuthorityState::LEN, 96);
+        assert_eq!(QuantumAuthorityState::LEN, 128);
         assert_eq!(state.next_sequence, 0);
+        assert_eq!(state.next_leaf_index, 0);
     }
 
     #[test]
     fn quantum_state_roundtrips_through_bytes() {
-        let state = QuantumAuthorityState::new([5; 32], 1);
+        let state = QuantumAuthorityState::new([5; 32], [6; 32], 1);
         let mut bytes = [0; QuantumAuthorityState::LEN];
 
         assert!(state.encode(&mut bytes));

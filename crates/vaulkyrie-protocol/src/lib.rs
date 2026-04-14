@@ -70,6 +70,10 @@ pub const WOTS_CHAIN_COUNT: usize = 16;
 pub const WOTS_ELEMENT_BYTES: usize = 32;
 pub const WOTS_CHAIN_MAX_STEPS: u8 = 15;
 pub const WOTS_KEY_BYTES: usize = WOTS_CHAIN_COUNT * WOTS_ELEMENT_BYTES;
+pub const XMSS_TREE_HEIGHT: usize = 8;
+pub const XMSS_NODE_BYTES: usize = 32;
+pub const XMSS_AUTH_PATH_BYTES: usize = XMSS_TREE_HEIGHT * XMSS_NODE_BYTES;
+pub const XMSS_LEAF_COUNT: u32 = 1u32 << XMSS_TREE_HEIGHT;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyReceipt {
@@ -105,10 +109,12 @@ pub struct AuthorityRotationStatement {
 pub struct WotsAuthProof {
     pub public_key: [u8; WOTS_KEY_BYTES],
     pub signature: [u8; WOTS_KEY_BYTES],
+    pub leaf_index: u32,
+    pub auth_path: [u8; XMSS_AUTH_PATH_BYTES],
 }
 
 impl WotsAuthProof {
-    pub const ENCODED_LEN: usize = WOTS_KEY_BYTES * 2;
+    pub const ENCODED_LEN: usize = (WOTS_KEY_BYTES * 2) + 4 + XMSS_AUTH_PATH_BYTES;
 
     pub fn encode(&self, dst: &mut [u8]) -> bool {
         if dst.len() != Self::ENCODED_LEN {
@@ -116,7 +122,10 @@ impl WotsAuthProof {
         }
 
         dst[..WOTS_KEY_BYTES].copy_from_slice(&self.public_key);
-        dst[WOTS_KEY_BYTES..Self::ENCODED_LEN].copy_from_slice(&self.signature);
+        dst[WOTS_KEY_BYTES..(WOTS_KEY_BYTES * 2)].copy_from_slice(&self.signature);
+        dst[(WOTS_KEY_BYTES * 2)..((WOTS_KEY_BYTES * 2) + 4)]
+            .copy_from_slice(&self.leaf_index.to_le_bytes());
+        dst[((WOTS_KEY_BYTES * 2) + 4)..Self::ENCODED_LEN].copy_from_slice(&self.auth_path);
         true
     }
 
@@ -127,12 +136,21 @@ impl WotsAuthProof {
 
         let mut public_key = [0; WOTS_KEY_BYTES];
         public_key.copy_from_slice(&src[..WOTS_KEY_BYTES]);
+
         let mut signature = [0; WOTS_KEY_BYTES];
-        signature.copy_from_slice(&src[WOTS_KEY_BYTES..Self::ENCODED_LEN]);
+        signature.copy_from_slice(&src[WOTS_KEY_BYTES..(WOTS_KEY_BYTES * 2)]);
+
+        let mut leaf_index = [0; 4];
+        leaf_index.copy_from_slice(&src[(WOTS_KEY_BYTES * 2)..((WOTS_KEY_BYTES * 2) + 4)]);
+
+        let mut auth_path = [0; XMSS_AUTH_PATH_BYTES];
+        auth_path.copy_from_slice(&src[((WOTS_KEY_BYTES * 2) + 4)..Self::ENCODED_LEN]);
 
         Some(Self {
             public_key,
             signature,
+            leaf_index: u32::from_le_bytes(leaf_index),
+            auth_path,
         })
     }
 
@@ -140,6 +158,24 @@ impl WotsAuthProof {
         let mut hasher = Sha256::new();
         hasher.update(self.public_key);
         hasher.finalize().into()
+    }
+
+    pub fn merkle_root(&self) -> [u8; 32] {
+        let mut node = self.authority_hash();
+        for level in 0..XMSS_TREE_HEIGHT {
+            let sibling = xmss_get_node(&self.auth_path, level);
+            node = if ((self.leaf_index >> level) & 1) == 0 {
+                xmss_parent_hash(node, sibling)
+            } else {
+                xmss_parent_hash(sibling, node)
+            };
+        }
+
+        node
+    }
+
+    pub fn verify_merkle_root(&self, expected_root: [u8; 32]) -> bool {
+        self.merkle_root() == expected_root
     }
 
     pub fn verify_digest(&self, digest: [u8; 32]) -> bool {
@@ -186,6 +222,15 @@ impl WotsSecretKey {
     }
 
     pub fn sign_digest(&self, digest: [u8; 32]) -> WotsAuthProof {
+        self.sign_digest_with_auth_path(digest, 0, [0; XMSS_AUTH_PATH_BYTES])
+    }
+
+    pub fn sign_digest_with_auth_path(
+        &self,
+        digest: [u8; 32],
+        leaf_index: u32,
+        auth_path: [u8; XMSS_AUTH_PATH_BYTES],
+    ) -> WotsAuthProof {
         let digits = wots_message_digits(digest);
         let mut signature = [0; WOTS_KEY_BYTES];
 
@@ -198,11 +243,22 @@ impl WotsSecretKey {
         WotsAuthProof {
             public_key: self.public_key(),
             signature,
+            leaf_index,
+            auth_path,
         }
     }
 
     pub fn sign_statement(&self, statement: &AuthorityRotationStatement) -> WotsAuthProof {
         self.sign_digest(statement.digest())
+    }
+
+    pub fn sign_statement_with_auth_path(
+        &self,
+        statement: &AuthorityRotationStatement,
+        leaf_index: u32,
+        auth_path: [u8; XMSS_AUTH_PATH_BYTES],
+    ) -> WotsAuthProof {
+        self.sign_digest_with_auth_path(statement.digest(), leaf_index, auth_path)
     }
 }
 
@@ -279,11 +335,26 @@ fn wots_set_element(
     dst[start..end].copy_from_slice(&value);
 }
 
+fn xmss_parent_hash(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(left);
+    hasher.update(right);
+    hasher.finalize().into()
+}
+
+fn xmss_get_node(data: &[u8; XMSS_AUTH_PATH_BYTES], level: usize) -> [u8; XMSS_NODE_BYTES] {
+    let start = level * XMSS_NODE_BYTES;
+    let end = start + XMSS_NODE_BYTES;
+    let mut node = [0; XMSS_NODE_BYTES];
+    node.copy_from_slice(&data[start..end]);
+    node
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionDescriptor, ActionKind, AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement,
-        WotsAuthProof, WotsSecretKey, WOTS_KEY_BYTES,
+        ActionDescriptor, ActionKind, AuthorityRotationStatement, PolicyReceipt,
+        ThresholdRequirement, WotsAuthProof, WotsSecretKey, WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES,
     };
 
     fn descriptor(kind: ActionKind) -> ActionDescriptor {
@@ -293,6 +364,14 @@ mod tests {
             policy_version: 42,
             kind,
         }
+    }
+
+    fn sample_auth_path(seed: u8) -> [u8; XMSS_AUTH_PATH_BYTES] {
+        let mut auth_path = [0u8; XMSS_AUTH_PATH_BYTES];
+        for (index, byte) in auth_path.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(index as u8);
+        }
+        auth_path
     }
 
     #[test]
@@ -388,8 +467,14 @@ mod tests {
 
     #[test]
     fn threshold_decoding_accepts_known_values() {
-        assert_eq!(ThresholdRequirement::try_from(1), Ok(ThresholdRequirement::OneOfThree));
-        assert_eq!(ThresholdRequirement::try_from(2), Ok(ThresholdRequirement::TwoOfThree));
+        assert_eq!(
+            ThresholdRequirement::try_from(1),
+            Ok(ThresholdRequirement::OneOfThree)
+        );
+        assert_eq!(
+            ThresholdRequirement::try_from(2),
+            Ok(ThresholdRequirement::TwoOfThree)
+        );
         assert_eq!(
             ThresholdRequirement::try_from(255),
             Ok(ThresholdRequirement::RequirePqcAuth)
@@ -435,10 +520,47 @@ mod tests {
     }
 
     #[test]
+    fn xmss_proof_derives_merkle_root_from_leaf_index_and_auth_path() {
+        let secret = sample_wots_secret(7);
+        let statement = AuthorityRotationStatement {
+            action_hash: [11; 32],
+            next_authority_hash: [12; 32],
+            sequence: 2,
+            expiry_slot: 900,
+        };
+        let proof = secret.sign_statement_with_auth_path(&statement, 3, sample_auth_path(21));
+        let root = proof.merkle_root();
+
+        assert!(proof.verify_merkle_root(root));
+    }
+
+    #[test]
+    fn xmss_merkle_root_changes_with_leaf_index() {
+        let secret = sample_wots_secret(7);
+        let statement = AuthorityRotationStatement {
+            action_hash: [11; 32],
+            next_authority_hash: [12; 32],
+            sequence: 2,
+            expiry_slot: 900,
+        };
+        let auth_path = sample_auth_path(21);
+        let first = secret
+            .sign_statement_with_auth_path(&statement, 0, auth_path)
+            .merkle_root();
+        let second = secret
+            .sign_statement_with_auth_path(&statement, 1, auth_path)
+            .merkle_root();
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn wots_proof_roundtrips_through_bytes() {
         let proof = WotsAuthProof {
             public_key: [3; WOTS_KEY_BYTES],
             signature: [4; WOTS_KEY_BYTES],
+            leaf_index: 9,
+            auth_path: [5; XMSS_AUTH_PATH_BYTES],
         };
         let mut bytes = [0u8; WotsAuthProof::ENCODED_LEN];
         assert!(proof.encode(&mut bytes));

@@ -14,6 +14,7 @@ pub struct InitVaultArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitAuthorityArgs {
     pub current_authority_hash: [u8; 32],
+    pub current_authority_root: [u8; 32],
     pub bump: u8,
 }
 
@@ -100,16 +101,20 @@ fn parse_init_vault(data: &[u8]) -> Result<InitVaultArgs, ProgramError> {
 }
 
 fn parse_init_authority(data: &[u8]) -> Result<InitAuthorityArgs, ProgramError> {
-    if data.len() != 33 {
+    if data.len() != 65 {
         return Err(ProgramError::InvalidInstructionData);
     }
 
     let mut current_authority_hash = [0; 32];
     current_authority_hash.copy_from_slice(&data[..32]);
 
+    let mut current_authority_root = [0; 32];
+    current_authority_root.copy_from_slice(&data[32..64]);
+
     Ok(InitAuthorityArgs {
         current_authority_hash,
-        bump: data[32],
+        current_authority_root,
+        bump: data[64],
     })
 }
 
@@ -142,7 +147,9 @@ fn parse_policy_receipt(data: &[u8]) -> Result<PolicyReceipt, ProgramError> {
     })
 }
 
-fn parse_authority_rotation_statement(data: &[u8]) -> Result<AuthorityRotationStatement, ProgramError> {
+fn parse_authority_rotation_statement(
+    data: &[u8],
+) -> Result<AuthorityRotationStatement, ProgramError> {
     if data.len() != 80 {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -183,12 +190,16 @@ mod tests {
     use super::{CoreInstruction, InitAuthorityArgs, InitVaultArgs, RotateAuthorityArgs};
     use pinocchio::program_error::ProgramError;
     use vaulkyrie_protocol::{
-        AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement, WotsAuthProof, WOTS_KEY_BYTES,
+        AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement, WotsAuthProof,
+        WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES,
     };
 
     #[test]
     fn parses_ping_instruction() {
-        assert_eq!(CoreInstruction::try_from(&[0][..]), Ok(CoreInstruction::Ping));
+        assert_eq!(
+            CoreInstruction::try_from(&[0][..]),
+            Ok(CoreInstruction::Ping)
+        );
     }
 
     #[test]
@@ -243,13 +254,15 @@ mod tests {
     fn parses_init_authority_instruction() {
         let mut data = vec![2];
         data.extend_from_slice(&[3; 32]);
-        data.push(4);
+        data.extend_from_slice(&[4; 32]);
+        data.push(5);
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
             Ok(CoreInstruction::InitAuthority(InitAuthorityArgs {
                 current_authority_hash: [3; 32],
-                bump: 4,
+                current_authority_root: [4; 32],
+                bump: 5,
             }))
         );
     }
@@ -327,6 +340,8 @@ mod tests {
         data.extend_from_slice(&14u64.to_le_bytes());
         data.extend_from_slice(&[7; WOTS_KEY_BYTES]);
         data.extend_from_slice(&[8; WOTS_KEY_BYTES]);
+        data.extend_from_slice(&9u32.to_le_bytes());
+        data.extend_from_slice(&[10; XMSS_AUTH_PATH_BYTES]);
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
@@ -340,6 +355,8 @@ mod tests {
                 proof: WotsAuthProof {
                     public_key: [7; WOTS_KEY_BYTES],
                     signature: [8; WOTS_KEY_BYTES],
+                    leaf_index: 9,
+                    auth_path: [10; XMSS_AUTH_PATH_BYTES],
                 },
             }))
         );

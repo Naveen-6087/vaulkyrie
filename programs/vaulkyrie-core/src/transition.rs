@@ -1,5 +1,5 @@
 use vaulkyrie_protocol::{
-    AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement, WotsAuthProof,
+    AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement, WotsAuthProof, XMSS_LEAF_COUNT,
 };
 
 use crate::state::{
@@ -28,9 +28,12 @@ pub enum TransitionError {
     SessionRequiresPqc,
     AuthorityNoOp,
     AuthoritySequenceMismatch,
+    AuthorityLeafIndexMismatch,
     AuthorityActionMismatch,
     AuthorityProofInvalid,
     AuthorityProofMismatch,
+    AuthorityMerkleRootMismatch,
+    AuthorityTreeExhausted,
 }
 
 pub fn initialize_vault(
@@ -50,9 +53,10 @@ pub fn initialize_vault(
 
 pub fn initialize_quantum_authority(
     current_authority_hash: [u8; 32],
+    current_authority_root: [u8; 32],
     bump: u8,
 ) -> QuantumAuthorityState {
-    QuantumAuthorityState::new(current_authority_hash, bump)
+    QuantumAuthorityState::new(current_authority_hash, current_authority_root, bump)
 }
 
 pub fn parse_vault_status(status: u8) -> Result<VaultStatus, TransitionError> {
@@ -186,7 +190,8 @@ pub fn consume_policy_receipt(
         return Err(TransitionError::ReceiptAlreadyConsumed);
     }
 
-    if state.receipt_commitment != receipt.commitment() || state.action_hash != receipt.action_hash {
+    if state.receipt_commitment != receipt.commitment() || state.action_hash != receipt.action_hash
+    {
         return Err(TransitionError::ReceiptMismatch);
     }
 
@@ -310,10 +315,14 @@ pub fn apply_authority_rotation(
     if state.next_sequence != statement.sequence {
         return Err(TransitionError::AuthoritySequenceMismatch);
     }
+    if state.next_leaf_index >= XMSS_LEAF_COUNT {
+        return Err(TransitionError::AuthorityTreeExhausted);
+    }
 
     state.last_consumed_digest = statement.digest();
     state.current_authority_hash = statement.next_authority_hash;
     state.next_sequence += 1;
+    state.next_leaf_index += 1;
 
     Ok(())
 }
@@ -351,8 +360,17 @@ pub fn verify_authority_proof(
     statement: &AuthorityRotationStatement,
     proof: &WotsAuthProof,
 ) -> Result<(), TransitionError> {
+    if authority.next_leaf_index >= XMSS_LEAF_COUNT {
+        return Err(TransitionError::AuthorityTreeExhausted);
+    }
     if proof.authority_hash() != authority.current_authority_hash {
         return Err(TransitionError::AuthorityProofMismatch);
+    }
+    if proof.leaf_index != authority.next_leaf_index {
+        return Err(TransitionError::AuthorityLeafIndexMismatch);
+    }
+    if !proof.verify_merkle_root(authority.current_authority_root) {
+        return Err(TransitionError::AuthorityMerkleRootMismatch);
     }
     if !proof.verify_statement(statement) {
         return Err(TransitionError::AuthorityProofInvalid);
@@ -385,20 +403,18 @@ fn validate_spend_threshold(threshold: u8) -> Result<(), TransitionError> {
 #[cfg(test)]
 mod tests {
     use vaulkyrie_protocol::{
-        ActionDescriptor, ActionKind, AuthorityRotationStatement, ThresholdRequirement, WotsSecretKey,
-        WOTS_KEY_BYTES,
+        ActionDescriptor, ActionKind, AuthorityRotationStatement, ThresholdRequirement,
+        WotsSecretKey, WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES, XMSS_LEAF_COUNT,
     };
 
     use super::{
         apply_authority_rotation, consume_action_session, consume_policy_receipt,
-        finalize_action_session, initialize_quantum_authority, initialize_vault, parse_vault_status,
-        mark_action_session_ready, rotate_vault_authority, validate_vault_authority_alignment,
-        validate_authority_action_binding,
-        verify_authority_proof,
-        validate_and_advance_receipt_nonce,
-        validate_vault_active, validate_vault_for_receipt, validate_vault_for_session,
-        validate_vault_recovery_mode,
-        open_action_session, open_action_session_from_receipt, stage_policy_receipt, update_vault_status,
+        finalize_action_session, initialize_quantum_authority, initialize_vault,
+        mark_action_session_ready, open_action_session, open_action_session_from_receipt,
+        parse_vault_status, rotate_vault_authority, stage_policy_receipt, update_vault_status,
+        validate_and_advance_receipt_nonce, validate_authority_action_binding,
+        validate_vault_active, validate_vault_authority_alignment, validate_vault_for_receipt,
+        validate_vault_for_session, validate_vault_recovery_mode, verify_authority_proof,
         TransitionError,
     };
     use crate::state::{QuantumAuthorityState, SessionStatus, VaultStatus};
@@ -438,6 +454,14 @@ mod tests {
         WotsSecretKey { elements }
     }
 
+    fn sample_auth_path(seed: u8) -> [u8; XMSS_AUTH_PATH_BYTES] {
+        let mut auth_path = [0u8; XMSS_AUTH_PATH_BYTES];
+        for (index, byte) in auth_path.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(index as u8);
+        }
+        auth_path
+    }
+
     #[test]
     fn initialize_vault_sets_active_status() {
         let vault = initialize_vault([1; 32], [2; 32], 3, 4);
@@ -450,11 +474,13 @@ mod tests {
 
     #[test]
     fn initialize_quantum_authority_sets_sequence_zero() {
-        let state = initialize_quantum_authority([8; 32], 6);
+        let state = initialize_quantum_authority([8; 32], [9; 32], 6);
 
         assert_eq!(state.current_authority_hash, [8; 32]);
+        assert_eq!(state.current_authority_root, [9; 32]);
         assert_eq!(state.bump, 6);
         assert_eq!(state.next_sequence, 0);
+        assert_eq!(state.next_leaf_index, 0);
     }
 
     #[test]
@@ -611,7 +637,7 @@ mod tests {
     #[test]
     fn validate_vault_authority_alignment_accepts_matching_hashes() {
         let vault = initialize_vault([1; 32], [2; 32], 9, 4);
-        let authority = initialize_quantum_authority([2; 32], 1);
+        let authority = initialize_quantum_authority([2; 32], [3; 32], 1);
 
         validate_vault_authority_alignment(&vault, &authority)
             .expect("matching authority hashes should pass");
@@ -620,7 +646,7 @@ mod tests {
     #[test]
     fn validate_vault_authority_alignment_rejects_mismatch() {
         let vault = initialize_vault([1; 32], [2; 32], 9, 4);
-        let authority = initialize_quantum_authority([3; 32], 1);
+        let authority = initialize_quantum_authority([3; 32], [4; 32], 1);
 
         let error = validate_vault_authority_alignment(&vault, &authority)
             .expect_err("mismatched authority hashes should fail");
@@ -1069,7 +1095,20 @@ mod tests {
     #[test]
     fn authority_rotation_advances_sequence() {
         let secret = sample_wots_secret(33);
-        let mut state = QuantumAuthorityState::new(secret.authority_hash(), 1);
+        let auth_path = sample_auth_path(17);
+        let proof_root = secret
+            .sign_statement_with_auth_path(
+                &vaulkyrie_protocol::AuthorityRotationStatement {
+                    action_hash: [0; 32],
+                    next_authority_hash: [4; 32],
+                    sequence: 0,
+                    expiry_slot: 100,
+                },
+                0,
+                auth_path,
+            )
+            .merkle_root();
+        let mut state = QuantumAuthorityState::new(secret.authority_hash(), proof_root, 1);
         let mut statement = vaulkyrie_protocol::AuthorityRotationStatement {
             action_hash: [0; 32],
             next_authority_hash: [4; 32],
@@ -1077,20 +1116,21 @@ mod tests {
             expiry_slot: 100,
         };
         statement.action_hash = statement.expected_action_hash([1; 32], 9);
-        let proof = secret.sign_statement(&statement);
+        let proof = secret.sign_statement_with_auth_path(&statement, 0, auth_path);
         verify_authority_proof(&state, &statement, &proof).expect("proof should verify");
 
         apply_authority_rotation(&mut state, &statement, 10).expect("sequence should match");
 
         assert_eq!(state.current_authority_hash, [4; 32]);
         assert_eq!(state.next_sequence, 1);
+        assert_eq!(state.next_leaf_index, 1);
         assert_eq!(state.last_consumed_digest, statement.digest());
     }
 
     #[test]
     fn authority_rotation_rejects_stale_sequence() {
         let secret = sample_wots_secret(33);
-        let mut state = QuantumAuthorityState::new(secret.authority_hash(), 1);
+        let mut state = QuantumAuthorityState::new(secret.authority_hash(), [8; 32], 1);
         state.next_sequence = 2;
         let mut statement = vaulkyrie_protocol::AuthorityRotationStatement {
             action_hash: [0; 32],
@@ -1109,7 +1149,7 @@ mod tests {
     #[test]
     fn authority_rotation_rejects_no_op_hash() {
         let secret = sample_wots_secret(33);
-        let mut state = QuantumAuthorityState::new(secret.authority_hash(), 1);
+        let mut state = QuantumAuthorityState::new(secret.authority_hash(), [8; 32], 1);
         let mut statement = vaulkyrie_protocol::AuthorityRotationStatement {
             action_hash: [0; 32],
             next_authority_hash: secret.authority_hash(),
@@ -1127,7 +1167,7 @@ mod tests {
     #[test]
     fn authority_rotation_rejects_expired_statement() {
         let secret = sample_wots_secret(33);
-        let mut state = QuantumAuthorityState::new(secret.authority_hash(), 1);
+        let mut state = QuantumAuthorityState::new(secret.authority_hash(), [8; 32], 1);
         let mut statement = vaulkyrie_protocol::AuthorityRotationStatement {
             action_hash: [0; 32],
             next_authority_hash: [4; 32],
@@ -1145,11 +1185,14 @@ mod tests {
     #[test]
     fn rotate_vault_authority_updates_both_states() {
         let secret = sample_wots_secret(33);
+        let auth_path = sample_auth_path(21);
         let mut vault = initialize_vault([1; 32], secret.authority_hash(), 9, 4);
         vault.status = VaultStatus::Recovery as u8;
-        let mut authority = initialize_quantum_authority(secret.authority_hash(), 1);
-        let statement = sample_rotation_statement(vault.wallet_pubkey, vault.policy_version, [4; 32], 0, 100);
-        let proof = secret.sign_statement(&statement);
+        let statement =
+            sample_rotation_statement(vault.wallet_pubkey, vault.policy_version, [4; 32], 0, 100);
+        let proof = secret.sign_statement_with_auth_path(&statement, 0, auth_path);
+        let mut authority =
+            initialize_quantum_authority(secret.authority_hash(), proof.merkle_root(), 1);
 
         rotate_vault_authority(&mut vault, &mut authority, &statement, &proof, 10)
             .expect("aligned authority should rotate");
@@ -1157,15 +1200,18 @@ mod tests {
         assert_eq!(vault.current_authority_hash, [4; 32]);
         assert_eq!(authority.current_authority_hash, [4; 32]);
         assert_eq!(authority.next_sequence, 1);
+        assert_eq!(authority.next_leaf_index, 1);
     }
 
     #[test]
     fn rotate_vault_authority_rejects_active_vault() {
         let secret = sample_wots_secret(33);
         let mut vault = initialize_vault([1; 32], secret.authority_hash(), 9, 4);
-        let mut authority = initialize_quantum_authority(secret.authority_hash(), 1);
-        let statement = sample_rotation_statement(vault.wallet_pubkey, vault.policy_version, [4; 32], 0, 100);
-        let proof = secret.sign_statement(&statement);
+        let statement =
+            sample_rotation_statement(vault.wallet_pubkey, vault.policy_version, [4; 32], 0, 100);
+        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(22));
+        let mut authority =
+            initialize_quantum_authority(secret.authority_hash(), proof.merkle_root(), 1);
 
         let error = rotate_vault_authority(&mut vault, &mut authority, &statement, &proof, 10)
             .expect_err("active vault should not allow authority rotation");
@@ -1178,14 +1224,14 @@ mod tests {
         let secret = sample_wots_secret(33);
         let mut vault = initialize_vault([1; 32], secret.authority_hash(), 9, 4);
         vault.status = VaultStatus::Recovery as u8;
-        let mut authority = initialize_quantum_authority(secret.authority_hash(), 1);
+        let mut authority = initialize_quantum_authority(secret.authority_hash(), [8; 32], 1);
         let statement = AuthorityRotationStatement {
             action_hash: sample_action_hash(),
             next_authority_hash: [4; 32],
             sequence: 0,
             expiry_slot: 100,
         };
-        let proof = secret.sign_statement(&statement);
+        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(23));
 
         let error = rotate_vault_authority(&mut vault, &mut authority, &statement, &proof, 10)
             .expect_err("rotation must require rekey-bound action hash");
@@ -1196,7 +1242,8 @@ mod tests {
     #[test]
     fn validate_authority_action_binding_accepts_rekey_bound_hash() {
         let vault = initialize_vault([1; 32], [3; 32], 9, 4);
-        let statement = sample_rotation_statement(vault.wallet_pubkey, vault.policy_version, [4; 32], 0, 100);
+        let statement =
+            sample_rotation_statement(vault.wallet_pubkey, vault.policy_version, [4; 32], 0, 100);
 
         validate_authority_action_binding(&vault, &statement)
             .expect("rekey-bound action hash should pass");
@@ -1205,9 +1252,9 @@ mod tests {
     #[test]
     fn verify_authority_proof_rejects_hash_mismatch() {
         let secret = sample_wots_secret(33);
-        let authority = initialize_quantum_authority([9; 32], 1);
         let statement = sample_rotation_statement([1; 32], 9, [4; 32], 0, 100);
-        let proof = secret.sign_statement(&statement);
+        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(24));
+        let authority = initialize_quantum_authority([9; 32], proof.merkle_root(), 1);
 
         let error = verify_authority_proof(&authority, &statement, &proof)
             .expect_err("proof hash must match current authority hash");
@@ -1219,14 +1266,58 @@ mod tests {
     fn verify_authority_proof_rejects_invalid_signature() {
         let secret = sample_wots_secret(33);
         let statement = sample_rotation_statement([1; 32], 9, [4; 32], 0, 100);
-        let mut proof = secret.sign_statement(&statement);
+        let mut proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(25));
         proof.signature[0] ^= 1;
-        let authority = initialize_quantum_authority(secret.authority_hash(), 1);
+        let authority =
+            initialize_quantum_authority(secret.authority_hash(), proof.merkle_root(), 1);
 
         let error = verify_authority_proof(&authority, &statement, &proof)
             .expect_err("tampered proof should fail verification");
 
         assert_eq!(error, TransitionError::AuthorityProofInvalid);
+    }
+
+    #[test]
+    fn verify_authority_proof_rejects_leaf_index_mismatch() {
+        let secret = sample_wots_secret(33);
+        let statement = sample_rotation_statement([1; 32], 9, [4; 32], 0, 100);
+        let proof = secret.sign_statement_with_auth_path(&statement, 1, sample_auth_path(26));
+        let authority =
+            initialize_quantum_authority(secret.authority_hash(), proof.merkle_root(), 1);
+
+        let error = verify_authority_proof(&authority, &statement, &proof)
+            .expect_err("proof must consume the next expected leaf index");
+
+        assert_eq!(error, TransitionError::AuthorityLeafIndexMismatch);
+    }
+
+    #[test]
+    fn verify_authority_proof_rejects_merkle_root_mismatch() {
+        let secret = sample_wots_secret(33);
+        let statement = sample_rotation_statement([1; 32], 9, [4; 32], 0, 100);
+        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(27));
+        let authority = initialize_quantum_authority(secret.authority_hash(), [8; 32], 1);
+
+        let error = verify_authority_proof(&authority, &statement, &proof)
+            .expect_err("proof root must match the current authority root");
+
+        assert_eq!(error, TransitionError::AuthorityMerkleRootMismatch);
+    }
+
+    #[test]
+    fn verify_authority_proof_rejects_tree_exhaustion() {
+        let secret = sample_wots_secret(33);
+        let statement = sample_rotation_statement([1; 32], 9, [4; 32], 0, 100);
+        let proof =
+            secret.sign_statement_with_auth_path(&statement, XMSS_LEAF_COUNT, sample_auth_path(28));
+        let mut authority =
+            initialize_quantum_authority(secret.authority_hash(), proof.merkle_root(), 1);
+        authority.next_leaf_index = XMSS_LEAF_COUNT;
+
+        let error = verify_authority_proof(&authority, &statement, &proof)
+            .expect_err("no proof should pass once the authority tree is exhausted");
+
+        assert_eq!(error, TransitionError::AuthorityTreeExhausted);
     }
 
     #[test]

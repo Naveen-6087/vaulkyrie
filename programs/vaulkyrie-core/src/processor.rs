@@ -11,8 +11,8 @@ use crate::{
     instruction::{CoreInstruction, InitAuthorityArgs, InitVaultArgs},
     state::{
         ActionSessionState, PolicyReceiptState, QuantumAuthorityState, VaultRegistry,
-        ACTION_SESSION_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR,
-        QUANTUM_STATE_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
+        ACTION_SESSION_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR,
+        VAULT_REGISTRY_DISCRIMINATOR,
     },
     transition,
 };
@@ -26,7 +26,11 @@ pub fn process(
         CoreInstruction::Ping => Ok(()),
         CoreInstruction::InitVault(args) => {
             let wallet_signer = get_account_info!(accounts, 1);
-            ensure_wallet_authority(args.wallet_pubkey, *wallet_signer.key(), wallet_signer.is_signer())?;
+            ensure_wallet_authority(
+                args.wallet_pubkey,
+                *wallet_signer.key(),
+                wallet_signer.is_signer(),
+            )?;
 
             let account = get_account_info!(accounts, 0);
             require_writable(account)?;
@@ -278,7 +282,11 @@ pub fn process_init_authority_data(dst: &mut [u8], args: InitAuthorityArgs) -> P
         return Err(ProgramError::AccountAlreadyInitialized);
     }
 
-    let state = transition::initialize_quantum_authority(args.current_authority_hash, args.bump);
+    let state = transition::initialize_quantum_authority(
+        args.current_authority_hash,
+        args.current_authority_root,
+        args.bump,
+    );
     if !state.encode(dst) {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -328,7 +336,8 @@ pub fn process_consume_receipt_data(
         return Err(ProgramError::InvalidArgument);
     }
 
-    let mut state = PolicyReceiptState::decode(receipt_dst).ok_or(ProgramError::InvalidAccountData)?;
+    let mut state =
+        PolicyReceiptState::decode(receipt_dst).ok_or(ProgramError::InvalidAccountData)?;
     require_discriminator(&state.discriminator, &POLICY_RECEIPT_DISCRIMINATOR)?;
     transition::consume_policy_receipt_for_vault(&mut vault, &mut state, receipt)
         .map_err(map_transition_error)?;
@@ -434,7 +443,8 @@ pub fn process_finalize_session_data(
         return Err(ProgramError::AccountDataTooSmall);
     }
 
-    let mut vault_state = VaultRegistry::decode(vault_dst).ok_or(ProgramError::InvalidAccountData)?;
+    let mut vault_state =
+        VaultRegistry::decode(vault_dst).ok_or(ProgramError::InvalidAccountData)?;
     require_discriminator(&vault_state.discriminator, &VAULT_REGISTRY_DISCRIMINATOR)?;
     transition::validate_vault_active(&vault_state).map_err(map_transition_error)?;
     if vault_state.policy_version != expected_policy_version
@@ -461,7 +471,7 @@ pub fn process_finalize_session_data(
         receipt,
         current_slot,
     )
-        .map_err(map_transition_error)?;
+    .map_err(map_transition_error)?;
 
     if !vault_state.encode(vault_dst)
         || !receipt_state.encode(receipt_dst)
@@ -565,7 +575,9 @@ fn current_slot() -> Result<u64, ProgramError> {
 
 fn map_transition_error(error: transition::TransitionError) -> ProgramError {
     match error {
-        transition::TransitionError::ReceiptAlreadyConsumed => ProgramError::AccountAlreadyInitialized,
+        transition::TransitionError::ReceiptAlreadyConsumed => {
+            ProgramError::AccountAlreadyInitialized
+        }
         transition::TransitionError::ReceiptMismatch => ProgramError::InvalidAccountData,
         transition::TransitionError::ReceiptExpired => ProgramError::InvalidArgument,
         transition::TransitionError::ReceiptNonceReplay => ProgramError::InvalidArgument,
@@ -576,7 +588,9 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::VaultNotActive => ProgramError::InvalidAccountData,
         transition::TransitionError::VaultNotRecovery => ProgramError::InvalidAccountData,
         transition::TransitionError::VaultStatusInvalid => ProgramError::InvalidInstructionData,
-        transition::TransitionError::VaultStatusTransitionNotAllowed => ProgramError::InvalidArgument,
+        transition::TransitionError::VaultStatusTransitionNotAllowed => {
+            ProgramError::InvalidArgument
+        }
         transition::TransitionError::SessionPolicyMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::SessionMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::SessionNotPending => ProgramError::AccountAlreadyInitialized,
@@ -584,9 +598,12 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::SessionRequiresPqc => ProgramError::InvalidArgument,
         transition::TransitionError::AuthorityNoOp => ProgramError::InvalidArgument,
         transition::TransitionError::AuthoritySequenceMismatch => ProgramError::InvalidArgument,
+        transition::TransitionError::AuthorityLeafIndexMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::AuthorityActionMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::AuthorityProofInvalid => ProgramError::InvalidArgument,
         transition::TransitionError::AuthorityProofMismatch => ProgramError::InvalidArgument,
+        transition::TransitionError::AuthorityMerkleRootMismatch => ProgramError::InvalidArgument,
+        transition::TransitionError::AuthorityTreeExhausted => ProgramError::InvalidArgument,
     }
 }
 
@@ -595,14 +612,14 @@ mod tests {
     use pinocchio::program_error::ProgramError;
     use vaulkyrie_protocol::{
         ActionDescriptor, ActionKind, PolicyReceipt, ThresholdRequirement, WotsSecretKey,
-        WOTS_KEY_BYTES,
+        WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES, XMSS_LEAF_COUNT,
     };
 
     use super::{
-        process_activate_session_data, process_consume_receipt_data, process_consume_session_data,
-        process_finalize_session_data, process_init_authority_data, process_init_vault_data,
-        process_open_session_data, process_rotate_authority_data, process_set_vault_status_data,
-        process_stage_receipt_data, ensure_wallet_authority,
+        ensure_wallet_authority, process_activate_session_data, process_consume_receipt_data,
+        process_consume_session_data, process_finalize_session_data, process_init_authority_data,
+        process_init_vault_data, process_open_session_data, process_rotate_authority_data,
+        process_set_vault_status_data, process_stage_receipt_data,
     };
     use crate::{
         instruction::{InitAuthorityArgs, InitVaultArgs},
@@ -644,7 +661,8 @@ mod tests {
             sequence,
             expiry_slot,
         };
-        statement.action_hash = statement.expected_action_hash(vault.wallet_pubkey, vault.policy_version);
+        statement.action_hash =
+            statement.expected_action_hash(vault.wallet_pubkey, vault.policy_version);
         statement
     }
 
@@ -654,6 +672,14 @@ mod tests {
             *byte = seed.wrapping_add(index as u8);
         }
         WotsSecretKey { elements }
+    }
+
+    fn sample_auth_path(seed: u8) -> [u8; XMSS_AUTH_PATH_BYTES] {
+        let mut auth_path = [0u8; XMSS_AUTH_PATH_BYTES];
+        for (index, byte) in auth_path.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(index as u8);
+        }
+        auth_path
     }
 
     #[test]
@@ -697,8 +723,8 @@ mod tests {
         let vault = VaultRegistry::new([5; 32], [6; 32], 7, VaultStatus::Active, 8);
         assert!(vault.encode(&mut bytes));
 
-        let error = process_set_vault_status_data(&mut bytes, 42)
-            .expect_err("unknown status should fail");
+        let error =
+            process_set_vault_status_data(&mut bytes, 42).expect_err("unknown status should fail");
 
         assert_eq!(error, ProgramError::InvalidInstructionData);
     }
@@ -763,6 +789,7 @@ mod tests {
             &mut bytes,
             InitAuthorityArgs {
                 current_authority_hash: [7; 32],
+                current_authority_root: [8; 32],
                 bump: 2,
             },
         )
@@ -770,8 +797,10 @@ mod tests {
 
         let state = QuantumAuthorityState::decode(&bytes).expect("state should decode");
         assert_eq!(state.current_authority_hash, [7; 32]);
+        assert_eq!(state.current_authority_root, [8; 32]);
         assert_eq!(state.bump, 2);
         assert_eq!(state.next_sequence, 0);
+        assert_eq!(state.next_leaf_index, 0);
     }
 
     #[test]
@@ -782,6 +811,7 @@ mod tests {
             &mut bytes,
             InitAuthorityArgs {
                 current_authority_hash: [7; 32],
+                current_authority_root: [8; 32],
                 bump: 2,
             },
         )
@@ -813,7 +843,8 @@ mod tests {
     #[test]
     fn consume_receipt_rejects_replayed_nonce() {
         let receipt = sample_receipt();
-        let mut vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+        let mut vault =
+            VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
         vault.last_consumed_receipt_nonce = receipt.nonce;
         let staged = PolicyReceiptState::new(
             receipt.commitment(),
@@ -907,26 +938,21 @@ mod tests {
             crate::state::VaultStatus::Recovery,
             8,
         );
-        let initial = QuantumAuthorityState::new(secret.authority_hash(), 1);
+        let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
+        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(31));
+        let initial = QuantumAuthorityState::new(secret.authority_hash(), proof.merkle_root(), 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut bytes));
-        let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
-        let proof = secret.sign_statement(&statement);
 
-        process_rotate_authority_data(
-            &mut vault_bytes,
-            &mut bytes,
-            &statement,
-            &proof,
-            10,
-        )
-        .expect("rotation should succeed");
+        process_rotate_authority_data(&mut vault_bytes, &mut bytes, &statement, &proof, 10)
+            .expect("rotation should succeed");
 
         let vault = VaultRegistry::decode(&vault_bytes).expect("vault should decode");
         let state = QuantumAuthorityState::decode(&bytes).expect("state should decode");
         assert_eq!(vault.current_authority_hash, [8; 32]);
         assert_eq!(state.current_authority_hash, [8; 32]);
         assert_eq!(state.next_sequence, 1);
+        assert_eq!(state.next_leaf_index, 1);
     }
 
     #[test]
@@ -941,11 +967,11 @@ mod tests {
             crate::state::VaultStatus::Recovery,
             8,
         );
-        let initial = QuantumAuthorityState::new([9; 32], 1);
+        let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
+        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(32));
+        let initial = QuantumAuthorityState::new([9; 32], proof.merkle_root(), 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
-        let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
-        let proof = secret.sign_statement(&statement);
 
         let error = process_rotate_authority_data(
             &mut vault_bytes,
@@ -971,11 +997,11 @@ mod tests {
             crate::state::VaultStatus::Recovery,
             8,
         );
-        let initial = QuantumAuthorityState::new(secret.authority_hash(), 1);
+        let statement = sample_rotation_statement(&vault, secret.authority_hash(), 0, 200);
+        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(33));
+        let initial = QuantumAuthorityState::new(secret.authority_hash(), proof.merkle_root(), 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
-        let statement = sample_rotation_statement(&vault, secret.authority_hash(), 0, 200);
-        let proof = secret.sign_statement(&statement);
 
         let error = process_rotate_authority_data(
             &mut vault_bytes,
@@ -1001,11 +1027,11 @@ mod tests {
             crate::state::VaultStatus::Recovery,
             8,
         );
-        let initial = QuantumAuthorityState::new(secret.authority_hash(), 1);
+        let statement = sample_rotation_statement(&vault, [8; 32], 0, 9);
+        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(34));
+        let initial = QuantumAuthorityState::new(secret.authority_hash(), proof.merkle_root(), 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
-        let statement = sample_rotation_statement(&vault, [8; 32], 0, 9);
-        let proof = secret.sign_statement(&statement);
 
         let error = process_rotate_authority_data(
             &mut vault_bytes,
@@ -1031,11 +1057,11 @@ mod tests {
             crate::state::VaultStatus::Active,
             8,
         );
-        let initial = QuantumAuthorityState::new(secret.authority_hash(), 1);
+        let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
+        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(35));
+        let initial = QuantumAuthorityState::new(secret.authority_hash(), proof.merkle_root(), 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
-        let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
-        let proof = secret.sign_statement(&statement);
 
         let error = process_rotate_authority_data(
             &mut vault_bytes,
@@ -1061,16 +1087,16 @@ mod tests {
             crate::state::VaultStatus::Recovery,
             8,
         );
-        let initial = QuantumAuthorityState::new(secret.authority_hash(), 1);
-        assert!(vault.encode(&mut vault_bytes));
-        assert!(initial.encode(&mut authority_bytes));
         let statement = vaulkyrie_protocol::AuthorityRotationStatement {
             action_hash: sample_action_hash(),
             next_authority_hash: [8; 32],
             sequence: 0,
             expiry_slot: 200,
         };
-        let proof = secret.sign_statement(&statement);
+        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(36));
+        let initial = QuantumAuthorityState::new(secret.authority_hash(), proof.merkle_root(), 1);
+        assert!(vault.encode(&mut vault_bytes));
+        assert!(initial.encode(&mut authority_bytes));
 
         let error = process_rotate_authority_data(
             &mut vault_bytes,
@@ -1096,11 +1122,11 @@ mod tests {
             crate::state::VaultStatus::Recovery,
             8,
         );
-        let initial = QuantumAuthorityState::new(secret.authority_hash(), 1);
+        let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
+        let mut proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(37));
+        let initial = QuantumAuthorityState::new(secret.authority_hash(), proof.merkle_root(), 1);
         assert!(vault.encode(&mut vault_bytes));
         assert!(initial.encode(&mut authority_bytes));
-        let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
-        let mut proof = secret.sign_statement(&statement);
         proof.signature[0] ^= 1;
 
         let error = process_rotate_authority_data(
@@ -1111,6 +1137,70 @@ mod tests {
             10,
         )
         .expect_err("tampered proof should fail");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn rotate_authority_rejects_leaf_index_mismatch() {
+        let mut vault_bytes = [0; VaultRegistry::LEN];
+        let mut authority_bytes = [0; QuantumAuthorityState::LEN];
+        let secret = sample_wots_secret(41);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            secret.authority_hash(),
+            3,
+            crate::state::VaultStatus::Recovery,
+            8,
+        );
+        let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
+        let proof = secret.sign_statement_with_auth_path(&statement, 1, sample_auth_path(38));
+        let initial = QuantumAuthorityState::new(secret.authority_hash(), proof.merkle_root(), 1);
+        assert!(vault.encode(&mut vault_bytes));
+        assert!(initial.encode(&mut authority_bytes));
+
+        let error = process_rotate_authority_data(
+            &mut vault_bytes,
+            &mut authority_bytes,
+            &statement,
+            &proof,
+            10,
+        )
+        .expect_err("rotation should require the next expected leaf index");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn rotate_authority_rejects_tree_exhaustion() {
+        let mut vault_bytes = [0; VaultRegistry::LEN];
+        let mut authority_bytes = [0; QuantumAuthorityState::LEN];
+        let secret = sample_wots_secret(41);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            secret.authority_hash(),
+            3,
+            crate::state::VaultStatus::Recovery,
+            8,
+        );
+        let statement = sample_rotation_statement(&vault, [8; 32], XMSS_LEAF_COUNT as u64, 200);
+        let proof =
+            secret.sign_statement_with_auth_path(&statement, XMSS_LEAF_COUNT, sample_auth_path(39));
+        let mut initial =
+            QuantumAuthorityState::new(secret.authority_hash(), proof.merkle_root(), 1);
+        initial.next_sequence = XMSS_LEAF_COUNT as u64;
+        initial.next_leaf_index = XMSS_LEAF_COUNT;
+        assert!(vault.encode(&mut vault_bytes));
+        assert!(initial.encode(&mut authority_bytes));
+
+        let error = process_rotate_authority_data(
+            &mut vault_bytes,
+            &mut authority_bytes,
+            &statement,
+            &proof,
+            10,
+        )
+        .expect_err("rotation should fail once the authority tree is exhausted");
 
         assert_eq!(error, ProgramError::InvalidArgument);
     }
@@ -1134,10 +1224,7 @@ mod tests {
         let state = ActionSessionState::decode(&session_bytes).expect("state should decode");
         assert_eq!(state.receipt_commitment, receipt.commitment());
         assert_eq!(state.action_hash, receipt.action_hash);
-        assert_eq!(
-            state.threshold,
-            ThresholdRequirement::TwoOfThree.as_byte()
-        );
+        assert_eq!(state.threshold, ThresholdRequirement::TwoOfThree.as_byte());
         assert_eq!(state.status, SessionStatus::Pending as u8);
     }
 
@@ -1234,9 +1321,13 @@ mod tests {
         assert!(receipt_state.encode(&mut receipt_bytes));
         process_open_session_data(&receipt_bytes, &mut bytes, &receipt, 10)
             .expect("open session should succeed");
-        let error =
-            process_activate_session_data(&mut bytes, receipt.action_hash, 10, receipt.policy_version)
-                .expect_err("pqc-only threshold should reject spend activation");
+        let error = process_activate_session_data(
+            &mut bytes,
+            receipt.action_hash,
+            10,
+            receipt.policy_version,
+        )
+        .expect_err("pqc-only threshold should reject spend activation");
 
         assert_eq!(error, ProgramError::InvalidArgument);
     }
@@ -1284,14 +1375,14 @@ mod tests {
             10,
             receipt.policy_version,
         )
-            .expect("activate session should succeed");
+        .expect("activate session should succeed");
         process_consume_session_data(
             &mut session_bytes,
             receipt.action_hash,
             10,
             receipt.policy_version,
         )
-            .expect("consume session should succeed");
+        .expect("consume session should succeed");
 
         let state = ActionSessionState::decode(&session_bytes).expect("state should decode");
         assert_eq!(state.status, SessionStatus::Consumed as u8);
@@ -1318,7 +1409,7 @@ mod tests {
             10,
             receipt.policy_version,
         )
-            .expect_err("pending session should not be consumable");
+        .expect_err("pending session should not be consumable");
 
         assert_eq!(error, ProgramError::InvalidAccountData);
     }
@@ -1383,7 +1474,7 @@ mod tests {
             10,
             receipt.policy_version,
         )
-            .expect("activate session should succeed");
+        .expect("activate session should succeed");
         process_finalize_session_data(
             &mut vault_bytes,
             &mut receipt_bytes,
@@ -1392,10 +1483,12 @@ mod tests {
             10,
             receipt.policy_version,
         )
-            .expect("finalize session should succeed");
+        .expect("finalize session should succeed");
 
-        let receipt_state = PolicyReceiptState::decode(&receipt_bytes).expect("receipt should decode");
-        let session_state = ActionSessionState::decode(&session_bytes).expect("session should decode");
+        let receipt_state =
+            PolicyReceiptState::decode(&receipt_bytes).expect("receipt should decode");
+        let session_state =
+            ActionSessionState::decode(&session_bytes).expect("session should decode");
         let vault_state = VaultRegistry::decode(&vault_bytes).expect("vault should decode");
         assert_eq!(receipt_state.consumed, 1);
         assert_eq!(session_state.status, SessionStatus::Consumed as u8);
@@ -1428,7 +1521,7 @@ mod tests {
             10,
             receipt.policy_version,
         )
-            .expect_err("pending session should not finalize");
+        .expect_err("pending session should not finalize");
 
         assert_eq!(error, ProgramError::InvalidAccountData);
     }
@@ -1483,7 +1576,8 @@ mod tests {
             receipt.nonce,
             receipt.expiry_slot,
         );
-        let mut vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+        let mut vault =
+            VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
         vault.last_consumed_receipt_nonce = receipt.nonce;
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
