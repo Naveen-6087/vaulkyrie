@@ -10,8 +10,13 @@ crate-type = ["cdylib", "lib"]
 
 [features]
 default = []
-bpf-entrypoint = []
+no-entrypoint = []
+cpi = ["no-entrypoint"]
+idl-build = ["anchor-lang/idl-build", "arcium-anchor/idl-build"]
 
 [dependencies]
-pinocchio.workspace = true
+anchor-lang = { version = "0.32.1", features = ["init-if-needed"] }
+arcium-anchor = "=0.9.3"
+arcium-client = { version = "=0.9.3", default-features = false }
+arcium-macros = "=0.9.3"
 vaulkyrie-protocol = { path = "../../crates/vaulkyrie-protocol" }
