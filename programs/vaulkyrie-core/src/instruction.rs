@@ -130,6 +130,9 @@ pub enum CoreInstruction {
     CommitSpendOrchestration(CommitSpendOrchestrationArgs),
     CompleteSpendOrchestration(CompleteSpendOrchestrationArgs),
     FailSpendOrchestration(FailSpendOrchestrationArgs),
+    /// Stage a policy receipt that has been cross-validated against a
+    /// finalized `PolicyEvaluationState` account owned by vaulkyrie-policy-mxe.
+    StageBridgedReceipt(PolicyReceipt),
 }
 
 impl TryFrom<&[u8]> for CoreInstruction {
@@ -170,6 +173,7 @@ impl TryFrom<&[u8]> for CoreInstruction {
             [20, rest @ ..] => Ok(Self::FailSpendOrchestration(
                 parse_fail_spend_orchestration(rest)?,
             )),
+            [21, rest @ ..] => Ok(Self::StageBridgedReceipt(parse_policy_receipt(rest)?)),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -885,6 +889,27 @@ mod tests {
                     reason_code: 42,
                 }
             ))
+        );
+    }
+
+    #[test]
+    fn parses_stage_bridged_receipt_instruction() {
+        let mut data = vec![21];
+        data.extend_from_slice(&[11; 32]); // action_hash
+        data.extend_from_slice(&7u64.to_le_bytes()); // policy_version
+        data.push(2); // threshold = TwoOfThree
+        data.extend_from_slice(&8u64.to_le_bytes()); // nonce
+        data.extend_from_slice(&900u64.to_le_bytes()); // expiry_slot
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::StageBridgedReceipt(PolicyReceipt {
+                action_hash: [11; 32],
+                policy_version: 7,
+                threshold: ThresholdRequirement::TwoOfThree,
+                nonce: 8,
+                expiry_slot: 900,
+            }))
         );
     }
 }

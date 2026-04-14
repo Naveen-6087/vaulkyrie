@@ -11,6 +11,10 @@ pub enum TransitionError {
     RequestAlreadyAborted,
     DecisionMismatch,
     DelayExceedsExpiry,
+    /// `QueueArciumComputation` called when computation is already queued.
+    ComputationAlreadyQueued,
+    /// Status value does not allow the requested transition.
+    InvalidComputationStatus,
 }
 
 pub fn initialize_policy_config(
@@ -71,7 +75,11 @@ pub fn finalize_policy_evaluation(
         value if value == PolicyEvaluationStatus::Aborted as u8 => {
             return Err(TransitionError::RequestAlreadyAborted);
         }
-        _ => {}
+        // Allow finalization from Pending or ComputationQueued.
+        value
+            if value == PolicyEvaluationStatus::Pending as u8
+                || value == PolicyEvaluationStatus::ComputationQueued as u8 => {}
+        _ => return Err(TransitionError::InvalidComputationStatus),
     }
 
     if state.expiry_slot < current_slot || !matches_envelope(state, envelope) {
@@ -101,11 +109,49 @@ pub fn abort_policy_evaluation(
         value if value == PolicyEvaluationStatus::Aborted as u8 => {
             return Err(TransitionError::RequestAlreadyAborted);
         }
-        _ => {}
+        // Allow abort from Pending or ComputationQueued.
+        value
+            if value == PolicyEvaluationStatus::Pending as u8
+                || value == PolicyEvaluationStatus::ComputationQueued as u8 => {}
+        _ => return Err(TransitionError::InvalidComputationStatus),
     }
 
     state.reason_code = reason_code;
     state.status = PolicyEvaluationStatus::Aborted as u8;
+
+    Ok(())
+}
+
+/// Records that an Arcium computation has been queued for this evaluation.
+///
+/// Transitions the status from `Pending` to `ComputationQueued` and stores
+/// the supplied `computation_offset` so the callback can correlate results.
+/// Calling this twice returns `ComputationAlreadyQueued`.
+pub fn queue_arcium_computation(
+    state: &mut PolicyEvaluationState,
+    computation_offset: u64,
+    current_slot: u64,
+) -> Result<(), TransitionError> {
+    match state.status {
+        value if value == PolicyEvaluationStatus::Finalized as u8 => {
+            return Err(TransitionError::RequestAlreadyFinalized);
+        }
+        value if value == PolicyEvaluationStatus::Aborted as u8 => {
+            return Err(TransitionError::RequestAlreadyAborted);
+        }
+        value if value == PolicyEvaluationStatus::ComputationQueued as u8 => {
+            return Err(TransitionError::ComputationAlreadyQueued);
+        }
+        value if value == PolicyEvaluationStatus::Pending as u8 => {}
+        _ => return Err(TransitionError::InvalidComputationStatus),
+    }
+
+    if state.expiry_slot < current_slot {
+        return Err(TransitionError::RequestExpired);
+    }
+
+    state.computation_offset = computation_offset;
+    state.status = PolicyEvaluationStatus::ComputationQueued as u8;
 
     Ok(())
 }
@@ -122,7 +168,7 @@ fn matches_envelope(state: &PolicyEvaluationState, envelope: &PolicyDecisionEnve
 mod tests {
     use super::{
         abort_policy_evaluation, finalize_policy_evaluation, initialize_policy_config,
-        open_policy_evaluation, TransitionError,
+        open_policy_evaluation, queue_arcium_computation, TransitionError,
     };
     use crate::state::PolicyEvaluationStatus;
     use vaulkyrie_protocol::{
@@ -233,5 +279,90 @@ mod tests {
 
         assert_eq!(state.reason_code, 44);
         assert_eq!(state.status, PolicyEvaluationStatus::Aborted as u8);
+    }
+
+    #[test]
+    fn queue_arcium_computation_transitions_to_computation_queued() {
+        let mut config = initialize_policy_config([4; 32], [5; 32], [6; 32], 9, 2);
+        let request = sample_request();
+        let mut state =
+            open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
+
+        queue_arcium_computation(&mut state, 55, 400).expect("queue should succeed");
+
+        assert_eq!(state.status, PolicyEvaluationStatus::ComputationQueued as u8);
+        assert_eq!(state.computation_offset, 55);
+    }
+
+    #[test]
+    fn queue_arcium_computation_rejects_double_queue() {
+        let mut config = initialize_policy_config([4; 32], [5; 32], [6; 32], 9, 2);
+        let request = sample_request();
+        let mut state =
+            open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
+
+        queue_arcium_computation(&mut state, 55, 400).expect("first queue should succeed");
+
+        assert_eq!(
+            queue_arcium_computation(&mut state, 55, 400),
+            Err(TransitionError::ComputationAlreadyQueued)
+        );
+    }
+
+    #[test]
+    fn queue_arcium_computation_rejects_expired_request() {
+        let mut config = initialize_policy_config([4; 32], [5; 32], [6; 32], 9, 2);
+        let request = sample_request(); // expiry_slot = 900
+        let mut state =
+            open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
+
+        assert_eq!(
+            queue_arcium_computation(&mut state, 55, 1000),
+            Err(TransitionError::RequestExpired)
+        );
+    }
+
+    #[test]
+    fn finalize_allows_computation_queued_state() {
+        let mut config = initialize_policy_config([4; 32], [5; 32], [6; 32], 9, 2);
+        let request = sample_request();
+        let mut state =
+            open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
+
+        queue_arcium_computation(&mut state, 77, 400).expect("queue should succeed");
+
+        let envelope = PolicyDecisionEnvelope {
+            request_commitment: request.commitment(),
+            receipt: PolicyReceipt {
+                action_hash: request.action_hash,
+                policy_version: request.policy_version,
+                threshold: ThresholdRequirement::TwoOfThree,
+                nonce: 9,
+                expiry_slot: 880,
+            },
+            delay_until_slot: 840,
+            reason_code: 5,
+            computation_offset: 77,
+            result_commitment: [9; 32],
+        };
+
+        finalize_policy_evaluation(&mut state, &envelope, 500)
+            .expect("finalize from ComputationQueued should succeed");
+
+        assert_eq!(state.status, PolicyEvaluationStatus::Finalized as u8);
+    }
+
+    #[test]
+    fn abort_allows_computation_queued_state() {
+        let mut config = initialize_policy_config([4; 32], [5; 32], [6; 32], 9, 2);
+        let request = sample_request();
+        let mut state =
+            open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
+
+        queue_arcium_computation(&mut state, 77, 400).expect("queue should succeed");
+        abort_policy_evaluation(&mut state, 11).expect("abort from ComputationQueued should succeed");
+
+        assert_eq!(state.status, PolicyEvaluationStatus::Aborted as u8);
+        assert_eq!(state.reason_code, 11);
     }
 }

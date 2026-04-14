@@ -9,6 +9,8 @@ pub enum PolicyEvaluationStatus {
     Pending = 1,
     Finalized = 2,
     Aborted = 3,
+    /// Arcium MXE computation has been queued; awaiting callback.
+    ComputationQueued = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

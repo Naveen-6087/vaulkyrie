@@ -452,7 +452,49 @@ pub fn process(
             let mut orch_data = orch_account.try_borrow_mut_data()?;
             process_fail_spend_orchestration_data(&mut orch_data, args)
         }
+        CoreInstruction::StageBridgedReceipt(receipt) => {
+            let current_slot = current_slot()?;
+            let vault_account = get_account_info!(accounts, 0);
+            require_program_owner(program_id, vault_account)?;
+
+            let receipt_account = get_account_info!(accounts, 1);
+            require_writable(receipt_account)?;
+            require_program_owner(program_id, receipt_account)?;
+
+            let wallet_signer = get_account_info!(accounts, 2);
+            {
+                let vault_data = vault_account.try_borrow_data()?;
+                let vault = decode_vault_state(&vault_data)?;
+                require_wallet_authority(&vault, wallet_signer)?;
+            }
+
+            // [3] = policy_eval account (readonly, raw bytes validated by transition)
+            let policy_eval_account = get_account_info!(accounts, 3);
+            let policy_eval_data = policy_eval_account.try_borrow_data()?;
+
+            let vault_data = vault_account.try_borrow_data()?;
+            let mut receipt_data = receipt_account.try_borrow_mut_data()?;
+            process_stage_bridged_receipt_data(
+                &vault_data,
+                &mut receipt_data,
+                &policy_eval_data,
+                &receipt,
+                current_slot,
+            )
+        }
     }
+}
+
+pub fn process_stage_bridged_receipt_data(
+    vault_src: &[u8],
+    receipt_dst: &mut [u8],
+    policy_eval_src: &[u8],
+    receipt: &PolicyReceipt,
+    current_slot: u64,
+) -> ProgramResult {
+    transition::validate_bridged_receipt_claim(policy_eval_src, receipt)
+        .map_err(map_transition_error)?;
+    process_stage_receipt_data(vault_src, receipt_dst, receipt, current_slot)
 }
 
 pub fn process_set_vault_status_data(dst: &mut [u8], status: u8) -> ProgramResult {
@@ -1019,6 +1061,7 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::OrchestrationAlreadyComplete => {
             ProgramError::AccountAlreadyInitialized
         }
+        transition::TransitionError::BridgedReceiptMismatch => ProgramError::InvalidAccountData,
     }
 }
 
@@ -1121,7 +1164,7 @@ mod tests {
         process_init_authority_data, process_init_authority_proof_data, process_init_vault_data,
         process_open_session_data, process_rotate_authority_data,
         process_rotate_authority_staged_data, process_set_vault_status_data,
-        process_split_quantum_vault, process_stage_receipt_data,
+        process_split_quantum_vault, process_stage_bridged_receipt_data, process_stage_receipt_data,
         process_write_authority_proof_chunk_data,
     };
     use crate::{
@@ -2469,5 +2512,106 @@ mod tests {
 
         process_close_quantum_vault([9; 32], &signature, bump, vault_pubkey, program_id)
             .expect("close quantum vault should validate a refund-bound signature");
+    }
+
+    // ── process_stage_bridged_receipt_data ───────────────────────────────────
+
+    fn make_finalized_eval_bytes_for_receipt(receipt: &PolicyReceipt) -> [u8; 256] {
+        let mut bytes = [0u8; 256];
+        bytes[0..8].copy_from_slice(b"POLEVAL1");
+        bytes[168..200].copy_from_slice(&receipt.commitment());
+        bytes[240] = 2; // Finalized
+        bytes
+    }
+
+    fn sample_vault_bytes_for_receipt(receipt: &PolicyReceipt) -> Vec<u8> {
+        use crate::state::VaultRegistry;
+        let state = super::super::transition::initialize_vault(
+            [10; 32],
+            [11; 32],
+            receipt.policy_version,
+            1,
+        );
+        let mut buf = vec![0u8; VaultRegistry::LEN];
+        state.encode(&mut buf);
+        buf
+    }
+
+    #[test]
+    fn stage_bridged_receipt_succeeds_on_valid_finalized_eval() {
+        use super::process_stage_bridged_receipt_data;
+        let receipt = PolicyReceipt {
+            action_hash: [7; 32],
+            policy_version: 5,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 3,
+            expiry_slot: 9999,
+        };
+        let vault_bytes = sample_vault_bytes_for_receipt(&receipt);
+        let eval_bytes = make_finalized_eval_bytes_for_receipt(&receipt);
+        let mut receipt_buf = vec![0u8; crate::state::PolicyReceiptState::LEN];
+
+        process_stage_bridged_receipt_data(
+            &vault_bytes,
+            &mut receipt_buf,
+            &eval_bytes,
+            &receipt,
+            100,
+        )
+        .expect("stage_bridged_receipt_data should succeed with valid finalized eval");
+    }
+
+    #[test]
+    fn stage_bridged_receipt_rejects_non_finalized_eval() {
+        use super::process_stage_bridged_receipt_data;
+        use pinocchio::program_error::ProgramError;
+        let receipt = PolicyReceipt {
+            action_hash: [7; 32],
+            policy_version: 5,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 3,
+            expiry_slot: 9999,
+        };
+        let vault_bytes = sample_vault_bytes_for_receipt(&receipt);
+        let mut eval_bytes = make_finalized_eval_bytes_for_receipt(&receipt);
+        eval_bytes[240] = 1; // Pending — not finalized
+        let mut receipt_buf = vec![0u8; crate::state::PolicyReceiptState::LEN];
+
+        let err = process_stage_bridged_receipt_data(
+            &vault_bytes,
+            &mut receipt_buf,
+            &eval_bytes,
+            &receipt,
+            100,
+        )
+        .expect_err("should reject non-finalized eval");
+        assert_eq!(err, ProgramError::InvalidAccountData);
+    }
+
+    #[test]
+    fn stage_bridged_receipt_rejects_commitment_mismatch() {
+        use super::process_stage_bridged_receipt_data;
+        use pinocchio::program_error::ProgramError;
+        let receipt = PolicyReceipt {
+            action_hash: [7; 32],
+            policy_version: 5,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 3,
+            expiry_slot: 9999,
+        };
+        let vault_bytes = sample_vault_bytes_for_receipt(&receipt);
+        let mut eval_bytes = make_finalized_eval_bytes_for_receipt(&receipt);
+        eval_bytes[168..200].copy_from_slice(&[0xAB; 32]); // wrong commitment
+        let mut receipt_buf = vec![0u8; crate::state::PolicyReceiptState::LEN];
+
+        let err = process_stage_bridged_receipt_data(
+            &vault_bytes,
+            &mut receipt_buf,
+            &eval_bytes,
+            &receipt,
+            100,
+        )
+        .expect_err("should reject mismatched commitment");
+        assert_eq!(err, ProgramError::InvalidAccountData);
     }
 }

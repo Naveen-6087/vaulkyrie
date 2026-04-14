@@ -46,6 +46,9 @@ pub enum TransitionError {
     OrchestrationNotPending,
     OrchestrationNotCommitted,
     OrchestrationAlreadyComplete,
+    /// The `PolicyEvaluationState` supplied to `StageBridgedReceipt` does not
+    /// match the receipt commitment or is not in `Finalized` status.
+    BridgedReceiptMismatch,
 }
 
 pub fn initialize_vault(
@@ -119,6 +122,43 @@ pub fn validate_vault_for_receipt(
     }
     if receipt.nonce <= vault.last_consumed_receipt_nonce {
         return Err(TransitionError::ReceiptNonceReplay);
+    }
+
+    Ok(())
+}
+
+/// Cross-validates a receipt against a `PolicyEvaluationState` byte slice owned
+/// by `vaulkyrie-policy-mxe`.
+///
+/// Layout invariants (see `PolicyEvaluationState::encode`):
+/// - `bytes[0..8]`   == `b"POLEVAL1"` (discriminator)
+/// - `bytes[240]`    == `2` (PolicyEvaluationStatus::Finalized)
+/// - `bytes[168..200]` == `receipt.commitment()` (receipt_commitment)
+pub fn validate_bridged_receipt_claim(
+    eval_data: &[u8],
+    receipt: &PolicyReceipt,
+) -> Result<(), TransitionError> {
+    const POLEVAL1: &[u8; 8] = b"POLEVAL1";
+    const FINALIZED: u8 = 2;
+    const MIN_LEN: usize = 256;
+    const DISCRIMINATOR_RANGE: core::ops::Range<usize> = 0..8;
+    const STATUS_OFFSET: usize = 240;
+    const RECEIPT_COMMITMENT_RANGE: core::ops::Range<usize> = 168..200;
+
+    if eval_data.len() < MIN_LEN {
+        return Err(TransitionError::BridgedReceiptMismatch);
+    }
+
+    if &eval_data[DISCRIMINATOR_RANGE] != POLEVAL1 {
+        return Err(TransitionError::BridgedReceiptMismatch);
+    }
+
+    if eval_data[STATUS_OFFSET] != FINALIZED {
+        return Err(TransitionError::BridgedReceiptMismatch);
+    }
+
+    if &eval_data[RECEIPT_COMMITMENT_RANGE] != &receipt.commitment() {
+        return Err(TransitionError::BridgedReceiptMismatch);
     }
 
     Ok(())
@@ -577,7 +617,7 @@ mod tests {
         mark_action_session_ready, open_action_session, open_action_session_from_receipt,
         parse_vault_status, rotate_vault_authority, stage_policy_receipt, update_vault_status,
         validate_and_advance_receipt_nonce, validate_authority_action_binding,
-        validate_quantum_vault_close, validate_quantum_vault_split,
+        validate_bridged_receipt_claim, validate_quantum_vault_close, validate_quantum_vault_split,
         validate_quantum_vault_split_amount, validate_vault_active,
         validate_vault_authority_alignment, validate_vault_for_receipt, validate_vault_for_session,
         validate_vault_recovery_mode, verify_authority_proof, TransitionError,
@@ -1699,5 +1739,113 @@ mod tests {
             .expect_err("complete orchestration cannot be failed");
 
         assert_eq!(error, TransitionError::OrchestrationAlreadyComplete);
+    }
+
+    // ── validate_bridged_receipt_claim ────────────────────────────────────────
+
+    fn make_finalized_eval_bytes(receipt_commitment: [u8; 32]) -> [u8; 256] {
+        let mut bytes = [0u8; 256];
+        bytes[0..8].copy_from_slice(b"POLEVAL1");
+        bytes[168..200].copy_from_slice(&receipt_commitment);
+        bytes[240] = 2; // Finalized
+        bytes
+    }
+
+    #[test]
+    fn validate_bridged_receipt_claim_accepts_valid_eval() {
+        use vaulkyrie_protocol::{PolicyReceipt, ThresholdRequirement};
+
+        let receipt = PolicyReceipt {
+            action_hash: [3; 32],
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 1,
+            expiry_slot: 900,
+        };
+
+        let eval_bytes = make_finalized_eval_bytes(receipt.commitment());
+        assert!(validate_bridged_receipt_claim(&eval_bytes, &receipt).is_ok());
+    }
+
+    #[test]
+    fn validate_bridged_receipt_claim_rejects_non_finalized() {
+        use vaulkyrie_protocol::{PolicyReceipt, ThresholdRequirement};
+
+        let receipt = PolicyReceipt {
+            action_hash: [3; 32],
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 1,
+            expiry_slot: 900,
+        };
+
+        let mut eval_bytes = make_finalized_eval_bytes(receipt.commitment());
+        eval_bytes[240] = 1; // Pending, not Finalized
+
+        assert_eq!(
+            validate_bridged_receipt_claim(&eval_bytes, &receipt),
+            Err(TransitionError::BridgedReceiptMismatch)
+        );
+    }
+
+    #[test]
+    fn validate_bridged_receipt_claim_rejects_mismatched_commitment() {
+        use vaulkyrie_protocol::{PolicyReceipt, ThresholdRequirement};
+
+        let receipt = PolicyReceipt {
+            action_hash: [3; 32],
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 1,
+            expiry_slot: 900,
+        };
+
+        let eval_bytes = make_finalized_eval_bytes([0xff; 32]); // different commitment
+
+        assert_eq!(
+            validate_bridged_receipt_claim(&eval_bytes, &receipt),
+            Err(TransitionError::BridgedReceiptMismatch)
+        );
+    }
+
+    #[test]
+    fn validate_bridged_receipt_claim_rejects_wrong_discriminator() {
+        use vaulkyrie_protocol::{PolicyReceipt, ThresholdRequirement};
+
+        let receipt = PolicyReceipt {
+            action_hash: [3; 32],
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 1,
+            expiry_slot: 900,
+        };
+
+        let mut eval_bytes = make_finalized_eval_bytes(receipt.commitment());
+        eval_bytes[0] = 0; // corrupt discriminator
+
+        assert_eq!(
+            validate_bridged_receipt_claim(&eval_bytes, &receipt),
+            Err(TransitionError::BridgedReceiptMismatch)
+        );
+    }
+
+    #[test]
+    fn validate_bridged_receipt_claim_rejects_truncated_data() {
+        use vaulkyrie_protocol::{PolicyReceipt, ThresholdRequirement};
+
+        let receipt = PolicyReceipt {
+            action_hash: [3; 32],
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 1,
+            expiry_slot: 900,
+        };
+
+        let eval_bytes = [0u8; 100]; // too short
+
+        assert_eq!(
+            validate_bridged_receipt_claim(&eval_bytes, &receipt),
+            Err(TransitionError::BridgedReceiptMismatch)
+        );
     }
 }

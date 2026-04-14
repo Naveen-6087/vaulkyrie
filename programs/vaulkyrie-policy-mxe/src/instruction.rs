@@ -22,12 +22,22 @@ pub struct AbortPolicyEvaluationArgs {
     pub reason_code: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueArciumComputationArgs {
+    /// Commitment binding this computation to the originating evaluation request.
+    pub request_commitment: [u8; 32],
+    /// Arcium computation offset used to correlate the MXE callback.
+    pub computation_offset: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyMxeInstruction {
     InitPolicyConfig(InitPolicyConfigArgs),
     OpenPolicyEvaluation(OpenPolicyEvaluationArgs),
     FinalizePolicyEvaluation(PolicyDecisionEnvelope),
     AbortPolicyEvaluation(AbortPolicyEvaluationArgs),
+    /// Queue an Arcium MXE computation for a `Pending` evaluation.
+    QueueArciumComputation(QueueArciumComputationArgs),
 }
 
 impl TryFrom<&[u8]> for PolicyMxeInstruction {
@@ -45,6 +55,9 @@ impl TryFrom<&[u8]> for PolicyMxeInstruction {
             [3, rest @ ..] => Ok(Self::AbortPolicyEvaluation(parse_abort_policy_evaluation(
                 rest,
             )?)),
+            [4, rest @ ..] => Ok(Self::QueueArciumComputation(
+                parse_queue_arcium_computation(rest)?,
+            )),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -107,6 +120,26 @@ fn parse_abort_policy_evaluation(data: &[u8]) -> Result<AbortPolicyEvaluationArg
     Ok(AbortPolicyEvaluationArgs {
         request_commitment,
         reason_code: u16::from_le_bytes(reason_code),
+    })
+}
+
+fn parse_queue_arcium_computation(
+    data: &[u8],
+) -> Result<QueueArciumComputationArgs, ProgramError> {
+    // 32 bytes request_commitment + 8 bytes computation_offset.
+    if data.len() != 40 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut request_commitment = [0; 32];
+    request_commitment.copy_from_slice(&data[..32]);
+
+    let mut computation_offset = [0; 8];
+    computation_offset.copy_from_slice(&data[32..40]);
+
+    Ok(QueueArciumComputationArgs {
+        request_commitment,
+        computation_offset: u64::from_le_bytes(computation_offset),
     })
 }
 
@@ -226,6 +259,33 @@ mod tests {
     fn rejects_unknown_instruction() {
         assert_eq!(
             PolicyMxeInstruction::try_from(&[9][..]),
+            Err(ProgramError::InvalidInstructionData)
+        );
+    }
+
+    #[test]
+    fn parses_queue_arcium_computation_instruction() {
+        let mut data = vec![4];
+        data.extend_from_slice(&[11; 32]); // request_commitment
+        data.extend_from_slice(&42u64.to_le_bytes()); // computation_offset
+
+        use super::QueueArciumComputationArgs;
+        assert_eq!(
+            PolicyMxeInstruction::try_from(data.as_slice()),
+            Ok(PolicyMxeInstruction::QueueArciumComputation(
+                QueueArciumComputationArgs {
+                    request_commitment: [11; 32],
+                    computation_offset: 42,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_queue_arcium_computation_with_wrong_length() {
+        let data = vec![4u8; 30]; // too short
+        assert_eq!(
+            PolicyMxeInstruction::try_from(data.as_slice()),
             Err(ProgramError::InvalidInstructionData)
         );
     }
