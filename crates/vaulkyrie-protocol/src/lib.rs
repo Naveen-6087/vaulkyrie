@@ -78,6 +78,16 @@ pub const AUTHORITY_PROOF_CHUNK_MAX_BYTES: usize = 256;
 pub const QUANTUM_SPLIT_MESSAGE_BYTES: usize = 72;
 pub const QUANTUM_CLOSE_MESSAGE_BYTES: usize = 32;
 
+pub const VAULT_REGISTRY_SEED: &[u8] = b"vault_registry";
+pub const POLICY_RECEIPT_SEED: &[u8] = b"policy_receipt";
+pub const ACTION_SESSION_SEED: &[u8] = b"action_session";
+pub const QUANTUM_AUTHORITY_SEED: &[u8] = b"quantum_authority";
+pub const AUTHORITY_PROOF_SEED: &[u8] = b"authority_proof";
+pub const QUANTUM_VAULT_SEED: &[u8] = b"quantum_vault";
+pub const POLICY_CONFIG_SEED: &[u8] = b"policy_config";
+pub const POLICY_EVAL_SEED: &[u8] = b"policy_eval";
+pub const SPEND_ORCH_SEED: &[u8] = b"spend_orch";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyReceipt {
     pub action_hash: [u8; 32],
