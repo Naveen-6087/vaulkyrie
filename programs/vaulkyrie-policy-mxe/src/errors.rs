@@ -45,6 +45,9 @@ pub enum PolicyMxeError {
 
     #[msg("Account owner mismatch")]
     AccountOwnerMismatch,
+
+    #[msg("Arcium callback output verification failed")]
+    CallbackVerificationFailed,
 }
 
 impl From<TransitionError> for PolicyMxeError {

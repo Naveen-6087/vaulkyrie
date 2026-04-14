@@ -1,5 +1,11 @@
 use anchor_lang::prelude::*;
 
+// Arcium SDK re-exports: MXE account types, CPI helpers, and the program macro.
+use arcium_anchor::prelude::*;
+use arcium_anchor::traits::QueueCompAccs;
+use arcium_client::idl::arcium::cpi::accounts::QueueComputation;
+use arcium_client::idl::arcium::types::{CallbackAccount, CallbackInstruction};
+
 pub mod errors;
 pub mod state;
 pub mod transition;
@@ -7,7 +13,39 @@ pub mod transition;
 // Placeholder program ID — replace with actual deployed address.
 declare_id!("99gQafBBNAZitScYub5BnJcA7asqdRVndwvCj2Zt7m7L");
 
-#[program]
+/// Arcium computation definition offset for "policy_evaluate" circuit.
+/// Deterministic u32 derived from SHA-256("policy_evaluate")[0..4].
+pub const POLICY_EVALUATE_COMP_DEF_OFFSET: u32 =
+    arcium_anchor::comp_def_offset("policy_evaluate");
+
+/// Vaulkyrie policy evaluation output produced by the Arcium MXE circuit.
+///
+/// The callback instruction receives this struct inside
+/// `SignedComputationOutputs<PolicyEvaluateOutput>`. Fields match the Arcis
+/// circuit return type (see `crates/encrypted-ixs`).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct PolicyEvaluateOutput {
+    /// SHA-256 commitment over the policy receipt fields.
+    pub receipt_commitment: [u8; 32],
+    /// SHA-256 commitment over the full decision envelope.
+    pub decision_commitment: [u8; 32],
+    /// Earliest slot the action may execute (time-lock).
+    pub delay_until_slot: u64,
+    /// Machine-readable reason code (0 = approved without conditions).
+    pub reason_code: u16,
+    /// 1 = approved, 0 = denied.
+    pub approved: u8,
+}
+
+impl arcium_anchor::HasSize for PolicyEvaluateOutput {
+    const SIZE: usize = 75; // 32 + 32 + 8 + 2 + 1
+}
+
+// `#[arcium_program]` wraps Anchor's `#[program]` and generates:
+//   - `ArciumSignerAccount` struct (PDA signer, space=9)
+//   - `CallbackError` enum for callback validation errors
+//   - `validate_callback_ixs()` security function for callback instructions
+#[arcium_program]
 pub mod vaulkyrie_policy_mxe {
     use super::*;
 
@@ -88,12 +126,48 @@ pub mod vaulkyrie_policy_mxe {
         handlers::process_abort_policy_evaluation(ctx, reason_code)
     }
 
-    /// Queue an Arcium MXE computation for this evaluation.
+    /// Queue an Arcium MXE computation for this evaluation (local state transition).
     pub fn queue_arcium_computation(
         ctx: Context<QueueArciumComputation>,
         computation_offset: u64,
     ) -> Result<()> {
         handlers::process_queue_arcium_computation(ctx, computation_offset)
+    }
+
+    // ── Arcium CPI instructions ───────────────────────────────────────────
+
+    /// Queue the encrypted policy evaluation via Arcium MXE CPI.
+    ///
+    /// Sends encrypted policy inputs to the MXE cluster for private
+    /// evaluation and registers a callback that will finalize the
+    /// evaluation state when the computation completes.
+    pub fn queue_policy_evaluate(
+        ctx: Context<QueuePolicyEvaluate>,
+        computation_offset: u64,
+        encrypted_input: [u8; 32],
+        x25519_pubkey: [u8; 32],
+        nonce: u128,
+    ) -> Result<()> {
+        handlers::process_queue_policy_evaluate(
+            ctx,
+            computation_offset,
+            encrypted_input,
+            x25519_pubkey,
+            nonce,
+        )
+    }
+
+    /// Arcium callback: receives the MPC computation result.
+    ///
+    /// Called by the Arcium MXE program after the `policy_evaluate` circuit
+    /// completes. Validates the callback transaction structure, verifies
+    /// the computation output signature, and finalizes the evaluation state
+    /// with the receipt and decision commitments.
+    pub fn policy_evaluate_callback(
+        ctx: Context<PolicyEvaluateCallback>,
+        output: arcium_anchor::SignedComputationOutputs<PolicyEvaluateOutput>,
+    ) -> Result<()> {
+        handlers::process_policy_evaluate_callback(ctx, output)
     }
 }
 
@@ -143,6 +217,124 @@ pub struct QueueArciumComputation<'info> {
     pub evaluation: UncheckedAccount<'info>,
     pub authority: Signer<'info>,
     pub clock: Sysvar<'info, Clock>,
+}
+
+// ── Arcium CPI account structs (manual — no compiled circuit required) ────
+
+/// Accounts required to queue a policy evaluation computation via Arcium CPI.
+///
+/// Manually implements `QueueCompAccs` instead of using the
+/// `#[queue_computation_accounts]` macro, which requires a compiled circuit
+/// in `build/policy_evaluate.arcis`. The trait implementation is below.
+#[derive(Accounts)]
+pub struct QueuePolicyEvaluate<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// CHECK: Vaulkyrie evaluation state — validated in handler
+    #[account(mut)]
+    pub evaluation: UncheckedAccount<'info>,
+
+    /// Arcium MXE global state account.
+    pub mxe_account: Account<'info, MXEAccount>,
+
+    /// Program-owned PDA signer (seeds = [SIGN_PDA_SEED]).
+    #[account(mut)]
+    pub sign_pda_account: Account<'info, ArciumSignerAccount>,
+
+    /// CHECK: Arcium mempool account (writable, validated by Arcium CPI)
+    #[account(mut)]
+    pub mempool_account: UncheckedAccount<'info>,
+
+    /// CHECK: Arcium executing pool (writable, validated by Arcium CPI)
+    #[account(mut)]
+    pub executing_pool: UncheckedAccount<'info>,
+
+    /// CHECK: Arcium computation account (writable, validated by Arcium CPI)
+    #[account(mut)]
+    pub computation_account: UncheckedAccount<'info>,
+
+    /// Arcium computation definition account.
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+
+    /// Arcium cluster account.
+    #[account(mut)]
+    pub cluster_account: Account<'info, Cluster>,
+
+    /// Arcium fee pool account.
+    #[account(mut)]
+    pub pool_account: Account<'info, FeePool>,
+
+    pub clock_account: Sysvar<'info, Clock>,
+    pub system_program: Program<'info, System>,
+
+    /// Arcium MXE program.
+    pub arcium_program: Program<'info, Arcium>,
+}
+
+/// Manual `QueueCompAccs` implementation — equivalent to what
+/// `#[queue_computation_accounts("policy_evaluate", payer)]` would generate.
+impl<'info> QueueCompAccs<'info> for QueuePolicyEvaluate<'info> {
+    fn comp_def_offset(&self) -> u32 {
+        POLICY_EVALUATE_COMP_DEF_OFFSET
+    }
+
+    fn queue_comp_accs(&self) -> QueueComputation<'info> {
+        QueueComputation {
+            signer: self.payer.to_account_info(),
+            sign_seed: self.sign_pda_account.to_account_info(),
+            comp: self.computation_account.to_account_info(),
+            mxe: self.mxe_account.to_account_info(),
+            mempool: self.mempool_account.to_account_info(),
+            executing_pool: self.executing_pool.to_account_info(),
+            comp_def_acc: self.comp_def_account.to_account_info(),
+            cluster: self.cluster_account.to_account_info(),
+            pool_account: self.pool_account.to_account_info(),
+            system_program: self.system_program.to_account_info(),
+            clock: self.clock_account.to_account_info(),
+        }
+    }
+
+    fn arcium_program(&self) -> AccountInfo<'info> {
+        self.arcium_program.to_account_info()
+    }
+
+    fn mxe_program(&self) -> Pubkey {
+        crate::ID
+    }
+
+    fn signer_pda_bump(&self) -> u8 {
+        self.sign_pda_account.bump
+    }
+}
+
+/// Accounts for the Arcium callback after policy evaluation completes.
+///
+/// Manually defined instead of using `#[callback_accounts("policy_evaluate")]`
+/// which requires compiled circuit artifacts.
+#[derive(Accounts)]
+pub struct PolicyEvaluateCallback<'info> {
+    /// CHECK: Vaulkyrie evaluation state — validated in handler
+    #[account(mut)]
+    pub evaluation: UncheckedAccount<'info>,
+
+    /// Arcium MXE program.
+    pub arcium_program: Program<'info, Arcium>,
+
+    /// Arcium computation definition for `policy_evaluate`.
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+
+    /// Arcium MXE global state.
+    pub mxe_account: Account<'info, MXEAccount>,
+
+    /// CHECK: Arcium computation account (validated by output verification)
+    pub computation_account: UncheckedAccount<'info>,
+
+    /// Arcium cluster that executed the computation.
+    pub cluster_account: Account<'info, Cluster>,
+
+    /// CHECK: Instructions sysvar — used by `validate_callback_ixs`
+    pub instructions_sysvar: UncheckedAccount<'info>,
 }
 
 // ── Handlers (internal) ───────────────────────────────────────────────────
@@ -339,4 +531,183 @@ mod handlers {
         eval_state.encode(&mut eval_data);
         Ok(())
     }
+
+    // ── Arcium CPI handlers ──────────────────────────────────────────────
+
+    /// Queue the encrypted policy evaluation through the Arcium MXE.
+    ///
+    /// 1. Validates and transitions evaluation state to `ComputationQueued`
+    /// 2. Builds encrypted arguments via `ArgBuilder`
+    /// 3. Registers a callback instruction so the MXE calls
+    ///    `policy_evaluate_callback` when the computation finishes
+    /// 4. Calls `queue_computation` CPI into the Arcium program
+    pub fn process_queue_policy_evaluate(
+        ctx: Context<QueuePolicyEvaluate>,
+        computation_offset: u64,
+        encrypted_input: [u8; 32],
+        x25519_pubkey: [u8; 32],
+        nonce: u128,
+    ) -> Result<()> {
+        // Transition evaluation state to ComputationQueued.
+        let eval_info = &ctx.accounts.evaluation;
+        let current_slot = ctx.accounts.clock_account.slot;
+        {
+            let mut eval_data = eval_info.try_borrow_mut_data()?;
+            if eval_data.len() != PolicyEvaluationState::LEN {
+                return Err(PolicyMxeError::InvalidAccountSize.into());
+            }
+            let mut eval_state = PolicyEvaluationState::decode(&eval_data)
+                .ok_or(PolicyMxeError::NotInitialized)?;
+            if eval_state.discriminator != POLICY_EVAL_DISCRIMINATOR {
+                return Err(PolicyMxeError::NotInitialized.into());
+            }
+
+            transition::queue_arcium_computation(
+                &mut eval_state,
+                computation_offset,
+                current_slot,
+            )
+            .map_err(PolicyMxeError::from)?;
+
+            eval_state.encode(&mut eval_data);
+        }
+
+        // Build Arcium encrypted arguments:
+        //   arg0: x25519 public key (for shared encryption envelope)
+        //   arg1: nonce (128-bit plaintext)
+        //   arg2: encrypted policy input (32-byte ciphertext)
+        let args = ArgBuilder::new()
+            .x25519_pubkey(x25519_pubkey)
+            .plaintext_u128(nonce)
+            .encrypted_u8(encrypted_input)
+            .build();
+
+        // Build callback instruction so the MXE routes the result back to us.
+        // The callback needs our evaluation account as a writable extra account.
+        let callback_extra_accs = vec![CallbackAccount {
+            pubkey: eval_info.key(),
+            is_writable: true,
+        }];
+
+        let callback_ix = build_callback_instruction(
+            computation_offset,
+            &ctx.accounts.mxe_account,
+            &callback_extra_accs,
+        )?;
+
+        // CPI into Arcium to queue the computation.
+        arcium_anchor::queue_computation(
+            &*ctx.accounts,
+            computation_offset,
+            args,
+            vec![callback_ix],
+            1,  // single callback transaction
+            0,  // no priority fee
+        )?;
+
+        Ok(())
+    }
+
+    /// Process the MXE callback after the policy evaluation circuit completes.
+    ///
+    /// Validates the callback transaction structure (must follow Arcium's
+    /// `callback_computation` instruction), verifies the output signature
+    /// against the cluster, and finalizes the evaluation with the MPC result.
+    pub fn process_policy_evaluate_callback(
+        ctx: Context<PolicyEvaluateCallback>,
+        output: arcium_anchor::SignedComputationOutputs<PolicyEvaluateOutput>,
+    ) -> Result<()> {
+        // Security: ensure this instruction immediately follows Arcium's
+        // callback_computation instruction with no trailing instructions.
+        validate_callback_ixs(
+            &ctx.accounts.instructions_sysvar,
+            &ctx.accounts.arcium_program.key(),
+        )?;
+
+        // Verify the computation output against the cluster's signing key.
+        let verified_output = output
+            .verify_output(
+                &ctx.accounts.cluster_account,
+                &ctx.accounts.computation_account,
+            )
+            .map_err(|_| PolicyMxeError::InvalidInstructionData)?;
+
+        // Extract the MPC result and finalize evaluation state.
+        let eval_info = &ctx.accounts.evaluation;
+        let mut eval_data = eval_info.try_borrow_mut_data()?;
+        if eval_data.len() != PolicyEvaluationState::LEN {
+            return Err(PolicyMxeError::InvalidAccountSize.into());
+        }
+        let mut eval_state = PolicyEvaluationState::decode(&eval_data)
+            .ok_or(PolicyMxeError::NotInitialized)?;
+        if eval_state.discriminator != POLICY_EVAL_DISCRIMINATOR {
+            return Err(PolicyMxeError::NotInitialized.into());
+        }
+
+        // Write MPC-produced commitments into the evaluation state.
+        eval_state.receipt_commitment = verified_output.receipt_commitment;
+        eval_state.decision_commitment = verified_output.decision_commitment;
+        eval_state.delay_until_slot = verified_output.delay_until_slot;
+        eval_state.reason_code = verified_output.reason_code;
+
+        // Transition to Finalized (status byte = 2).
+        eval_state.status = 2;
+
+        eval_state.encode(&mut eval_data);
+        Ok(())
+    }
+}
+
+// ── Callback instruction builder ──────────────────────────────────────────
+
+/// Builds the `CallbackInstruction` metadata that tells the Arcium MXE
+/// how to route the computation result back to `policy_evaluate_callback`.
+///
+/// This is the manual equivalent of what `#[callback_accounts("policy_evaluate")]`
+/// would generate via the `CallbackCompAccs` trait.
+fn build_callback_instruction(
+    _computation_offset: u64,
+    _mxe_account: &MXEAccount,
+    extra_accs: &[CallbackAccount],
+) -> Result<CallbackInstruction> {
+    let mut accounts = Vec::with_capacity(extra_accs.len() + 6);
+
+    // Standard Arcium callback accounts (order matters).
+    accounts.push(CallbackAccount {
+        pubkey: ARCIUM_PROG_ID,
+        is_writable: false,
+    });
+    accounts.push(CallbackAccount {
+        pubkey: arcium_anchor::derive_comp_def_pda!(POLICY_EVALUATE_COMP_DEF_OFFSET),
+        is_writable: false,
+    });
+    accounts.push(CallbackAccount {
+        pubkey: arcium_anchor::derive_mxe_pda!(),
+        is_writable: false,
+    });
+    // Computation and cluster PDAs are resolved at runtime by the MXE cranker,
+    // but we pass placeholders since the macro-generated code does the same
+    // derivation. The Arcium runtime fills in the actual addresses.
+    accounts.push(CallbackAccount {
+        pubkey: Pubkey::default(),
+        is_writable: false,
+    });
+    accounts.push(CallbackAccount {
+        pubkey: Pubkey::default(),
+        is_writable: false,
+    });
+    // Instructions sysvar
+    accounts.push(CallbackAccount {
+        pubkey: anchor_lang::solana_program::sysvar::instructions::ID,
+        is_writable: false,
+    });
+
+    // Extra accounts (e.g., our evaluation state).
+    accounts.extend_from_slice(extra_accs);
+
+    Ok(CallbackInstruction {
+        program_id: crate::ID,
+        discriminator: crate::instruction::PolicyEvaluateCallback::DISCRIMINATOR.to_vec(),
+        accounts,
+    })
 }
