@@ -64,6 +64,10 @@ pub enum TransitionError {
     PolicyVersionNotMonotonic,
     /// Completing a spend orchestration requires a non-zero tx binding hash.
     TxBindingMissing,
+    /// The authority rotation statement has already been consumed (replay).
+    AuthorityStatementReplay,
+    /// The bridged receipt's delay period has not elapsed yet.
+    BridgedReceiptDelayNotMet,
 }
 
 pub fn initialize_vault(
@@ -152,6 +156,7 @@ pub fn validate_vault_for_receipt(
 pub fn validate_bridged_receipt_claim(
     eval_data: &[u8],
     receipt: &PolicyReceipt,
+    current_slot: u64,
 ) -> Result<(), TransitionError> {
     const POLEVAL1: &[u8; 8] = b"POLEVAL1";
     const FINALIZED: u8 = 2;
@@ -159,6 +164,7 @@ pub fn validate_bridged_receipt_claim(
     const DISCRIMINATOR_RANGE: core::ops::Range<usize> = 0..8;
     const STATUS_OFFSET: usize = 240;
     const RECEIPT_COMMITMENT_RANGE: core::ops::Range<usize> = 168..200;
+    const DELAY_UNTIL_SLOT_RANGE: core::ops::Range<usize> = 232..240;
 
     if eval_data.len() < MIN_LEN {
         return Err(TransitionError::BridgedReceiptMismatch);
@@ -174,6 +180,13 @@ pub fn validate_bridged_receipt_claim(
 
     if &eval_data[RECEIPT_COMMITMENT_RANGE] != &receipt.commitment() {
         return Err(TransitionError::BridgedReceiptMismatch);
+    }
+
+    let mut delay_bytes = [0u8; 8];
+    delay_bytes.copy_from_slice(&eval_data[DELAY_UNTIL_SLOT_RANGE]);
+    let delay_until_slot = u64::from_le_bytes(delay_bytes);
+    if delay_until_slot > 0 && current_slot < delay_until_slot {
+        return Err(TransitionError::BridgedReceiptDelayNotMet);
     }
 
     Ok(())
@@ -386,7 +399,12 @@ pub fn apply_authority_rotation(
         return Err(TransitionError::AuthorityTreeExhausted);
     }
 
-    state.last_consumed_digest = statement.digest();
+    let digest = statement.digest();
+    if state.last_consumed_digest != [0u8; 32] && state.last_consumed_digest == digest {
+        return Err(TransitionError::AuthorityStatementReplay);
+    }
+
+    state.last_consumed_digest = digest;
     state.current_authority_hash = statement.next_authority_hash;
     state.next_sequence += 1;
     state.next_leaf_index += 1;
@@ -1485,6 +1503,45 @@ mod tests {
     }
 
     #[test]
+    fn authority_rotation_rejects_replayed_statement_digest() {
+        let secret = sample_wots_secret(33);
+        let mut state = QuantumAuthorityState::new(secret.authority_hash(), [8; 32], 1);
+
+        // Craft a statement that will produce a known digest
+        let mut statement = vaulkyrie_protocol::AuthorityRotationStatement {
+            action_hash: [0; 32],
+            next_authority_hash: [4; 32],
+            sequence: 0,
+            expiry_slot: 100,
+        };
+        statement.action_hash = statement.expected_action_hash([1; 32], 9);
+
+        // First rotation succeeds
+        apply_authority_rotation(&mut state, &statement, 10)
+            .expect("first rotation should succeed");
+
+        // Now state.last_consumed_digest == statement.digest()
+        // Craft a second statement with different next_authority_hash (avoids NoOp)
+        // but force its digest to equal last_consumed_digest
+        let mut replay_stmt = vaulkyrie_protocol::AuthorityRotationStatement {
+            action_hash: [0; 32],
+            next_authority_hash: [5; 32], // different from current [4;32]
+            sequence: 1, // matches advanced next_sequence
+            expiry_slot: 100,
+        };
+        replay_stmt.action_hash = replay_stmt.expected_action_hash([1; 32], 9);
+
+        // Manually set last_consumed_digest to the new statement's digest
+        // to simulate a digest collision (defense-in-depth scenario)
+        state.last_consumed_digest = replay_stmt.digest();
+
+        let error = apply_authority_rotation(&mut state, &replay_stmt, 10)
+            .expect_err("replayed digest should fail");
+
+        assert_eq!(error, TransitionError::AuthorityStatementReplay);
+    }
+
+    #[test]
     fn rotate_vault_authority_updates_both_states() {
         let secret = sample_wots_secret(33);
         let auth_path = sample_auth_path(21);
@@ -1863,7 +1920,7 @@ mod tests {
         };
 
         let eval_bytes = make_finalized_eval_bytes(receipt.commitment());
-        assert!(validate_bridged_receipt_claim(&eval_bytes, &receipt).is_ok());
+        assert!(validate_bridged_receipt_claim(&eval_bytes, &receipt, 100).is_ok());
     }
 
     #[test]
@@ -1882,7 +1939,7 @@ mod tests {
         eval_bytes[240] = 1; // Pending, not Finalized
 
         assert_eq!(
-            validate_bridged_receipt_claim(&eval_bytes, &receipt),
+            validate_bridged_receipt_claim(&eval_bytes, &receipt, 100),
             Err(TransitionError::BridgedReceiptMismatch)
         );
     }
@@ -1902,7 +1959,7 @@ mod tests {
         let eval_bytes = make_finalized_eval_bytes([0xff; 32]); // different commitment
 
         assert_eq!(
-            validate_bridged_receipt_claim(&eval_bytes, &receipt),
+            validate_bridged_receipt_claim(&eval_bytes, &receipt, 100),
             Err(TransitionError::BridgedReceiptMismatch)
         );
     }
@@ -1923,7 +1980,7 @@ mod tests {
         eval_bytes[0] = 0; // corrupt discriminator
 
         assert_eq!(
-            validate_bridged_receipt_claim(&eval_bytes, &receipt),
+            validate_bridged_receipt_claim(&eval_bytes, &receipt, 100),
             Err(TransitionError::BridgedReceiptMismatch)
         );
     }
@@ -1943,9 +2000,38 @@ mod tests {
         let eval_bytes = [0u8; 100]; // too short
 
         assert_eq!(
-            validate_bridged_receipt_claim(&eval_bytes, &receipt),
+            validate_bridged_receipt_claim(&eval_bytes, &receipt, 100),
             Err(TransitionError::BridgedReceiptMismatch)
         );
+    }
+
+    #[test]
+    fn validate_bridged_receipt_claim_rejects_active_delay() {
+        use vaulkyrie_protocol::{PolicyReceipt, ThresholdRequirement};
+
+        let receipt = PolicyReceipt {
+            action_hash: [3; 32],
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 1,
+            expiry_slot: 900,
+        };
+
+        let mut eval_bytes = make_finalized_eval_bytes(receipt.commitment());
+        // Set delay_until_slot to 500 at bytes 232..240
+        eval_bytes[232..240].copy_from_slice(&500u64.to_le_bytes());
+
+        // current_slot < delay_until_slot => should fail
+        assert_eq!(
+            validate_bridged_receipt_claim(&eval_bytes, &receipt, 499),
+            Err(TransitionError::BridgedReceiptDelayNotMet)
+        );
+
+        // current_slot == delay_until_slot => should succeed
+        assert!(validate_bridged_receipt_claim(&eval_bytes, &receipt, 500).is_ok());
+
+        // current_slot > delay_until_slot => should succeed
+        assert!(validate_bridged_receipt_claim(&eval_bytes, &receipt, 600).is_ok());
     }
 
     // ── Recovery transition tests ───────────────────────────────────

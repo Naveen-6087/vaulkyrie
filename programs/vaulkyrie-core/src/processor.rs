@@ -548,7 +548,7 @@ pub fn process_stage_bridged_receipt_data(
     receipt: &PolicyReceipt,
     current_slot: u64,
 ) -> ProgramResult {
-    transition::validate_bridged_receipt_claim(policy_eval_src, receipt)
+    transition::validate_bridged_receipt_claim(policy_eval_src, receipt, current_slot)
         .map_err(map_transition_error)?;
     process_stage_receipt_data(vault_src, receipt_dst, receipt, current_slot)
 }
@@ -1129,6 +1129,8 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::AuthorityMigrationNoOp => ProgramError::InvalidArgument,
         transition::TransitionError::PolicyVersionNotMonotonic => ProgramError::InvalidArgument,
         transition::TransitionError::TxBindingMissing => ProgramError::InvalidInstructionData,
+        transition::TransitionError::AuthorityStatementReplay => ProgramError::InvalidArgument,
+        transition::TransitionError::BridgedReceiptDelayNotMet => ProgramError::InvalidArgument,
     }
 }
 

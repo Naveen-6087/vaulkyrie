@@ -84,6 +84,9 @@ impl VaultRegistry {
 
         let mut discriminator = [0; 8];
         discriminator.copy_from_slice(&src[..8]);
+        if discriminator != VAULT_REGISTRY_DISCRIMINATOR {
+            return None;
+        }
 
         let mut wallet_pubkey = [0; 32];
         wallet_pubkey.copy_from_slice(&src[8..40]);
@@ -168,6 +171,9 @@ impl PolicyReceiptState {
 
         let mut discriminator = [0; 8];
         discriminator.copy_from_slice(&src[..8]);
+        if discriminator != POLICY_RECEIPT_DISCRIMINATOR {
+            return None;
+        }
 
         let mut receipt_commitment = [0; 32];
         receipt_commitment.copy_from_slice(&src[8..40]);
@@ -255,6 +261,9 @@ impl ActionSessionState {
 
         let mut discriminator = [0; 8];
         discriminator.copy_from_slice(&src[..8]);
+        if discriminator != ACTION_SESSION_DISCRIMINATOR {
+            return None;
+        }
 
         let mut receipt_commitment = [0; 32];
         receipt_commitment.copy_from_slice(&src[8..40]);
@@ -341,6 +350,9 @@ impl QuantumAuthorityState {
 
         let mut discriminator = [0; 8];
         discriminator.copy_from_slice(&src[..8]);
+        if discriminator != QUANTUM_STATE_DISCRIMINATOR {
+            return None;
+        }
 
         let mut current_authority_hash = [0; 32];
         current_authority_hash.copy_from_slice(&src[8..40]);
@@ -424,6 +436,9 @@ impl AuthorityProofState {
 
         let mut discriminator = [0; 8];
         discriminator.copy_from_slice(&src[..8]);
+        if discriminator != AUTHORITY_PROOF_DISCRIMINATOR {
+            return None;
+        }
 
         let mut statement_digest = [0; 32];
         statement_digest.copy_from_slice(&src[8..40]);
@@ -550,6 +565,9 @@ impl SpendOrchestrationState {
 
         let mut discriminator = [0; 8];
         discriminator.copy_from_slice(&src[..8]);
+        if discriminator != SPEND_ORCH_DISCRIMINATOR {
+            return None;
+        }
 
         let mut action_hash = [0; 32];
         action_hash.copy_from_slice(&src[8..40]);
@@ -665,6 +683,9 @@ impl RecoveryState {
         }
         let mut discriminator = [0; 8];
         discriminator.copy_from_slice(&src[..8]);
+        if discriminator != RECOVERY_STATE_DISCRIMINATOR {
+            return None;
+        }
         let mut vault_pubkey = [0; 32];
         vault_pubkey.copy_from_slice(&src[8..40]);
         let mut recovery_commitment = [0; 32];
@@ -837,5 +858,86 @@ mod tests {
 
         assert!(state.encode(&mut bytes));
         assert_eq!(RecoveryState::decode(&bytes), Some(state));
+    }
+
+    #[test]
+    fn spend_orchestration_roundtrips_with_nonzero_tx_binding() {
+        let mut state = SpendOrchestrationState::new(
+            [1; 32], [2; 32], [3; 32], 999, 2, 3, 5,
+        );
+        state.signing_package_hash = [4; 32];
+        state.tx_binding = [0xAB; 32];
+        state.status = OrchestrationStatus::Complete as u8;
+        let mut bytes = [0; SpendOrchestrationState::LEN];
+
+        assert!(state.encode(&mut bytes));
+        let decoded = SpendOrchestrationState::decode(&bytes).unwrap();
+        assert_eq!(decoded.tx_binding, [0xAB; 32]);
+        assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn vault_registry_decode_rejects_wrong_discriminator() {
+        let state = VaultRegistry::new([1; 32], [2; 32], 7, VaultStatus::Active, 9);
+        let mut bytes = [0; VaultRegistry::LEN];
+        assert!(state.encode(&mut bytes));
+        bytes[0] = 0xFF; // corrupt discriminator
+        assert_eq!(VaultRegistry::decode(&bytes), None);
+    }
+
+    #[test]
+    fn policy_receipt_decode_rejects_wrong_discriminator() {
+        let state = PolicyReceiptState::new([3; 32], [4; 32], 5, 6);
+        let mut bytes = [0; PolicyReceiptState::LEN];
+        assert!(state.encode(&mut bytes));
+        bytes[0] = 0xFF;
+        assert_eq!(PolicyReceiptState::decode(&bytes), None);
+    }
+
+    #[test]
+    fn action_session_decode_rejects_wrong_discriminator() {
+        let state = ActionSessionState::new([6; 32], [7; 32], 77, 99, 2);
+        let mut bytes = [0; ActionSessionState::LEN];
+        assert!(state.encode(&mut bytes));
+        bytes[0] = 0xFF;
+        assert_eq!(ActionSessionState::decode(&bytes), None);
+    }
+
+    #[test]
+    fn quantum_authority_decode_rejects_wrong_discriminator() {
+        let state = QuantumAuthorityState::new([5; 32], [6; 32], 1);
+        let mut bytes = [0; QuantumAuthorityState::LEN];
+        assert!(state.encode(&mut bytes));
+        bytes[0] = 0xFF;
+        assert_eq!(QuantumAuthorityState::decode(&bytes), None);
+    }
+
+    #[test]
+    fn authority_proof_decode_rejects_wrong_discriminator() {
+        let state = AuthorityProofState::new([7; 32], [8; 32]);
+        let mut bytes = [0; AuthorityProofState::LEN];
+        assert!(state.encode(&mut bytes));
+        bytes[0] = 0xFF;
+        assert_eq!(AuthorityProofState::decode(&bytes), None);
+    }
+
+    #[test]
+    fn spend_orchestration_decode_rejects_wrong_discriminator() {
+        let state = SpendOrchestrationState::new(
+            [1; 32], [2; 32], [3; 32], 500, 2, 3, 7,
+        );
+        let mut bytes = [0; SpendOrchestrationState::LEN];
+        assert!(state.encode(&mut bytes));
+        bytes[0] = 0xFF;
+        assert_eq!(SpendOrchestrationState::decode(&bytes), None);
+    }
+
+    #[test]
+    fn recovery_state_decode_rejects_wrong_discriminator() {
+        let state = RecoveryState::new([1; 32], [2; 32], 5000, 2, 3, 7);
+        let mut bytes = [0; RecoveryState::LEN];
+        assert!(state.encode(&mut bytes));
+        bytes[0] = 0xFF;
+        assert_eq!(RecoveryState::decode(&bytes), None);
     }
 }
