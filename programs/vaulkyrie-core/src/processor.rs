@@ -12,13 +12,15 @@ use vaulkyrie_protocol::{AuthorityRotationStatement, PolicyReceipt, WotsAuthProo
 
 use crate::{
     instruction::{
-        CoreInstruction, InitAuthorityArgs, InitAuthorityProofArgs, InitQuantumVaultArgs,
-        InitVaultArgs, WriteAuthorityProofChunkArgs,
+        CommitSpendOrchestrationArgs, CompleteSpendOrchestrationArgs, CoreInstruction,
+        FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs, InitQuantumVaultArgs,
+        InitSpendOrchestrationArgs, InitVaultArgs, WriteAuthorityProofChunkArgs,
     },
     state::{
         ActionSessionState, AuthorityProofState, PolicyReceiptState, QuantumAuthorityState,
-        VaultRegistry, ACTION_SESSION_DISCRIMINATOR, AUTHORITY_PROOF_DISCRIMINATOR,
-        POLICY_RECEIPT_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
+        SpendOrchestrationState, VaultRegistry, ACTION_SESSION_DISCRIMINATOR,
+        AUTHORITY_PROOF_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR,
+        SPEND_ORCH_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
     },
     transition,
 };
@@ -374,6 +376,81 @@ pub fn process(
             }
 
             vault_account.close()
+        }
+        CoreInstruction::InitSpendOrchestration(args) => {
+            let current_slot = current_slot()?;
+            let orch_account = get_account_info!(accounts, 0);
+            require_writable(orch_account)?;
+            require_program_owner(program_id, orch_account)?;
+
+            let vault_account = get_account_info!(accounts, 1);
+            require_program_owner(program_id, vault_account)?;
+
+            let wallet_signer = get_account_info!(accounts, 2);
+            {
+                let vault_data = vault_account.try_borrow_data()?;
+                let vault = decode_vault_state(&vault_data)?;
+                require_wallet_authority(&vault, wallet_signer)?;
+            }
+
+            let mut orch_data = orch_account.try_borrow_mut_data()?;
+            process_init_spend_orchestration_data(&mut orch_data, args, current_slot)
+        }
+        CoreInstruction::CommitSpendOrchestration(args) => {
+            let current_slot = current_slot()?;
+            let orch_account = get_account_info!(accounts, 0);
+            require_writable(orch_account)?;
+            require_program_owner(program_id, orch_account)?;
+
+            let vault_account = get_account_info!(accounts, 1);
+            require_program_owner(program_id, vault_account)?;
+
+            let wallet_signer = get_account_info!(accounts, 2);
+            {
+                let vault_data = vault_account.try_borrow_data()?;
+                let vault = decode_vault_state(&vault_data)?;
+                require_wallet_authority(&vault, wallet_signer)?;
+            }
+
+            let mut orch_data = orch_account.try_borrow_mut_data()?;
+            process_commit_spend_orchestration_data(&mut orch_data, args, current_slot)
+        }
+        CoreInstruction::CompleteSpendOrchestration(args) => {
+            let current_slot = current_slot()?;
+            let orch_account = get_account_info!(accounts, 0);
+            require_writable(orch_account)?;
+            require_program_owner(program_id, orch_account)?;
+
+            let vault_account = get_account_info!(accounts, 1);
+            require_program_owner(program_id, vault_account)?;
+
+            let wallet_signer = get_account_info!(accounts, 2);
+            {
+                let vault_data = vault_account.try_borrow_data()?;
+                let vault = decode_vault_state(&vault_data)?;
+                require_wallet_authority(&vault, wallet_signer)?;
+            }
+
+            let mut orch_data = orch_account.try_borrow_mut_data()?;
+            process_complete_spend_orchestration_data(&mut orch_data, args, current_slot)
+        }
+        CoreInstruction::FailSpendOrchestration(args) => {
+            let orch_account = get_account_info!(accounts, 0);
+            require_writable(orch_account)?;
+            require_program_owner(program_id, orch_account)?;
+
+            let vault_account = get_account_info!(accounts, 1);
+            require_program_owner(program_id, vault_account)?;
+
+            let wallet_signer = get_account_info!(accounts, 2);
+            {
+                let vault_data = vault_account.try_borrow_data()?;
+                let vault = decode_vault_state(&vault_data)?;
+                require_wallet_authority(&vault, wallet_signer)?;
+            }
+
+            let mut orch_data = orch_account.try_borrow_mut_data()?;
+            process_fail_spend_orchestration_data(&mut orch_data, args)
         }
     }
 }
@@ -930,7 +1007,101 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::QuantumVaultPdaMismatch => {
             ProgramError::MissingRequiredSignature
         }
+        transition::TransitionError::OrchestrationExpired => ProgramError::InvalidArgument,
+        transition::TransitionError::OrchestrationInvalidParams => {
+            ProgramError::InvalidInstructionData
+        }
+        transition::TransitionError::OrchestrationActionMismatch => ProgramError::InvalidArgument,
+        transition::TransitionError::OrchestrationNotPending => {
+            ProgramError::AccountAlreadyInitialized
+        }
+        transition::TransitionError::OrchestrationNotCommitted => ProgramError::InvalidAccountData,
+        transition::TransitionError::OrchestrationAlreadyComplete => {
+            ProgramError::AccountAlreadyInitialized
+        }
     }
+}
+
+pub fn process_init_spend_orchestration_data(
+    data: &mut [u8],
+    args: InitSpendOrchestrationArgs,
+    current_slot: u64,
+) -> ProgramResult {
+    if !is_zeroed(data) {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+    if data.len() < SpendOrchestrationState::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let state = transition::init_spend_orchestration(
+        args.action_hash,
+        args.session_commitment,
+        args.signers_commitment,
+        args.signing_package_hash,
+        args.expiry_slot,
+        args.threshold,
+        args.participant_count,
+        args.bump,
+        current_slot,
+    )
+    .map_err(map_transition_error)?;
+    state.encode(&mut data[..SpendOrchestrationState::LEN]);
+    Ok(())
+}
+
+pub fn process_commit_spend_orchestration_data(
+    data: &mut [u8],
+    args: CommitSpendOrchestrationArgs,
+    current_slot: u64,
+) -> ProgramResult {
+    if data.len() < SpendOrchestrationState::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut state = SpendOrchestrationState::decode(&data[..SpendOrchestrationState::LEN])
+        .ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&state.discriminator, &SPEND_ORCH_DISCRIMINATOR)?;
+    transition::commit_spend_orchestration(
+        &mut state,
+        args.action_hash,
+        args.signing_package_hash,
+        current_slot,
+    )
+    .map_err(map_transition_error)?;
+    state.encode(&mut data[..SpendOrchestrationState::LEN]);
+    Ok(())
+}
+
+pub fn process_complete_spend_orchestration_data(
+    data: &mut [u8],
+    args: CompleteSpendOrchestrationArgs,
+    current_slot: u64,
+) -> ProgramResult {
+    if data.len() < SpendOrchestrationState::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut state = SpendOrchestrationState::decode(&data[..SpendOrchestrationState::LEN])
+        .ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&state.discriminator, &SPEND_ORCH_DISCRIMINATOR)?;
+    transition::complete_spend_orchestration(&mut state, args.action_hash, current_slot)
+        .map_err(map_transition_error)?;
+    state.encode(&mut data[..SpendOrchestrationState::LEN]);
+    Ok(())
+}
+
+pub fn process_fail_spend_orchestration_data(
+    data: &mut [u8],
+    args: FailSpendOrchestrationArgs,
+) -> ProgramResult {
+    if data.len() < SpendOrchestrationState::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut state = SpendOrchestrationState::decode(&data[..SpendOrchestrationState::LEN])
+        .ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&state.discriminator, &SPEND_ORCH_DISCRIMINATOR)?;
+    transition::fail_spend_orchestration(&mut state, args.action_hash)
+        .map_err(map_transition_error)?;
+    state.encode(&mut data[..SpendOrchestrationState::LEN]);
+    Ok(())
 }
 
 #[cfg(test)]

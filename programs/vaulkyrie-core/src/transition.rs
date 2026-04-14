@@ -6,8 +6,8 @@ use vaulkyrie_protocol::{
 };
 
 use crate::state::{
-    ActionSessionState, PolicyReceiptState, QuantumAuthorityState, SessionStatus, VaultRegistry,
-    VaultStatus,
+    ActionSessionState, OrchestrationStatus, PolicyReceiptState, QuantumAuthorityState,
+    SessionStatus, SpendOrchestrationState, VaultRegistry, VaultStatus,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +40,12 @@ pub enum TransitionError {
     QuantumVaultAmountTooLarge,
     QuantumVaultSignatureInvalid,
     QuantumVaultPdaMismatch,
+    OrchestrationExpired,
+    OrchestrationInvalidParams,
+    OrchestrationActionMismatch,
+    OrchestrationNotPending,
+    OrchestrationNotCommitted,
+    OrchestrationAlreadyComplete,
 }
 
 pub fn initialize_vault(
@@ -463,6 +469,96 @@ fn validate_spend_threshold(threshold: u8) -> Result<(), TransitionError> {
         return Err(TransitionError::SessionRequiresPqc);
     }
 
+    Ok(())
+}
+
+/// Initialize a new spend orchestration account in `Pending` status.
+pub fn init_spend_orchestration(
+    action_hash: [u8; 32],
+    session_commitment: [u8; 32],
+    signers_commitment: [u8; 32],
+    signing_package_hash: [u8; 32],
+    expiry_slot: u64,
+    threshold: u8,
+    participant_count: u8,
+    bump: u8,
+    current_slot: u64,
+) -> Result<SpendOrchestrationState, TransitionError> {
+    if expiry_slot <= current_slot {
+        return Err(TransitionError::OrchestrationExpired);
+    }
+    if threshold == 0 || participant_count == 0 || threshold > participant_count {
+        return Err(TransitionError::OrchestrationInvalidParams);
+    }
+
+    let mut state = SpendOrchestrationState::new(
+        action_hash,
+        session_commitment,
+        signers_commitment,
+        expiry_slot,
+        threshold,
+        participant_count,
+        bump,
+    );
+    state.signing_package_hash = signing_package_hash;
+    Ok(state)
+}
+
+/// Record the signing package hash and advance status to `Committed`.
+pub fn commit_spend_orchestration(
+    state: &mut SpendOrchestrationState,
+    action_hash: [u8; 32],
+    signing_package_hash: [u8; 32],
+    current_slot: u64,
+) -> Result<(), TransitionError> {
+    if state.expiry_slot <= current_slot {
+        return Err(TransitionError::OrchestrationExpired);
+    }
+    if state.status != OrchestrationStatus::Pending as u8 {
+        return Err(TransitionError::OrchestrationNotPending);
+    }
+    if state.action_hash != action_hash {
+        return Err(TransitionError::OrchestrationActionMismatch);
+    }
+
+    state.signing_package_hash = signing_package_hash;
+    state.status = OrchestrationStatus::Committed as u8;
+    Ok(())
+}
+
+/// Mark the orchestration as `Complete` once the signature has been broadcast on-chain.
+pub fn complete_spend_orchestration(
+    state: &mut SpendOrchestrationState,
+    action_hash: [u8; 32],
+    current_slot: u64,
+) -> Result<(), TransitionError> {
+    if state.expiry_slot <= current_slot {
+        return Err(TransitionError::OrchestrationExpired);
+    }
+    if state.status != OrchestrationStatus::Committed as u8 {
+        return Err(TransitionError::OrchestrationNotCommitted);
+    }
+    if state.action_hash != action_hash {
+        return Err(TransitionError::OrchestrationActionMismatch);
+    }
+
+    state.status = OrchestrationStatus::Complete as u8;
+    Ok(())
+}
+
+/// Mark the orchestration as `Failed` with an optional reason code.
+pub fn fail_spend_orchestration(
+    state: &mut SpendOrchestrationState,
+    action_hash: [u8; 32],
+) -> Result<(), TransitionError> {
+    if state.status == OrchestrationStatus::Complete as u8 {
+        return Err(TransitionError::OrchestrationAlreadyComplete);
+    }
+    if state.action_hash != action_hash {
+        return Err(TransitionError::OrchestrationActionMismatch);
+    }
+
+    state.status = OrchestrationStatus::Failed as u8;
     Ok(())
 }
 
@@ -1489,5 +1585,119 @@ mod tests {
             .expect_err("vault/session policy mismatch should fail");
 
         assert_eq!(error, TransitionError::SessionPolicyMismatch);
+    }
+
+    #[test]
+    fn init_spend_orchestration_creates_pending_state() {
+        use super::{init_spend_orchestration, OrchestrationStatus};
+        let state = init_spend_orchestration(
+            [1; 32], [2; 32], [3; 32], [4; 32], 1000, 2, 3, 7, 500,
+        )
+        .expect("valid params should succeed");
+
+        assert_eq!(state.action_hash, [1; 32]);
+        assert_eq!(state.status, OrchestrationStatus::Pending as u8);
+        assert_eq!(state.threshold, 2);
+        assert_eq!(state.participant_count, 3);
+        assert_eq!(state.signing_package_hash, [4; 32]);
+    }
+
+    #[test]
+    fn init_spend_orchestration_rejects_expired_slot() {
+        use super::init_spend_orchestration;
+        let error = init_spend_orchestration(
+            [1; 32], [2; 32], [3; 32], [4; 32], 500, 2, 3, 7, 500,
+        )
+        .expect_err("expiry <= current_slot should fail");
+
+        assert_eq!(error, TransitionError::OrchestrationExpired);
+    }
+
+    #[test]
+    fn init_spend_orchestration_rejects_invalid_threshold() {
+        use super::init_spend_orchestration;
+        let error = init_spend_orchestration(
+            [1; 32], [2; 32], [3; 32], [4; 32], 1000, 5, 3, 7, 500,
+        )
+        .expect_err("threshold > participant_count should fail");
+
+        assert_eq!(error, TransitionError::OrchestrationInvalidParams);
+    }
+
+    #[test]
+    fn commit_spend_orchestration_advances_to_committed() {
+        use super::{commit_spend_orchestration, init_spend_orchestration, OrchestrationStatus};
+        let mut state = init_spend_orchestration(
+            [1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500,
+        )
+        .unwrap();
+
+        commit_spend_orchestration(&mut state, [1; 32], [5; 32], 600).expect("should commit");
+
+        assert_eq!(state.status, OrchestrationStatus::Committed as u8);
+        assert_eq!(state.signing_package_hash, [5; 32]);
+    }
+
+    #[test]
+    fn commit_spend_orchestration_rejects_wrong_action_hash() {
+        use super::{commit_spend_orchestration, init_spend_orchestration};
+        let mut state = init_spend_orchestration(
+            [1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500,
+        )
+        .unwrap();
+
+        let error = commit_spend_orchestration(&mut state, [9; 32], [5; 32], 600)
+            .expect_err("wrong action hash should fail");
+
+        assert_eq!(error, TransitionError::OrchestrationActionMismatch);
+    }
+
+    #[test]
+    fn complete_spend_orchestration_marks_complete() {
+        use super::{
+            commit_spend_orchestration, complete_spend_orchestration, init_spend_orchestration,
+            OrchestrationStatus,
+        };
+        let mut state = init_spend_orchestration(
+            [1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500,
+        )
+        .unwrap();
+        commit_spend_orchestration(&mut state, [1; 32], [5; 32], 600).unwrap();
+
+        complete_spend_orchestration(&mut state, [1; 32], 700).expect("should complete");
+
+        assert_eq!(state.status, OrchestrationStatus::Complete as u8);
+    }
+
+    #[test]
+    fn fail_spend_orchestration_marks_failed() {
+        use super::{fail_spend_orchestration, init_spend_orchestration, OrchestrationStatus};
+        let mut state = init_spend_orchestration(
+            [1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500,
+        )
+        .unwrap();
+
+        fail_spend_orchestration(&mut state, [1; 32]).expect("should fail orchestration");
+
+        assert_eq!(state.status, OrchestrationStatus::Failed as u8);
+    }
+
+    #[test]
+    fn fail_spend_orchestration_rejects_already_complete() {
+        use super::{
+            commit_spend_orchestration, complete_spend_orchestration, fail_spend_orchestration,
+            init_spend_orchestration,
+        };
+        let mut state = init_spend_orchestration(
+            [1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500,
+        )
+        .unwrap();
+        commit_spend_orchestration(&mut state, [1; 32], [5; 32], 600).unwrap();
+        complete_spend_orchestration(&mut state, [1; 32], 700).unwrap();
+
+        let error = fail_spend_orchestration(&mut state, [1; 32])
+            .expect_err("complete orchestration cannot be failed");
+
+        assert_eq!(error, TransitionError::OrchestrationAlreadyComplete);
     }
 }

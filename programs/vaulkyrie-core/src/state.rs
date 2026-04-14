@@ -6,6 +6,7 @@ pub const POLICY_RECEIPT_DISCRIMINATOR: [u8; 8] = *b"POLRCPT1";
 pub const ACTION_SESSION_DISCRIMINATOR: [u8; 8] = *b"SESSION1";
 pub const QUANTUM_STATE_DISCRIMINATOR: [u8; 8] = *b"QSTATE01";
 pub const AUTHORITY_PROOF_DISCRIMINATOR: [u8; 8] = *b"AUTHPRF1";
+pub const SPEND_ORCH_DISCRIMINATOR: [u8; 8] = *b"SPNDORC1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -450,13 +451,143 @@ impl AuthorityProofState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OrchestrationStatus {
+    Pending = 1,
+    Committed = 2,
+    Complete = 3,
+    Failed = 4,
+}
+
+/// Coordination state for an offchain FROST threshold signing ceremony.
+///
+/// Layout (152 bytes):
+/// ```text
+/// [0..8]   discriminator  "SPNDORC1"
+/// [8..40]  action_hash
+/// [40..72] session_commitment
+/// [72..104] signers_commitment
+/// [104..136] signing_package_hash
+/// [136..144] expiry_slot       (u64 LE)
+/// [144]    threshold
+/// [145]    participant_count
+/// [146]    status
+/// [147]    bump
+/// [148..152] reserved
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct SpendOrchestrationState {
+    pub discriminator: [u8; 8],
+    pub action_hash: [u8; 32],
+    pub session_commitment: [u8; 32],
+    pub signers_commitment: [u8; 32],
+    pub signing_package_hash: [u8; 32],
+    pub expiry_slot: u64,
+    pub threshold: u8,
+    pub participant_count: u8,
+    pub status: u8,
+    pub bump: u8,
+    pub reserved: [u8; 4],
+}
+
+impl SpendOrchestrationState {
+    pub const LEN: usize = size_of::<Self>();
+
+    pub const fn new(
+        action_hash: [u8; 32],
+        session_commitment: [u8; 32],
+        signers_commitment: [u8; 32],
+        expiry_slot: u64,
+        threshold: u8,
+        participant_count: u8,
+        bump: u8,
+    ) -> Self {
+        Self {
+            discriminator: SPEND_ORCH_DISCRIMINATOR,
+            action_hash,
+            session_commitment,
+            signers_commitment,
+            signing_package_hash: [0; 32],
+            expiry_slot,
+            threshold,
+            participant_count,
+            status: OrchestrationStatus::Pending as u8,
+            bump,
+            reserved: [0; 4],
+        }
+    }
+
+    pub fn encode(self, dst: &mut [u8]) -> bool {
+        if dst.len() != Self::LEN {
+            return false;
+        }
+
+        dst[..8].copy_from_slice(&self.discriminator);
+        dst[8..40].copy_from_slice(&self.action_hash);
+        dst[40..72].copy_from_slice(&self.session_commitment);
+        dst[72..104].copy_from_slice(&self.signers_commitment);
+        dst[104..136].copy_from_slice(&self.signing_package_hash);
+        dst[136..144].copy_from_slice(&self.expiry_slot.to_le_bytes());
+        dst[144] = self.threshold;
+        dst[145] = self.participant_count;
+        dst[146] = self.status;
+        dst[147] = self.bump;
+        dst[148..152].copy_from_slice(&self.reserved);
+
+        true
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::LEN {
+            return None;
+        }
+
+        let mut discriminator = [0; 8];
+        discriminator.copy_from_slice(&src[..8]);
+
+        let mut action_hash = [0; 32];
+        action_hash.copy_from_slice(&src[8..40]);
+
+        let mut session_commitment = [0; 32];
+        session_commitment.copy_from_slice(&src[40..72]);
+
+        let mut signers_commitment = [0; 32];
+        signers_commitment.copy_from_slice(&src[72..104]);
+
+        let mut signing_package_hash = [0; 32];
+        signing_package_hash.copy_from_slice(&src[104..136]);
+
+        let mut expiry_slot = [0; 8];
+        expiry_slot.copy_from_slice(&src[136..144]);
+
+        let mut reserved = [0; 4];
+        reserved.copy_from_slice(&src[148..152]);
+
+        Some(Self {
+            discriminator,
+            action_hash,
+            session_commitment,
+            signers_commitment,
+            signing_package_hash,
+            expiry_slot: u64::from_le_bytes(expiry_slot),
+            threshold: src[144],
+            participant_count: src[145],
+            status: src[146],
+            bump: src[147],
+            reserved,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionSessionState, AuthorityProofState, PolicyReceiptState, QuantumAuthorityState,
-        SessionStatus, VaultRegistry, VaultStatus, ACTION_SESSION_DISCRIMINATOR,
-        AUTHORITY_PROOF_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR,
-        VAULT_REGISTRY_DISCRIMINATOR,
+        ActionSessionState, AuthorityProofState, OrchestrationStatus, PolicyReceiptState,
+        QuantumAuthorityState, SessionStatus, SpendOrchestrationState, VaultRegistry, VaultStatus,
+        ACTION_SESSION_DISCRIMINATOR, AUTHORITY_PROOF_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR,
+        QUANTUM_STATE_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
     };
     use vaulkyrie_protocol::WotsAuthProof;
 
@@ -544,5 +675,30 @@ mod tests {
             AuthorityProofState::LEN,
             AuthorityProofState::HEADER_LEN + WotsAuthProof::ENCODED_LEN
         );
+    }
+
+    #[test]
+    fn spend_orchestration_state_layout_is_stable() {
+        let state = SpendOrchestrationState::new(
+            [1; 32], [2; 32], [3; 32], 500, 2, 3, 7,
+        );
+
+        assert_eq!(state.discriminator, SPEND_ORCH_DISCRIMINATOR);
+        assert_eq!(SpendOrchestrationState::LEN, 152);
+        assert_eq!(state.status, OrchestrationStatus::Pending as u8);
+        assert_eq!(state.signing_package_hash, [0; 32]);
+    }
+
+    #[test]
+    fn spend_orchestration_state_roundtrips_through_bytes() {
+        let mut state = SpendOrchestrationState::new(
+            [1; 32], [2; 32], [3; 32], 999, 2, 3, 5,
+        );
+        state.signing_package_hash = [4; 32];
+        state.status = OrchestrationStatus::Committed as u8;
+        let mut bytes = [0; SpendOrchestrationState::LEN];
+
+        assert!(state.encode(&mut bytes));
+        assert_eq!(SpendOrchestrationState::decode(&bytes), Some(state));
     }
 }

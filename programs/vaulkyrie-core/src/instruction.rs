@@ -53,6 +53,35 @@ impl CloseQuantumVaultArgs {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitSpendOrchestrationArgs {
+    pub action_hash: [u8; 32],
+    pub session_commitment: [u8; 32],
+    pub signers_commitment: [u8; 32],
+    pub signing_package_hash: [u8; 32],
+    pub expiry_slot: u64,
+    pub threshold: u8,
+    pub participant_count: u8,
+    pub bump: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitSpendOrchestrationArgs {
+    pub action_hash: [u8; 32],
+    pub signing_package_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompleteSpendOrchestrationArgs {
+    pub action_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailSpendOrchestrationArgs {
+    pub action_hash: [u8; 32],
+    pub reason_code: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotateAuthorityArgs {
     pub statement: AuthorityRotationStatement,
@@ -97,6 +126,10 @@ pub enum CoreInstruction {
     RotateAuthorityStaged(AuthorityRotationStatement),
     SplitQuantumVault(SplitQuantumVaultArgs),
     CloseQuantumVault(CloseQuantumVaultArgs),
+    InitSpendOrchestration(InitSpendOrchestrationArgs),
+    CommitSpendOrchestration(CommitSpendOrchestrationArgs),
+    CompleteSpendOrchestration(CompleteSpendOrchestrationArgs),
+    FailSpendOrchestration(FailSpendOrchestrationArgs),
 }
 
 impl TryFrom<&[u8]> for CoreInstruction {
@@ -125,6 +158,18 @@ impl TryFrom<&[u8]> for CoreInstruction {
             )),
             [15, rest @ ..] => Ok(Self::SplitQuantumVault(parse_split_quantum_vault(rest)?)),
             [16, rest @ ..] => Ok(Self::CloseQuantumVault(parse_close_quantum_vault(rest)?)),
+            [17, rest @ ..] => Ok(Self::InitSpendOrchestration(
+                parse_init_spend_orchestration(rest)?,
+            )),
+            [18, rest @ ..] => Ok(Self::CommitSpendOrchestration(
+                parse_commit_spend_orchestration(rest)?,
+            )),
+            [19, rest @ ..] => Ok(Self::CompleteSpendOrchestration(
+                parse_complete_spend_orchestration(rest)?,
+            )),
+            [20, rest @ ..] => Ok(Self::FailSpendOrchestration(
+                parse_fail_spend_orchestration(rest)?,
+            )),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -350,12 +395,99 @@ fn parse_close_quantum_vault(data: &[u8]) -> Result<CloseQuantumVaultArgs, Progr
     })
 }
 
+fn parse_init_spend_orchestration(
+    data: &[u8],
+) -> Result<InitSpendOrchestrationArgs, ProgramError> {
+    // 32 + 32 + 32 + 32 + 8 + 1 + 1 + 1 = 139
+    if data.len() != 139 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut action_hash = [0; 32];
+    action_hash.copy_from_slice(&data[..32]);
+
+    let mut session_commitment = [0; 32];
+    session_commitment.copy_from_slice(&data[32..64]);
+
+    let mut signers_commitment = [0; 32];
+    signers_commitment.copy_from_slice(&data[64..96]);
+
+    let mut signing_package_hash = [0; 32];
+    signing_package_hash.copy_from_slice(&data[96..128]);
+
+    let mut expiry_slot = [0; 8];
+    expiry_slot.copy_from_slice(&data[128..136]);
+
+    Ok(InitSpendOrchestrationArgs {
+        action_hash,
+        session_commitment,
+        signers_commitment,
+        signing_package_hash,
+        expiry_slot: u64::from_le_bytes(expiry_slot),
+        threshold: data[136],
+        participant_count: data[137],
+        bump: data[138],
+    })
+}
+
+fn parse_commit_spend_orchestration(
+    data: &[u8],
+) -> Result<CommitSpendOrchestrationArgs, ProgramError> {
+    // 32 + 32 = 64
+    if data.len() != 64 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut action_hash = [0; 32];
+    action_hash.copy_from_slice(&data[..32]);
+
+    let mut signing_package_hash = [0; 32];
+    signing_package_hash.copy_from_slice(&data[32..64]);
+
+    Ok(CommitSpendOrchestrationArgs {
+        action_hash,
+        signing_package_hash,
+    })
+}
+
+fn parse_complete_spend_orchestration(
+    data: &[u8],
+) -> Result<CompleteSpendOrchestrationArgs, ProgramError> {
+    // 32
+    if data.len() != 32 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut action_hash = [0; 32];
+    action_hash.copy_from_slice(data);
+
+    Ok(CompleteSpendOrchestrationArgs { action_hash })
+}
+
+fn parse_fail_spend_orchestration(
+    data: &[u8],
+) -> Result<FailSpendOrchestrationArgs, ProgramError> {
+    // 32 + 1 = 33
+    if data.len() != 33 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut action_hash = [0; 32];
+    action_hash.copy_from_slice(&data[..32]);
+
+    Ok(FailSpendOrchestrationArgs {
+        action_hash,
+        reason_code: data[32],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CloseQuantumVaultArgs, CoreInstruction, InitAuthorityArgs, InitAuthorityProofArgs,
-        InitQuantumVaultArgs, InitVaultArgs, RotateAuthorityArgs, SplitQuantumVaultArgs,
-        WriteAuthorityProofChunkArgs, WINTERNITZ_SIGNATURE_BYTES,
+        CloseQuantumVaultArgs, CommitSpendOrchestrationArgs, CompleteSpendOrchestrationArgs,
+        CoreInstruction, FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs,
+        InitQuantumVaultArgs, InitSpendOrchestrationArgs, InitVaultArgs, RotateAuthorityArgs,
+        SplitQuantumVaultArgs, WriteAuthorityProofChunkArgs, WINTERNITZ_SIGNATURE_BYTES,
     };
     use pinocchio::program_error::ProgramError;
     use vaulkyrie_protocol::{
@@ -677,6 +809,82 @@ mod tests {
                 signature,
                 bump: 6,
             }))
+        );
+    }
+
+    #[test]
+    fn parses_init_spend_orchestration_instruction() {
+        let mut data = vec![17];
+        data.extend_from_slice(&[1; 32]); // action_hash
+        data.extend_from_slice(&[2; 32]); // session_commitment
+        data.extend_from_slice(&[3; 32]); // signers_commitment
+        data.extend_from_slice(&[4; 32]); // signing_package_hash
+        data.extend_from_slice(&500u64.to_le_bytes());
+        data.push(2); // threshold
+        data.push(3); // participant_count
+        data.push(7); // bump
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::InitSpendOrchestration(
+                InitSpendOrchestrationArgs {
+                    action_hash: [1; 32],
+                    session_commitment: [2; 32],
+                    signers_commitment: [3; 32],
+                    signing_package_hash: [4; 32],
+                    expiry_slot: 500,
+                    threshold: 2,
+                    participant_count: 3,
+                    bump: 7,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_commit_spend_orchestration_instruction() {
+        let mut data = vec![18];
+        data.extend_from_slice(&[5; 32]); // action_hash
+        data.extend_from_slice(&[6; 32]); // signing_package_hash
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::CommitSpendOrchestration(
+                CommitSpendOrchestrationArgs {
+                    action_hash: [5; 32],
+                    signing_package_hash: [6; 32],
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_complete_spend_orchestration_instruction() {
+        let mut data = vec![19];
+        data.extend_from_slice(&[7; 32]);
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::CompleteSpendOrchestration(
+                CompleteSpendOrchestrationArgs { action_hash: [7; 32] }
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_fail_spend_orchestration_instruction() {
+        let mut data = vec![20];
+        data.extend_from_slice(&[8; 32]);
+        data.push(42); // reason_code
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::FailSpendOrchestration(
+                FailSpendOrchestrationArgs {
+                    action_hash: [8; 32],
+                    reason_code: 42,
+                }
+            ))
         );
     }
 }
