@@ -16,6 +16,7 @@ use crate::{
         FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs, InitQuantumVaultArgs,
         InitSpendOrchestrationArgs, InitVaultArgs, WriteAuthorityProofChunkArgs,
     },
+    pda,
     state::{
         ActionSessionState, AuthorityProofState, PolicyReceiptState, QuantumAuthorityState,
         SpendOrchestrationState, VaultRegistry, ACTION_SESSION_DISCRIMINATOR,
@@ -45,6 +46,12 @@ pub fn process(
             let account = get_account_info!(accounts, 0);
             require_writable(account)?;
             require_program_owner(program_id, account)?;
+            pda::verify_vault_registry(
+                account.key(),
+                &args.wallet_pubkey,
+                args.bump,
+                program_id,
+            )?;
             let mut data = account.try_borrow_mut_data()?;
             process_init_vault_data(&mut data, args)
         }
@@ -63,6 +70,12 @@ pub fn process(
             let account = get_account_info!(accounts, 0);
             require_writable(account)?;
             require_program_owner(program_id, account)?;
+            pda::verify_quantum_authority(
+                account.key(),
+                vault_account.key(),
+                args.bump,
+                program_id,
+            )?;
             let mut data = account.try_borrow_mut_data()?;
             process_init_authority_data(&mut data, args)
         }
@@ -385,6 +398,13 @@ pub fn process(
 
             let vault_account = get_account_info!(accounts, 1);
             require_program_owner(program_id, vault_account)?;
+            pda::verify_spend_orchestration(
+                orch_account.key(),
+                vault_account.key(),
+                &args.action_hash,
+                args.bump,
+                program_id,
+            )?;
 
             let wallet_signer = get_account_info!(accounts, 2);
             {
