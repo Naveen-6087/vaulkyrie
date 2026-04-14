@@ -216,7 +216,9 @@ impl TryFrom<&[u8]> for CoreInstruction {
             [22, rest @ ..] => Ok(Self::InitRecovery(parse_init_recovery(rest)?)),
             [23, rest @ ..] => Ok(Self::CompleteRecovery(parse_complete_recovery(rest)?)),
             [24, rest @ ..] => Ok(Self::MigrateAuthority(parse_migrate_authority(rest)?)),
-            [25, rest @ ..] => Ok(Self::AdvancePolicyVersion(parse_advance_policy_version(rest)?)),
+            [25, rest @ ..] => Ok(Self::AdvancePolicyVersion(parse_advance_policy_version(
+                rest,
+            )?)),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -448,9 +450,7 @@ fn parse_close_quantum_vault(data: &[u8]) -> Result<CloseQuantumVaultArgs, Progr
     })
 }
 
-fn parse_init_spend_orchestration(
-    data: &[u8],
-) -> Result<InitSpendOrchestrationArgs, ProgramError> {
+fn parse_init_spend_orchestration(data: &[u8]) -> Result<InitSpendOrchestrationArgs, ProgramError> {
     // 32 + 32 + 32 + 32 + 8 + 1 + 1 + 1 = 139
     if data.len() != 139 {
         return Err(ProgramError::InvalidInstructionData);
@@ -523,9 +523,7 @@ fn parse_complete_spend_orchestration(
     })
 }
 
-fn parse_fail_spend_orchestration(
-    data: &[u8],
-) -> Result<FailSpendOrchestrationArgs, ProgramError> {
+fn parse_fail_spend_orchestration(data: &[u8]) -> Result<FailSpendOrchestrationArgs, ProgramError> {
     // 32 + 1 = 33
     if data.len() != 33 {
         return Err(ProgramError::InvalidInstructionData);
@@ -589,9 +587,7 @@ fn parse_migrate_authority(data: &[u8]) -> Result<MigrateAuthorityArgs, ProgramE
     }
     let mut new_authority_root = [0; 32];
     new_authority_root.copy_from_slice(data);
-    Ok(MigrateAuthorityArgs {
-        new_authority_root,
-    })
+    Ok(MigrateAuthorityArgs { new_authority_root })
 }
 
 fn parse_advance_policy_version(data: &[u8]) -> Result<AdvancePolicyVersionArgs, ProgramError> {
@@ -1099,9 +1095,9 @@ mod tests {
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
-            Ok(CoreInstruction::AdvancePolicyVersion(AdvancePolicyVersionArgs {
-                new_version: 42,
-            }))
+            Ok(CoreInstruction::AdvancePolicyVersion(
+                AdvancePolicyVersionArgs { new_version: 42 }
+            ))
         );
     }
 }

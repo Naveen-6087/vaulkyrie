@@ -753,9 +753,8 @@ mod tests {
         migrate_authority_tree, open_action_session, open_action_session_from_receipt,
         parse_vault_status, rotate_vault_authority, stage_policy_receipt, update_vault_status,
         validate_and_advance_receipt_nonce, validate_authority_action_binding,
-        validate_bridged_receipt_claim, validate_eval_account_owner,
-        validate_quantum_vault_close, validate_quantum_vault_split,
-        validate_quantum_vault_split_amount, validate_vault_active,
+        validate_bridged_receipt_claim, validate_eval_account_owner, validate_quantum_vault_close,
+        validate_quantum_vault_split, validate_quantum_vault_split_amount, validate_vault_active,
         validate_vault_authority_alignment, validate_vault_for_receipt, validate_vault_for_session,
         validate_vault_recovery_mode, verify_authority_proof, TransitionError,
     };
@@ -1552,7 +1551,7 @@ mod tests {
         let mut replay_stmt = vaulkyrie_protocol::AuthorityRotationStatement {
             action_hash: [0; 32],
             next_authority_hash: [5; 32], // different from current [4;32]
-            sequence: 1, // matches advanced next_sequence
+            sequence: 1,                  // matches advanced next_sequence
             expiry_slot: 100,
         };
         replay_stmt.action_hash = replay_stmt.expected_action_hash([1; 32], 9);
@@ -1810,10 +1809,9 @@ mod tests {
     #[test]
     fn init_spend_orchestration_creates_pending_state() {
         use super::{init_spend_orchestration, OrchestrationStatus};
-        let state = init_spend_orchestration(
-            [1; 32], [2; 32], [3; 32], [4; 32], 1000, 2, 3, 7, 500,
-        )
-        .expect("valid params should succeed");
+        let state =
+            init_spend_orchestration([1; 32], [2; 32], [3; 32], [4; 32], 1000, 2, 3, 7, 500)
+                .expect("valid params should succeed");
 
         assert_eq!(state.action_hash, [1; 32]);
         assert_eq!(state.status, OrchestrationStatus::Pending as u8);
@@ -1825,10 +1823,8 @@ mod tests {
     #[test]
     fn init_spend_orchestration_rejects_expired_slot() {
         use super::init_spend_orchestration;
-        let error = init_spend_orchestration(
-            [1; 32], [2; 32], [3; 32], [4; 32], 500, 2, 3, 7, 500,
-        )
-        .expect_err("expiry <= current_slot should fail");
+        let error = init_spend_orchestration([1; 32], [2; 32], [3; 32], [4; 32], 500, 2, 3, 7, 500)
+            .expect_err("expiry <= current_slot should fail");
 
         assert_eq!(error, TransitionError::OrchestrationExpired);
     }
@@ -1836,10 +1832,9 @@ mod tests {
     #[test]
     fn init_spend_orchestration_rejects_invalid_threshold() {
         use super::init_spend_orchestration;
-        let error = init_spend_orchestration(
-            [1; 32], [2; 32], [3; 32], [4; 32], 1000, 5, 3, 7, 500,
-        )
-        .expect_err("threshold > participant_count should fail");
+        let error =
+            init_spend_orchestration([1; 32], [2; 32], [3; 32], [4; 32], 1000, 5, 3, 7, 500)
+                .expect_err("threshold > participant_count should fail");
 
         assert_eq!(error, TransitionError::OrchestrationInvalidParams);
     }
@@ -1847,10 +1842,9 @@ mod tests {
     #[test]
     fn commit_spend_orchestration_advances_to_committed() {
         use super::{commit_spend_orchestration, init_spend_orchestration, OrchestrationStatus};
-        let mut state = init_spend_orchestration(
-            [1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500,
-        )
-        .unwrap();
+        let mut state =
+            init_spend_orchestration([1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500)
+                .unwrap();
 
         commit_spend_orchestration(&mut state, [1; 32], [5; 32], 600).expect("should commit");
 
@@ -1861,10 +1855,9 @@ mod tests {
     #[test]
     fn commit_spend_orchestration_rejects_wrong_action_hash() {
         use super::{commit_spend_orchestration, init_spend_orchestration};
-        let mut state = init_spend_orchestration(
-            [1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500,
-        )
-        .unwrap();
+        let mut state =
+            init_spend_orchestration([1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500)
+                .unwrap();
 
         let error = commit_spend_orchestration(&mut state, [9; 32], [5; 32], 600)
             .expect_err("wrong action hash should fail");
@@ -1878,14 +1871,12 @@ mod tests {
             commit_spend_orchestration, complete_spend_orchestration, init_spend_orchestration,
             OrchestrationStatus,
         };
-        let mut state = init_spend_orchestration(
-            [1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500,
-        )
-        .unwrap();
+        let mut state =
+            init_spend_orchestration([1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500)
+                .unwrap();
         commit_spend_orchestration(&mut state, [1; 32], [5; 32], 600).unwrap();
 
-        complete_spend_orchestration(&mut state, [1; 32], [99; 32], 700)
-            .expect("should complete");
+        complete_spend_orchestration(&mut state, [1; 32], [99; 32], 700).expect("should complete");
 
         assert_eq!(state.status, OrchestrationStatus::Complete as u8);
         assert_eq!(state.tx_binding, [99; 32]);
@@ -1894,10 +1885,9 @@ mod tests {
     #[test]
     fn fail_spend_orchestration_marks_failed() {
         use super::{fail_spend_orchestration, init_spend_orchestration, OrchestrationStatus};
-        let mut state = init_spend_orchestration(
-            [1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500,
-        )
-        .unwrap();
+        let mut state =
+            init_spend_orchestration([1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500)
+                .unwrap();
 
         fail_spend_orchestration(&mut state, [1; 32]).expect("should fail orchestration");
 
@@ -1910,10 +1900,9 @@ mod tests {
             commit_spend_orchestration, complete_spend_orchestration, fail_spend_orchestration,
             init_spend_orchestration,
         };
-        let mut state = init_spend_orchestration(
-            [1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500,
-        )
-        .unwrap();
+        let mut state =
+            init_spend_orchestration([1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500)
+                .unwrap();
         commit_spend_orchestration(&mut state, [1; 32], [5; 32], 600).unwrap();
         complete_spend_orchestration(&mut state, [1; 32], [99; 32], 700).unwrap();
 
@@ -2114,8 +2103,7 @@ mod tests {
         RecoveryState::new(
             [1; 32], // vault_pubkey
             [2; 32], // recovery_commitment
-            expiry,
-            2,  // new_threshold
+            expiry, 2,  // new_threshold
             3,  // new_participant_count
             42, // bump
         )
@@ -2135,13 +2123,7 @@ mod tests {
 
     #[test]
     fn init_recovery_rejects_non_recovery_vault() {
-        let result = init_recovery(
-            VaultStatus::Active as u8,
-            100,
-            500,
-            2,
-            3,
-        );
+        let result = init_recovery(VaultStatus::Active as u8, 100, 500, 2, 3);
         assert_eq!(result, Err(TransitionError::RecoveryVaultNotInRecoveryMode));
     }
 
@@ -2270,7 +2252,10 @@ mod tests {
         let mut vault = VaultRegistry::new([0; 32], [0; 32], 5, VaultStatus::Active, 1, [0; 32]);
 
         let result = advance_policy_version(&mut vault, 7);
-        assert_eq!(result.unwrap_err(), TransitionError::PolicyVersionNotMonotonic);
+        assert_eq!(
+            result.unwrap_err(),
+            TransitionError::PolicyVersionNotMonotonic
+        );
     }
 
     #[test]
@@ -2278,7 +2263,10 @@ mod tests {
         let mut vault = VaultRegistry::new([0; 32], [0; 32], 5, VaultStatus::Active, 1, [0; 32]);
 
         let result = advance_policy_version(&mut vault, 5);
-        assert_eq!(result.unwrap_err(), TransitionError::PolicyVersionNotMonotonic);
+        assert_eq!(
+            result.unwrap_err(),
+            TransitionError::PolicyVersionNotMonotonic
+        );
     }
 
     #[test]

@@ -321,7 +321,10 @@ mod tests {
 
         queue_arcium_computation(&mut state, 55, 400).expect("queue should succeed");
 
-        assert_eq!(state.status, PolicyEvaluationStatus::ComputationQueued as u8);
+        assert_eq!(
+            state.status,
+            PolicyEvaluationStatus::ComputationQueued as u8
+        );
         assert_eq!(state.computation_offset, 55);
     }
 
@@ -391,7 +394,8 @@ mod tests {
             open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
 
         queue_arcium_computation(&mut state, 77, 400).expect("queue should succeed");
-        abort_policy_evaluation(&mut state, 11).expect("abort from ComputationQueued should succeed");
+        abort_policy_evaluation(&mut state, 11)
+            .expect("abort from ComputationQueued should succeed");
 
         assert_eq!(state.status, PolicyEvaluationStatus::Aborted as u8);
         assert_eq!(state.reason_code, 11);

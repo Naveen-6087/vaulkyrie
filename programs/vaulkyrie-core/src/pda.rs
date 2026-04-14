@@ -104,10 +104,7 @@ pub fn derive_quantum_authority(
     program_id: &Pubkey,
 ) -> Result<Pubkey, ProgramError> {
     let bump_slice = [bump];
-    create_program_address(
-        &[QUANTUM_AUTHORITY_SEED, vault_id, &bump_slice],
-        program_id,
-    )
+    create_program_address(&[QUANTUM_AUTHORITY_SEED, vault_id, &bump_slice], program_id)
 }
 
 pub fn verify_quantum_authority(
@@ -160,10 +157,7 @@ pub fn derive_quantum_vault(
     program_id: &Pubkey,
 ) -> Result<Pubkey, ProgramError> {
     let bump_slice = [bump];
-    create_program_address(
-        &[QUANTUM_VAULT_SEED, hash, &bump_slice],
-        program_id,
-    )
+    create_program_address(&[QUANTUM_VAULT_SEED, hash, &bump_slice], program_id)
 }
 
 pub fn verify_quantum_vault(
@@ -228,10 +222,7 @@ mod host_pda {
     }
 
     /// Pure-Rust equivalent of `solana_program::pubkey::Pubkey::create_program_address`.
-    pub fn create_program_address(
-        seeds: &[&[u8]],
-        program_id: &[u8; 32],
-    ) -> Option<[u8; 32]> {
+    pub fn create_program_address(seeds: &[&[u8]], program_id: &[u8; 32]) -> Option<[u8; 32]> {
         if seeds.len() > 16 {
             return None;
         }
@@ -251,10 +242,7 @@ mod host_pda {
     }
 
     /// Pure-Rust equivalent of `solana_program::pubkey::Pubkey::find_program_address`.
-    pub fn find_program_address(
-        seeds: &[&[u8]],
-        program_id: &[u8; 32],
-    ) -> Option<([u8; 32], u8)> {
+    pub fn find_program_address(seeds: &[&[u8]], program_id: &[u8; 32]) -> Option<([u8; 32], u8)> {
         let mut bump = 255u8;
         loop {
             let bump_slice = [bump];
@@ -280,37 +268,29 @@ mod tests {
     };
 
     const PROGRAM_ID: [u8; 32] = [
-        0x0A, 0x1B, 0x2C, 0x3D, 0x4E, 0x5F, 0x60, 0x71,
-        0x82, 0x93, 0xA4, 0xB5, 0xC6, 0xD7, 0xE8, 0xF9,
-        0x01, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78,
-        0x89, 0x9A, 0xAB, 0xBC, 0xCD, 0xDE, 0xEF, 0xF0,
+        0x0A, 0x1B, 0x2C, 0x3D, 0x4E, 0x5F, 0x60, 0x71, 0x82, 0x93, 0xA4, 0xB5, 0xC6, 0xD7, 0xE8,
+        0xF9, 0x01, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67, 0x78, 0x89, 0x9A, 0xAB, 0xBC, 0xCD, 0xDE,
+        0xEF, 0xF0,
     ];
 
     #[test]
     fn vault_registry_pda_derivation() {
         let wallet = [42u8; 32];
-        let (expected, bump) = host_pda::find_program_address(
-            &[VAULT_REGISTRY_SEED, &wallet],
-            &PROGRAM_ID,
-        )
-        .expect("should find PDA");
+        let (expected, bump) =
+            host_pda::find_program_address(&[VAULT_REGISTRY_SEED, &wallet], &PROGRAM_ID)
+                .expect("should find PDA");
 
-        let derived = host_pda::create_program_address(
-            &[VAULT_REGISTRY_SEED, &wallet, &[bump]],
-            &PROGRAM_ID,
-        )
-        .expect("should derive PDA");
+        let derived =
+            host_pda::create_program_address(&[VAULT_REGISTRY_SEED, &wallet, &[bump]], &PROGRAM_ID)
+                .expect("should derive PDA");
         assert_eq!(derived, expected);
     }
 
     #[test]
     fn vault_registry_wrong_bump_yields_different_address() {
         let wallet = [42u8; 32];
-        let (expected, bump) = host_pda::find_program_address(
-            &[VAULT_REGISTRY_SEED, &wallet],
-            &PROGRAM_ID,
-        )
-        .unwrap();
+        let (expected, bump) =
+            host_pda::find_program_address(&[VAULT_REGISTRY_SEED, &wallet], &PROGRAM_ID).unwrap();
 
         let wrong_bump = bump.wrapping_sub(1);
         // Different bump may produce a different valid PDA or None.
@@ -318,7 +298,10 @@ mod tests {
             &[VAULT_REGISTRY_SEED, &wallet, &[wrong_bump]],
             &PROGRAM_ID,
         ) {
-            assert_ne!(other, expected, "different bump should give different address");
+            assert_ne!(
+                other, expected,
+                "different bump should give different address"
+            );
         }
     }
 
@@ -326,11 +309,9 @@ mod tests {
     fn policy_receipt_pda_derivation() {
         let vault = [10u8; 32];
         let action = [20u8; 32];
-        let (expected, bump) = host_pda::find_program_address(
-            &[POLICY_RECEIPT_SEED, &vault, &action],
-            &PROGRAM_ID,
-        )
-        .unwrap();
+        let (expected, bump) =
+            host_pda::find_program_address(&[POLICY_RECEIPT_SEED, &vault, &action], &PROGRAM_ID)
+                .unwrap();
 
         let derived = host_pda::create_program_address(
             &[POLICY_RECEIPT_SEED, &vault, &action, &[bump]],
@@ -344,11 +325,9 @@ mod tests {
     fn action_session_pda_derivation() {
         let vault = [11u8; 32];
         let action = [22u8; 32];
-        let (expected, bump) = host_pda::find_program_address(
-            &[ACTION_SESSION_SEED, &vault, &action],
-            &PROGRAM_ID,
-        )
-        .unwrap();
+        let (expected, bump) =
+            host_pda::find_program_address(&[ACTION_SESSION_SEED, &vault, &action], &PROGRAM_ID)
+                .unwrap();
 
         let derived = host_pda::create_program_address(
             &[ACTION_SESSION_SEED, &vault, &action, &[bump]],
@@ -361,11 +340,8 @@ mod tests {
     #[test]
     fn quantum_authority_pda_derivation() {
         let vault = [33u8; 32];
-        let (expected, bump) = host_pda::find_program_address(
-            &[QUANTUM_AUTHORITY_SEED, &vault],
-            &PROGRAM_ID,
-        )
-        .unwrap();
+        let (expected, bump) =
+            host_pda::find_program_address(&[QUANTUM_AUTHORITY_SEED, &vault], &PROGRAM_ID).unwrap();
 
         let derived = host_pda::create_program_address(
             &[QUANTUM_AUTHORITY_SEED, &vault, &[bump]],
@@ -378,11 +354,9 @@ mod tests {
     #[test]
     fn authority_proof_pda_derivation() {
         let auth_key = [55u8; 32];
-        let (expected, bump) = host_pda::find_program_address(
-            &[AUTHORITY_PROOF_SEED, &auth_key],
-            &PROGRAM_ID,
-        )
-        .unwrap();
+        let (expected, bump) =
+            host_pda::find_program_address(&[AUTHORITY_PROOF_SEED, &auth_key], &PROGRAM_ID)
+                .unwrap();
 
         let derived = host_pda::create_program_address(
             &[AUTHORITY_PROOF_SEED, &auth_key, &[bump]],
@@ -395,17 +369,12 @@ mod tests {
     #[test]
     fn quantum_vault_pda_derivation() {
         let hash = [77u8; 32];
-        let (expected, bump) = host_pda::find_program_address(
-            &[QUANTUM_VAULT_SEED, &hash],
-            &PROGRAM_ID,
-        )
-        .unwrap();
+        let (expected, bump) =
+            host_pda::find_program_address(&[QUANTUM_VAULT_SEED, &hash], &PROGRAM_ID).unwrap();
 
-        let derived = host_pda::create_program_address(
-            &[QUANTUM_VAULT_SEED, &hash, &[bump]],
-            &PROGRAM_ID,
-        )
-        .unwrap();
+        let derived =
+            host_pda::create_program_address(&[QUANTUM_VAULT_SEED, &hash, &[bump]], &PROGRAM_ID)
+                .unwrap();
         assert_eq!(derived, expected);
     }
 
@@ -413,11 +382,9 @@ mod tests {
     fn spend_orchestration_pda_derivation() {
         let vault = [88u8; 32];
         let action = [99u8; 32];
-        let (expected, bump) = host_pda::find_program_address(
-            &[SPEND_ORCH_SEED, &vault, &action],
-            &PROGRAM_ID,
-        )
-        .unwrap();
+        let (expected, bump) =
+            host_pda::find_program_address(&[SPEND_ORCH_SEED, &vault, &action], &PROGRAM_ID)
+                .unwrap();
 
         let derived = host_pda::create_program_address(
             &[SPEND_ORCH_SEED, &vault, &action, &[bump]],
@@ -430,16 +397,10 @@ mod tests {
     #[test]
     fn cross_type_seeds_do_not_collide() {
         let id = [42u8; 32];
-        let (vault_key, _) = host_pda::find_program_address(
-            &[VAULT_REGISTRY_SEED, &id],
-            &PROGRAM_ID,
-        )
-        .unwrap();
-        let (authority_key, _) = host_pda::find_program_address(
-            &[QUANTUM_AUTHORITY_SEED, &id],
-            &PROGRAM_ID,
-        )
-        .unwrap();
+        let (vault_key, _) =
+            host_pda::find_program_address(&[VAULT_REGISTRY_SEED, &id], &PROGRAM_ID).unwrap();
+        let (authority_key, _) =
+            host_pda::find_program_address(&[QUANTUM_AUTHORITY_SEED, &id], &PROGRAM_ID).unwrap();
         assert_ne!(vault_key, authority_key);
     }
 

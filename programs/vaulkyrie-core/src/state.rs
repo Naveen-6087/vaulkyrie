@@ -822,9 +822,7 @@ mod tests {
 
     #[test]
     fn spend_orchestration_state_layout_is_stable() {
-        let state = SpendOrchestrationState::new(
-            [1; 32], [2; 32], [3; 32], 500, 2, 3, 7,
-        );
+        let state = SpendOrchestrationState::new([1; 32], [2; 32], [3; 32], 500, 2, 3, 7);
 
         assert_eq!(state.discriminator, SPEND_ORCH_DISCRIMINATOR);
         assert_eq!(SpendOrchestrationState::LEN, 184);
@@ -835,9 +833,7 @@ mod tests {
 
     #[test]
     fn spend_orchestration_state_roundtrips_through_bytes() {
-        let mut state = SpendOrchestrationState::new(
-            [1; 32], [2; 32], [3; 32], 999, 2, 3, 5,
-        );
+        let mut state = SpendOrchestrationState::new([1; 32], [2; 32], [3; 32], 999, 2, 3, 5);
         state.signing_package_hash = [4; 32];
         state.status = OrchestrationStatus::Committed as u8;
         let mut bytes = [0; SpendOrchestrationState::LEN];
@@ -871,9 +867,7 @@ mod tests {
 
     #[test]
     fn spend_orchestration_roundtrips_with_nonzero_tx_binding() {
-        let mut state = SpendOrchestrationState::new(
-            [1; 32], [2; 32], [3; 32], 999, 2, 3, 5,
-        );
+        let mut state = SpendOrchestrationState::new([1; 32], [2; 32], [3; 32], 999, 2, 3, 5);
         state.signing_package_hash = [4; 32];
         state.tx_binding = [0xAB; 32];
         state.status = OrchestrationStatus::Complete as u8;
@@ -932,9 +926,7 @@ mod tests {
 
     #[test]
     fn spend_orchestration_decode_rejects_wrong_discriminator() {
-        let state = SpendOrchestrationState::new(
-            [1; 32], [2; 32], [3; 32], 500, 2, 3, 7,
-        );
+        let state = SpendOrchestrationState::new([1; 32], [2; 32], [3; 32], 500, 2, 3, 7);
         let mut bytes = [0; SpendOrchestrationState::LEN];
         assert!(state.encode(&mut bytes));
         bytes[0] = 0xFF;

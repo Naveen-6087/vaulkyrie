@@ -4,9 +4,7 @@ use anchor_lang::prelude::*;
 use arcium_anchor::prelude::*;
 use arcium_anchor::traits::{InitCompDefAccs, QueueCompAccs};
 use arcium_client::idl::arcium::cpi::accounts::QueueComputation;
-use arcium_client::idl::arcium::types::{
-    CallbackAccount, CallbackInstruction, Output, Parameter,
-};
+use arcium_client::idl::arcium::types::{CallbackAccount, CallbackInstruction, Output, Parameter};
 
 pub mod errors;
 pub mod state;
@@ -17,8 +15,7 @@ declare_id!("99gQafBBNAZitScYub5BnJcA7asqdRVndwvCj2Zt7m7L");
 
 /// Arcium computation definition offset for "policy_evaluate" circuit.
 /// Deterministic u32 derived from SHA-256("policy_evaluate")[0..4].
-pub const POLICY_EVALUATE_COMP_DEF_OFFSET: u32 =
-    arcium_anchor::comp_def_offset("policy_evaluate");
+pub const POLICY_EVALUATE_COMP_DEF_OFFSET: u32 = arcium_anchor::comp_def_offset("policy_evaluate");
 
 /// Vaulkyrie policy evaluation output produced by the Arcium MXE circuit.
 ///
@@ -144,9 +141,7 @@ pub mod vaulkyrie_policy_mxe {
     /// Must be called once after program deployment, before any policy
     /// evaluations can be queued. Creates the `ComputationDefinitionAccount`
     /// PDA that stores the circuit interface (parameter/output types).
-    pub fn init_policy_evaluate_comp_def(
-        ctx: Context<InitPolicyEvaluateCompDef>,
-    ) -> Result<()> {
+    pub fn init_policy_evaluate_comp_def(ctx: Context<InitPolicyEvaluateCompDef>) -> Result<()> {
         handlers::process_init_policy_evaluate_comp_def(ctx)
     }
 
@@ -321,11 +316,11 @@ impl<'info> InitCompDefAccs<'info> for InitPolicyEvaluateCompDef<'info> {
 
     fn outputs(&self) -> Vec<Output> {
         vec![
-            Output::Ciphertext,        // receipt_commitment  (32 bytes)
-            Output::Ciphertext,        // decision_commitment (32 bytes)
-            Output::PlaintextU64,      // delay_until_slot
-            Output::PlaintextU16,      // reason_code
-            Output::PlaintextU8,       // approved flag
+            Output::Ciphertext,   // receipt_commitment  (32 bytes)
+            Output::Ciphertext,   // decision_commitment (32 bytes)
+            Output::PlaintextU64, // delay_until_slot
+            Output::PlaintextU16, // reason_code
+            Output::PlaintextU8,  // approved flag
         ]
     }
 
@@ -518,8 +513,8 @@ mod handlers {
         if config_data.len() != PolicyConfigState::LEN {
             return Err(PolicyMxeError::InvalidAccountSize.into());
         }
-        let mut config = PolicyConfigState::decode(&config_data)
-            .ok_or(PolicyMxeError::NotInitialized)?;
+        let mut config =
+            PolicyConfigState::decode(&config_data).ok_or(PolicyMxeError::NotInitialized)?;
         if config.discriminator != POLICY_CONFIG_DISCRIMINATOR {
             return Err(PolicyMxeError::NotInitialized.into());
         }
@@ -575,8 +570,8 @@ mod handlers {
         if eval_data.len() != PolicyEvaluationState::LEN {
             return Err(PolicyMxeError::InvalidAccountSize.into());
         }
-        let mut eval_state = PolicyEvaluationState::decode(&eval_data)
-            .ok_or(PolicyMxeError::NotInitialized)?;
+        let mut eval_state =
+            PolicyEvaluationState::decode(&eval_data).ok_or(PolicyMxeError::NotInitialized)?;
         if eval_state.discriminator != POLICY_EVAL_DISCRIMINATOR {
             return Err(PolicyMxeError::NotInitialized.into());
         }
@@ -616,8 +611,8 @@ mod handlers {
         if eval_data.len() != PolicyEvaluationState::LEN {
             return Err(PolicyMxeError::InvalidAccountSize.into());
         }
-        let mut eval_state = PolicyEvaluationState::decode(&eval_data)
-            .ok_or(PolicyMxeError::NotInitialized)?;
+        let mut eval_state =
+            PolicyEvaluationState::decode(&eval_data).ok_or(PolicyMxeError::NotInitialized)?;
         if eval_state.discriminator != POLICY_EVAL_DISCRIMINATOR {
             return Err(PolicyMxeError::NotInitialized.into());
         }
@@ -640,8 +635,8 @@ mod handlers {
         if eval_data.len() != PolicyEvaluationState::LEN {
             return Err(PolicyMxeError::InvalidAccountSize.into());
         }
-        let mut eval_state = PolicyEvaluationState::decode(&eval_data)
-            .ok_or(PolicyMxeError::NotInitialized)?;
+        let mut eval_state =
+            PolicyEvaluationState::decode(&eval_data).ok_or(PolicyMxeError::NotInitialized)?;
         if eval_state.discriminator != POLICY_EVAL_DISCRIMINATOR {
             return Err(PolicyMxeError::NotInitialized.into());
         }
@@ -689,18 +684,14 @@ mod handlers {
             if eval_data.len() != PolicyEvaluationState::LEN {
                 return Err(PolicyMxeError::InvalidAccountSize.into());
             }
-            let mut eval_state = PolicyEvaluationState::decode(&eval_data)
-                .ok_or(PolicyMxeError::NotInitialized)?;
+            let mut eval_state =
+                PolicyEvaluationState::decode(&eval_data).ok_or(PolicyMxeError::NotInitialized)?;
             if eval_state.discriminator != POLICY_EVAL_DISCRIMINATOR {
                 return Err(PolicyMxeError::NotInitialized.into());
             }
 
-            transition::queue_arcium_computation(
-                &mut eval_state,
-                computation_offset,
-                current_slot,
-            )
-            .map_err(PolicyMxeError::from)?;
+            transition::queue_arcium_computation(&mut eval_state, computation_offset, current_slot)
+                .map_err(PolicyMxeError::from)?;
 
             eval_state.encode(&mut eval_data);
         }
@@ -734,8 +725,8 @@ mod handlers {
             computation_offset,
             args,
             vec![callback_ix],
-            1,  // single callback transaction
-            0,  // no priority fee
+            1, // single callback transaction
+            0, // no priority fee
         )?;
 
         Ok(())
@@ -771,8 +762,8 @@ mod handlers {
         if eval_data.len() != PolicyEvaluationState::LEN {
             return Err(PolicyMxeError::InvalidAccountSize.into());
         }
-        let mut eval_state = PolicyEvaluationState::decode(&eval_data)
-            .ok_or(PolicyMxeError::NotInitialized)?;
+        let mut eval_state =
+            PolicyEvaluationState::decode(&eval_data).ok_or(PolicyMxeError::NotInitialized)?;
         if eval_state.discriminator != POLICY_EVAL_DISCRIMINATOR {
             return Err(PolicyMxeError::NotInitialized.into());
         }

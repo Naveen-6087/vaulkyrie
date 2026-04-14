@@ -11,10 +11,12 @@ use solana_winternitz::signature::WinternitzSignature;
 use vaulkyrie_protocol::{AuthorityRotationStatement, PolicyReceipt, WotsAuthProof};
 
 use crate::{
+    error,
     instruction::{
         CommitSpendOrchestrationArgs, CompleteSpendOrchestrationArgs, CoreInstruction,
-        FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs, InitQuantumVaultArgs,
-        InitSpendOrchestrationArgs, InitVaultArgs, WriteAuthorityProofChunkArgs,
+        FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs,
+        InitQuantumVaultArgs, InitSpendOrchestrationArgs, InitVaultArgs,
+        WriteAuthorityProofChunkArgs,
     },
     pda,
     state::{
@@ -46,12 +48,7 @@ pub fn process(
             let account = get_account_info!(accounts, 0);
             require_writable(account)?;
             require_program_owner(program_id, account)?;
-            pda::verify_vault_registry(
-                account.key(),
-                &args.wallet_pubkey,
-                args.bump,
-                program_id,
-            )?;
+            pda::verify_vault_registry(account.key(), &args.wallet_pubkey, args.bump, program_id)?;
             let mut data = account.try_borrow_mut_data()?;
             process_init_vault_data(&mut data, args)
         }
@@ -64,7 +61,7 @@ pub fn process(
             let wallet_signer = get_account_info!(accounts, 2);
             require_wallet_authority(&vault, wallet_signer)?;
             if vault.current_authority_hash != args.current_authority_hash {
-                return Err(ProgramError::InvalidArgument);
+                return Err(ProgramError::Custom(error::AUTHORITY_HASH_MISMATCH));
             }
 
             let account = get_account_info!(accounts, 0);
@@ -334,7 +331,7 @@ pub fn process(
                 || vault_account.key() == refund_account.key()
                 || split_account.key() == refund_account.key()
             {
-                return Err(ProgramError::InvalidArgument);
+                return Err(ProgramError::Custom(error::DUPLICATE_ACCOUNT_KEYS));
             }
 
             {
@@ -370,7 +367,7 @@ pub fn process(
             let refund_account = get_account_info!(accounts, 1);
             require_writable(refund_account)?;
             if vault_account.key() == refund_account.key() {
-                return Err(ProgramError::InvalidArgument);
+                return Err(ProgramError::Custom(error::DUPLICATE_ACCOUNT_KEYS));
             }
 
             {
@@ -493,7 +490,11 @@ pub fn process(
             {
                 let vault_data = vault_account.try_borrow_data()?;
                 let vault = decode_vault_state(&vault_data)?;
-                let owner_bytes: [u8; 32] = policy_eval_account.owner().as_ref().try_into().unwrap();
+                let owner_bytes: [u8; 32] = policy_eval_account
+                    .owner()
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidAccountData)?;
                 transition::validate_eval_account_owner(&owner_bytes, &vault)
                     .map_err(|_| ProgramError::IllegalOwner)?;
             }
@@ -692,16 +693,17 @@ pub fn process_write_authority_proof_chunk_data(
         return Err(ProgramError::AccountAlreadyInitialized);
     }
 
-    let offset = usize::try_from(args.offset).map_err(|_| ProgramError::InvalidArgument)?;
+    let offset = usize::try_from(args.offset)
+        .map_err(|_| ProgramError::Custom(error::PROOF_CHUNK_OFFSET_MISMATCH))?;
     let chunk = args.chunk_bytes();
     if offset != state.bytes_written as usize {
-        return Err(ProgramError::InvalidArgument);
+        return Err(ProgramError::Custom(error::PROOF_CHUNK_OFFSET_MISMATCH));
     }
     let end = offset
         .checked_add(chunk.len())
-        .ok_or(ProgramError::InvalidArgument)?;
+        .ok_or(ProgramError::Custom(error::PROOF_CHUNK_OVERFLOW))?;
     if end > WotsAuthProof::ENCODED_LEN {
-        return Err(ProgramError::InvalidArgument);
+        return Err(ProgramError::Custom(error::PROOF_CHUNK_TOO_LARGE));
     }
 
     state.proof_bytes[offset..end].copy_from_slice(chunk);
@@ -794,7 +796,7 @@ pub fn process_consume_receipt_data(
     require_discriminator(&vault.discriminator, &VAULT_REGISTRY_DISCRIMINATOR)?;
     transition::validate_vault_active(&vault).map_err(map_transition_error)?;
     if vault.policy_version != receipt.policy_version {
-        return Err(ProgramError::InvalidArgument);
+        return Err(ProgramError::Custom(error::POLICY_VERSION_MISMATCH));
     }
 
     let mut state =
@@ -852,7 +854,7 @@ pub fn process_activate_session_data(
     let mut state = ActionSessionState::decode(dst).ok_or(ProgramError::InvalidAccountData)?;
     require_discriminator(&state.discriminator, &ACTION_SESSION_DISCRIMINATOR)?;
     if state.policy_version != expected_policy_version {
-        return Err(ProgramError::InvalidArgument);
+        return Err(ProgramError::Custom(error::POLICY_VERSION_MISMATCH));
     }
     transition::mark_action_session_ready(&mut state, action_hash, current_slot)
         .map_err(map_transition_error)?;
@@ -877,7 +879,7 @@ pub fn process_consume_session_data(
     let mut state = ActionSessionState::decode(dst).ok_or(ProgramError::InvalidAccountData)?;
     require_discriminator(&state.discriminator, &ACTION_SESSION_DISCRIMINATOR)?;
     if state.policy_version != expected_policy_version {
-        return Err(ProgramError::InvalidArgument);
+        return Err(ProgramError::Custom(error::POLICY_VERSION_MISMATCH));
     }
     transition::consume_action_session(&mut state, action_hash, current_slot)
         .map_err(map_transition_error)?;
@@ -911,7 +913,7 @@ pub fn process_finalize_session_data(
     if vault_state.policy_version != expected_policy_version
         || receipt.policy_version != expected_policy_version
     {
-        return Err(ProgramError::InvalidArgument);
+        return Err(ProgramError::Custom(error::POLICY_VERSION_MISMATCH));
     }
 
     let mut receipt_state =
@@ -922,7 +924,7 @@ pub fn process_finalize_session_data(
         ActionSessionState::decode(session_dst).ok_or(ProgramError::InvalidAccountData)?;
     require_discriminator(&session_state.discriminator, &ACTION_SESSION_DISCRIMINATOR)?;
     if session_state.policy_version != expected_policy_version {
-        return Err(ProgramError::InvalidArgument);
+        return Err(ProgramError::Custom(error::POLICY_VERSION_MISMATCH));
     }
 
     transition::finalize_action_session(
@@ -994,7 +996,7 @@ pub fn process_rotate_authority_staged_data(
         return Err(ProgramError::AccountAlreadyInitialized);
     }
     if proof_state.statement_digest != statement.digest() {
-        return Err(ProgramError::InvalidArgument);
+        return Err(ProgramError::Custom(error::PROOF_STATEMENT_MISMATCH));
     }
     if proof_state.bytes_written as usize != WotsAuthProof::ENCODED_LEN {
         return Err(ProgramError::InvalidAccountData);
@@ -1003,7 +1005,7 @@ pub fn process_rotate_authority_staged_data(
     let proof =
         WotsAuthProof::decode(&proof_state.proof_bytes).ok_or(ProgramError::InvalidAccountData)?;
     if proof.commitment() != proof_state.proof_commitment {
-        return Err(ProgramError::InvalidArgument);
+        return Err(ProgramError::Custom(error::PROOF_COMMITMENT_MISMATCH));
     }
 
     process_rotate_authority_data(vault_dst, authority_dst, statement, &proof, current_slot)?;
@@ -1083,40 +1085,72 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
             ProgramError::AccountAlreadyInitialized
         }
         transition::TransitionError::ReceiptMismatch => ProgramError::InvalidAccountData,
-        transition::TransitionError::ReceiptExpired => ProgramError::InvalidArgument,
-        transition::TransitionError::ReceiptNonceReplay => ProgramError::InvalidArgument,
-        transition::TransitionError::SessionExpired => ProgramError::InvalidArgument,
-        transition::TransitionError::AuthorityStatementExpired => ProgramError::InvalidArgument,
-        transition::TransitionError::VaultAuthorityMismatch => ProgramError::InvalidArgument,
-        transition::TransitionError::VaultPolicyMismatch => ProgramError::InvalidArgument,
+        transition::TransitionError::ReceiptExpired => ProgramError::Custom(error::RECEIPT_EXPIRED),
+        transition::TransitionError::ReceiptNonceReplay => {
+            ProgramError::Custom(error::RECEIPT_NONCE_REPLAY)
+        }
+        transition::TransitionError::SessionExpired => ProgramError::Custom(error::SESSION_EXPIRED),
+        transition::TransitionError::AuthorityStatementExpired => {
+            ProgramError::Custom(error::AUTHORITY_STATEMENT_EXPIRED)
+        }
+        transition::TransitionError::VaultAuthorityMismatch => {
+            ProgramError::Custom(error::VAULT_AUTHORITY_MISMATCH)
+        }
+        transition::TransitionError::VaultPolicyMismatch => {
+            ProgramError::Custom(error::VAULT_POLICY_MISMATCH)
+        }
         transition::TransitionError::VaultNotActive => ProgramError::InvalidAccountData,
         transition::TransitionError::VaultNotRecovery => ProgramError::InvalidAccountData,
         transition::TransitionError::VaultStatusInvalid => ProgramError::InvalidInstructionData,
         transition::TransitionError::VaultStatusTransitionNotAllowed => {
-            ProgramError::InvalidArgument
+            ProgramError::Custom(error::VAULT_STATUS_BAD_TRANSITION)
         }
-        transition::TransitionError::SessionPolicyMismatch => ProgramError::InvalidArgument,
-        transition::TransitionError::SessionMismatch => ProgramError::InvalidArgument,
+        transition::TransitionError::SessionPolicyMismatch => {
+            ProgramError::Custom(error::SESSION_POLICY_MISMATCH)
+        }
+        transition::TransitionError::SessionMismatch => {
+            ProgramError::Custom(error::SESSION_MISMATCH)
+        }
         transition::TransitionError::SessionNotPending => ProgramError::AccountAlreadyInitialized,
         transition::TransitionError::SessionNotReady => ProgramError::InvalidAccountData,
-        transition::TransitionError::SessionRequiresPqc => ProgramError::InvalidArgument,
-        transition::TransitionError::AuthorityNoOp => ProgramError::InvalidArgument,
-        transition::TransitionError::AuthoritySequenceMismatch => ProgramError::InvalidArgument,
-        transition::TransitionError::AuthorityLeafIndexMismatch => ProgramError::InvalidArgument,
-        transition::TransitionError::AuthorityActionMismatch => ProgramError::InvalidArgument,
-        transition::TransitionError::AuthorityProofInvalid => ProgramError::InvalidArgument,
-        transition::TransitionError::AuthorityProofMismatch => ProgramError::InvalidArgument,
-        transition::TransitionError::AuthorityMerkleRootMismatch => ProgramError::InvalidArgument,
-        transition::TransitionError::AuthorityTreeExhausted => ProgramError::InvalidArgument,
+        transition::TransitionError::SessionRequiresPqc => {
+            ProgramError::Custom(error::SESSION_REQUIRES_PQC)
+        }
+        transition::TransitionError::AuthorityNoOp => ProgramError::Custom(error::AUTHORITY_NO_OP),
+        transition::TransitionError::AuthoritySequenceMismatch => {
+            ProgramError::Custom(error::AUTHORITY_SEQUENCE_MISMATCH)
+        }
+        transition::TransitionError::AuthorityLeafIndexMismatch => {
+            ProgramError::Custom(error::AUTHORITY_LEAF_INDEX_MISMATCH)
+        }
+        transition::TransitionError::AuthorityActionMismatch => {
+            ProgramError::Custom(error::AUTHORITY_ACTION_MISMATCH)
+        }
+        transition::TransitionError::AuthorityProofInvalid => {
+            ProgramError::Custom(error::AUTHORITY_PROOF_INVALID)
+        }
+        transition::TransitionError::AuthorityProofMismatch => {
+            ProgramError::Custom(error::AUTHORITY_PROOF_MISMATCH)
+        }
+        transition::TransitionError::AuthorityMerkleRootMismatch => {
+            ProgramError::Custom(error::AUTHORITY_MERKLE_ROOT_MISMATCH)
+        }
+        transition::TransitionError::AuthorityTreeExhausted => {
+            ProgramError::Custom(error::AUTHORITY_TREE_EXHAUSTED)
+        }
         transition::TransitionError::QuantumVaultAmountTooLarge => ProgramError::InsufficientFunds,
         transition::TransitionError::QuantumVaultPdaMismatch => {
             ProgramError::MissingRequiredSignature
         }
-        transition::TransitionError::OrchestrationExpired => ProgramError::InvalidArgument,
+        transition::TransitionError::OrchestrationExpired => {
+            ProgramError::Custom(error::ORCHESTRATION_EXPIRED)
+        }
         transition::TransitionError::OrchestrationInvalidParams => {
             ProgramError::InvalidInstructionData
         }
-        transition::TransitionError::OrchestrationActionMismatch => ProgramError::InvalidArgument,
+        transition::TransitionError::OrchestrationActionMismatch => {
+            ProgramError::Custom(error::ORCHESTRATION_ACTION_MISMATCH)
+        }
         transition::TransitionError::OrchestrationNotPending => {
             ProgramError::AccountAlreadyInitialized
         }
@@ -1128,16 +1162,24 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::RecoveryVaultNotInRecoveryMode => {
             ProgramError::InvalidAccountData
         }
-        transition::TransitionError::RecoveryExpired => ProgramError::InvalidArgument,
-        transition::TransitionError::RecoveryNotPending => ProgramError::AccountAlreadyInitialized,
-        transition::TransitionError::RecoveryInvalidParams => {
-            ProgramError::InvalidInstructionData
+        transition::TransitionError::RecoveryExpired => {
+            ProgramError::Custom(error::RECOVERY_EXPIRED)
         }
-        transition::TransitionError::AuthorityMigrationNoOp => ProgramError::InvalidArgument,
-        transition::TransitionError::PolicyVersionNotMonotonic => ProgramError::InvalidArgument,
+        transition::TransitionError::RecoveryNotPending => ProgramError::AccountAlreadyInitialized,
+        transition::TransitionError::RecoveryInvalidParams => ProgramError::InvalidInstructionData,
+        transition::TransitionError::AuthorityMigrationNoOp => {
+            ProgramError::Custom(error::AUTHORITY_MIGRATION_NO_OP)
+        }
+        transition::TransitionError::PolicyVersionNotMonotonic => {
+            ProgramError::Custom(error::POLICY_VERSION_NOT_MONOTONIC)
+        }
         transition::TransitionError::TxBindingMissing => ProgramError::InvalidInstructionData,
-        transition::TransitionError::AuthorityStatementReplay => ProgramError::InvalidArgument,
-        transition::TransitionError::BridgedReceiptDelayNotMet => ProgramError::InvalidArgument,
+        transition::TransitionError::AuthorityStatementReplay => {
+            ProgramError::Custom(error::AUTHORITY_STATEMENT_REPLAY)
+        }
+        transition::TransitionError::BridgedReceiptDelayNotMet => {
+            ProgramError::Custom(error::BRIDGED_RECEIPT_DELAY_NOT_MET)
+        }
     }
 }
 
@@ -1299,9 +1341,8 @@ pub fn process_migrate_authority_data(
     if data.len() < QuantumAuthorityState::LEN {
         return Err(ProgramError::InvalidAccountData);
     }
-    let mut authority =
-        QuantumAuthorityState::decode(&data[..QuantumAuthorityState::LEN])
-            .ok_or(ProgramError::InvalidAccountData)?;
+    let mut authority = QuantumAuthorityState::decode(&data[..QuantumAuthorityState::LEN])
+        .ok_or(ProgramError::InvalidAccountData)?;
     require_discriminator(&authority.discriminator, &QUANTUM_STATE_DISCRIMINATOR)?;
 
     transition::migrate_authority_tree(&mut authority, new_authority_root)
@@ -1311,10 +1352,7 @@ pub fn process_migrate_authority_data(
     Ok(())
 }
 
-pub fn process_advance_policy_version_data(
-    data: &mut [u8],
-    new_version: u64,
-) -> ProgramResult {
+pub fn process_advance_policy_version_data(data: &mut [u8], new_version: u64) -> ProgramResult {
     use crate::state::{VaultRegistry, VAULT_REGISTRY_DISCRIMINATOR};
 
     if data.len() < VaultRegistry::LEN {
@@ -1324,8 +1362,7 @@ pub fn process_advance_policy_version_data(
         .ok_or(ProgramError::InvalidAccountData)?;
     require_discriminator(&vault.discriminator, &VAULT_REGISTRY_DISCRIMINATOR)?;
 
-    transition::advance_policy_version(&mut vault, new_version)
-        .map_err(map_transition_error)?;
+    transition::advance_policy_version(&mut vault, new_version).map_err(map_transition_error)?;
 
     vault.encode(&mut data[..VaultRegistry::LEN]);
     Ok(())
@@ -1351,13 +1388,13 @@ mod tests {
         process_finalize_session_data, process_init_authority_data,
         process_init_authority_proof_data, process_init_recovery_data,
         process_init_spend_orchestration_data, process_init_vault_data,
-        process_migrate_authority_data, process_open_session_data,
-        process_rotate_authority_data, process_rotate_authority_staged_data,
-        process_set_vault_status_data, process_split_quantum_vault,
-        process_stage_bridged_receipt_data, process_stage_receipt_data,
-        process_write_authority_proof_chunk_data,
+        process_migrate_authority_data, process_open_session_data, process_rotate_authority_data,
+        process_rotate_authority_staged_data, process_set_vault_status_data,
+        process_split_quantum_vault, process_stage_bridged_receipt_data,
+        process_stage_receipt_data, process_write_authority_proof_chunk_data,
     };
     use crate::{
+        error,
         instruction::{
             CommitSpendOrchestrationArgs, CompleteRecoveryArgs, CompleteSpendOrchestrationArgs,
             FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs,
@@ -1519,7 +1556,10 @@ mod tests {
         let error = process_set_vault_status_data(&mut bytes, VaultStatus::Active as u8)
             .expect_err("locked to active should fail");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(
+            error,
+            ProgramError::Custom(error::VAULT_STATUS_BAD_TRANSITION)
+        );
     }
 
     #[test]
@@ -1677,13 +1717,23 @@ mod tests {
         )
         .expect_err("authority proof chunk offset must be append-only");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(
+            error,
+            ProgramError::Custom(error::PROOF_CHUNK_OFFSET_MISMATCH)
+        );
     }
 
     #[test]
     fn stage_and_consume_receipt_updates_consumed_flag() {
         let receipt = sample_receipt();
-        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8, [0; 32]);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            [6; 32],
+            3,
+            crate::state::VaultStatus::Active,
+            8,
+            [0; 32],
+        );
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
 
@@ -1703,8 +1753,14 @@ mod tests {
     #[test]
     fn consume_receipt_rejects_replayed_nonce() {
         let receipt = sample_receipt();
-        let mut vault =
-            VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8, [0; 32]);
+        let mut vault = VaultRegistry::new(
+            [5; 32],
+            [6; 32],
+            3,
+            crate::state::VaultStatus::Active,
+            8,
+            [0; 32],
+        );
         vault.last_consumed_receipt_nonce = receipt.nonce;
         let staged = PolicyReceiptState::new(
             receipt.commitment(),
@@ -1720,7 +1776,7 @@ mod tests {
         let error = process_consume_receipt_data(&mut vault_bytes, &mut receipt_bytes, &receipt)
             .expect_err("replayed nonce should fail");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(error, ProgramError::Custom(error::RECEIPT_NONCE_REPLAY));
         let state = PolicyReceiptState::decode(&receipt_bytes).expect("state should decode");
         assert_eq!(state.consumed, 0);
     }
@@ -1728,7 +1784,14 @@ mod tests {
     #[test]
     fn stage_receipt_rejects_policy_mismatch() {
         let receipt = sample_receipt();
-        let vault = VaultRegistry::new([5; 32], [6; 32], 99, crate::state::VaultStatus::Active, 8, [0; 32]);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            [6; 32],
+            99,
+            crate::state::VaultStatus::Active,
+            8,
+            [0; 32],
+        );
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
 
@@ -1736,13 +1799,20 @@ mod tests {
         let error = process_stage_receipt_data(&vault_bytes, &mut receipt_bytes, &receipt, 10)
             .expect_err("policy mismatch should fail");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(error, ProgramError::Custom(error::VAULT_POLICY_MISMATCH));
     }
 
     #[test]
     fn stage_receipt_rejects_non_active_vault() {
         let receipt = sample_receipt();
-        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Locked, 8, [0; 32]);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            [6; 32],
+            3,
+            crate::state::VaultStatus::Locked,
+            8,
+            [0; 32],
+        );
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
 
@@ -1759,7 +1829,14 @@ mod tests {
             expiry_slot: 9,
             ..sample_receipt()
         };
-        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8, [0; 32]);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            [6; 32],
+            3,
+            crate::state::VaultStatus::Active,
+            8,
+            [0; 32],
+        );
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
 
@@ -1767,14 +1844,20 @@ mod tests {
         let error = process_stage_receipt_data(&vault_bytes, &mut receipt_bytes, &receipt, 10)
             .expect_err("expired receipt should fail");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(error, ProgramError::Custom(error::RECEIPT_EXPIRED));
     }
 
     #[test]
     fn stage_receipt_rejects_replayed_nonce() {
         let receipt = sample_receipt();
-        let mut vault =
-            VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8, [0; 32]);
+        let mut vault = VaultRegistry::new(
+            [5; 32],
+            [6; 32],
+            3,
+            crate::state::VaultStatus::Active,
+            8,
+            [0; 32],
+        );
         vault.last_consumed_receipt_nonce = receipt.nonce;
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
@@ -1783,7 +1866,7 @@ mod tests {
         let error = process_stage_receipt_data(&vault_bytes, &mut receipt_bytes, &receipt, 10)
             .expect_err("replayed nonce should fail stage");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(error, ProgramError::Custom(error::RECEIPT_NONCE_REPLAY));
     }
 
     #[test]
@@ -1796,7 +1879,7 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-             8,
+            8,
             [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
@@ -1826,7 +1909,7 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-             8,
+            8,
             [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
@@ -1865,7 +1948,7 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-             8,
+            8,
             [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
@@ -1904,7 +1987,7 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-             8,
+            8,
             [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
@@ -1929,7 +2012,10 @@ mod tests {
         )
         .expect_err("staged rotation should reject mismatched proof commitment");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(
+            error,
+            ProgramError::Custom(error::PROOF_COMMITMENT_MISMATCH)
+        );
     }
 
     #[test]
@@ -1942,7 +2028,7 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-             8,
+            8,
             [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
@@ -1960,7 +2046,7 @@ mod tests {
         )
         .expect_err("mismatched vault and authority should fail");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(error, ProgramError::Custom(error::VAULT_AUTHORITY_MISMATCH));
     }
 
     #[test]
@@ -1973,7 +2059,7 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-             8,
+            8,
             [0; 32],
         );
         let statement = sample_rotation_statement(&vault, secret.authority_hash(), 0, 200);
@@ -1991,7 +2077,7 @@ mod tests {
         )
         .expect_err("no-op authority rotation should fail");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(error, ProgramError::Custom(error::AUTHORITY_NO_OP));
     }
 
     #[test]
@@ -2004,7 +2090,7 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-             8,
+            8,
             [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 9);
@@ -2022,7 +2108,10 @@ mod tests {
         )
         .expect_err("expired authority statement should fail");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(
+            error,
+            ProgramError::Custom(error::AUTHORITY_STATEMENT_EXPIRED)
+        );
     }
 
     #[test]
@@ -2035,7 +2124,7 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Active,
-             8,
+            8,
             [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
@@ -2066,7 +2155,7 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-             8,
+            8,
             [0; 32],
         );
         let statement = vaulkyrie_protocol::AuthorityRotationStatement {
@@ -2089,7 +2178,10 @@ mod tests {
         )
         .expect_err("rotation should require rekey-bound action hash");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(
+            error,
+            ProgramError::Custom(error::AUTHORITY_ACTION_MISMATCH)
+        );
     }
 
     #[test]
@@ -2102,7 +2194,7 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-             8,
+            8,
             [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
@@ -2121,7 +2213,7 @@ mod tests {
         )
         .expect_err("tampered proof should fail");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(error, ProgramError::Custom(error::AUTHORITY_PROOF_INVALID));
     }
 
     #[test]
@@ -2134,7 +2226,7 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-             8,
+            8,
             [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
@@ -2152,7 +2244,10 @@ mod tests {
         )
         .expect_err("rotation should require the next expected leaf index");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(
+            error,
+            ProgramError::Custom(error::AUTHORITY_LEAF_INDEX_MISMATCH)
+        );
     }
 
     #[test]
@@ -2165,7 +2260,7 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-             8,
+            8,
             [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], XMSS_LEAF_COUNT as u64, 200);
@@ -2187,7 +2282,7 @@ mod tests {
         )
         .expect_err("rotation should fail once the authority tree is exhausted");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(error, ProgramError::Custom(error::AUTHORITY_TREE_EXHAUSTED));
     }
 
     #[test]
@@ -2264,7 +2359,7 @@ mod tests {
         let error = process_activate_session_data(&mut bytes, [9; 32], 10, receipt.policy_version)
             .expect_err("wrong action hash should fail");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(error, ProgramError::Custom(error::SESSION_MISMATCH));
     }
 
     #[test]
@@ -2285,7 +2380,7 @@ mod tests {
         let error = process_activate_session_data(&mut bytes, receipt.action_hash, 10, 99)
             .expect_err("policy mismatch should fail");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(error, ProgramError::Custom(error::POLICY_VERSION_MISMATCH));
     }
 
     #[test]
@@ -2314,7 +2409,7 @@ mod tests {
         )
         .expect_err("pqc-only threshold should reject spend activation");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(error, ProgramError::Custom(error::SESSION_REQUIRES_PQC));
     }
 
     #[test]
@@ -2336,7 +2431,7 @@ mod tests {
         let error = process_open_session_data(&receipt_bytes, &mut session_bytes, &receipt, 10)
             .expect_err("expired receipt should not open a session");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(error, ProgramError::Custom(error::RECEIPT_EXPIRED));
     }
 
     #[test]
@@ -2432,7 +2527,7 @@ mod tests {
         )
         .expect_err("pqc-only threshold should reject spend consumption");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(error, ProgramError::Custom(error::SESSION_REQUIRES_PQC));
     }
 
     #[test]
@@ -2444,7 +2539,14 @@ mod tests {
             receipt.nonce,
             receipt.expiry_slot,
         );
-        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8, [0; 32]);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            [6; 32],
+            3,
+            crate::state::VaultStatus::Active,
+            8,
+            [0; 32],
+        );
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
         let mut session_bytes = [0; ActionSessionState::LEN];
@@ -2489,7 +2591,14 @@ mod tests {
             receipt.nonce,
             receipt.expiry_slot,
         );
-        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8, [0; 32]);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            [6; 32],
+            3,
+            crate::state::VaultStatus::Active,
+            8,
+            [0; 32],
+        );
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
         let mut session_bytes = [0; ActionSessionState::LEN];
@@ -2523,7 +2632,14 @@ mod tests {
             receipt.nonce,
             receipt.expiry_slot,
         );
-        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8, [0; 32]);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            [6; 32],
+            3,
+            crate::state::VaultStatus::Active,
+            8,
+            [0; 32],
+        );
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
         let mut session_bytes = [0; ActionSessionState::LEN];
@@ -2549,7 +2665,7 @@ mod tests {
         )
         .expect_err("pqc-only threshold should reject spend finalization");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(error, ProgramError::Custom(error::SESSION_REQUIRES_PQC));
     }
 
     #[test]
@@ -2561,8 +2677,14 @@ mod tests {
             receipt.nonce,
             receipt.expiry_slot,
         );
-        let mut vault =
-            VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8, [0; 32]);
+        let mut vault = VaultRegistry::new(
+            [5; 32],
+            [6; 32],
+            3,
+            crate::state::VaultStatus::Active,
+            8,
+            [0; 32],
+        );
         vault.last_consumed_receipt_nonce = receipt.nonce;
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
@@ -2590,7 +2712,7 @@ mod tests {
         )
         .expect_err("replayed nonce should fail finalize");
 
-        assert_eq!(error, ProgramError::InvalidArgument);
+        assert_eq!(error, ProgramError::Custom(error::RECEIPT_NONCE_REPLAY));
     }
 
     #[test]
@@ -2891,7 +3013,7 @@ mod tests {
         };
         let err = process_init_spend_orchestration_data(&mut buf, args, 100)
             .expect_err("already expired must fail");
-        assert_eq!(err, ProgramError::InvalidArgument);
+        assert_eq!(err, ProgramError::Custom(error::ORCHESTRATION_EXPIRED));
     }
 
     #[test]
@@ -2901,8 +3023,7 @@ mod tests {
             action_hash: [1; 32],
             signing_package_hash: [4; 32],
         };
-        process_commit_spend_orchestration_data(&mut buf, args, 20)
-            .expect("commit should succeed");
+        process_commit_spend_orchestration_data(&mut buf, args, 20).expect("commit should succeed");
         let state = SpendOrchestrationState::decode(&buf).expect("decode");
         assert_eq!(state.status, OrchestrationStatus::Committed as u8);
     }
@@ -2916,7 +3037,10 @@ mod tests {
         };
         let err = process_commit_spend_orchestration_data(&mut buf, args, 20)
             .expect_err("wrong action hash must fail");
-        assert_eq!(err, ProgramError::InvalidArgument);
+        assert_eq!(
+            err,
+            ProgramError::Custom(error::ORCHESTRATION_ACTION_MISMATCH)
+        );
     }
 
     #[test]
@@ -2928,7 +3052,7 @@ mod tests {
         };
         let err = process_commit_spend_orchestration_data(&mut buf, args, 2000)
             .expect_err("expired commit must fail");
-        assert_eq!(err, ProgramError::InvalidArgument);
+        assert_eq!(err, ProgramError::Custom(error::ORCHESTRATION_EXPIRED));
     }
 
     #[test]
@@ -2975,8 +3099,7 @@ mod tests {
             action_hash: [1; 32],
             reason_code: 1,
         };
-        process_fail_spend_orchestration_data(&mut buf, args)
-            .expect("fail should succeed");
+        process_fail_spend_orchestration_data(&mut buf, args).expect("fail should succeed");
         let state = SpendOrchestrationState::decode(&buf).expect("decode");
         assert_eq!(state.status, OrchestrationStatus::Failed as u8);
     }
@@ -2990,7 +3113,10 @@ mod tests {
         };
         let err = process_fail_spend_orchestration_data(&mut buf, args)
             .expect_err("wrong action hash must fail");
-        assert_eq!(err, ProgramError::InvalidArgument);
+        assert_eq!(
+            err,
+            ProgramError::Custom(error::ORCHESTRATION_ACTION_MISMATCH)
+        );
     }
 
     #[test]
@@ -3036,8 +3162,7 @@ mod tests {
             statement_digest: [0xBB; 32],
             proof_commitment: [0xCC; 32],
         };
-        process_init_authority_proof_data(&mut buf, args)
-            .expect("init proof should succeed");
+        process_init_authority_proof_data(&mut buf, args).expect("init proof should succeed");
 
         let chunk_size = AUTHORITY_PROOF_CHUNK_MAX_BYTES;
         let total = WotsAuthProof::ENCODED_LEN;
@@ -3097,7 +3222,10 @@ mod tests {
             },
         )
         .expect_err("gap in offset must fail");
-        assert_eq!(err, ProgramError::InvalidArgument);
+        assert_eq!(
+            err,
+            ProgramError::Custom(error::PROOF_CHUNK_OFFSET_MISMATCH)
+        );
     }
 
     // ── Bridged Receipt Replay Prevention ────────────────────────────────────
@@ -3179,9 +3307,8 @@ mod tests {
         let args = sample_init_recovery_args();
         process_init_recovery_data(&mut buf, args, VaultStatus::Recovery as u8, 100).unwrap();
 
-        let err =
-            process_init_recovery_data(&mut buf, args, VaultStatus::Recovery as u8, 100)
-                .expect_err("double init must fail");
+        let err = process_init_recovery_data(&mut buf, args, VaultStatus::Recovery as u8, 100)
+            .expect_err("double init must fail");
         assert_eq!(err, ProgramError::AccountAlreadyInitialized);
     }
 
@@ -3218,7 +3345,7 @@ mod tests {
         args.expiry_slot = 50;
         let err = process_init_recovery_data(&mut buf, args, VaultStatus::Recovery as u8, 100)
             .expect_err("recovery must not be already expired");
-        assert_eq!(err, ProgramError::InvalidArgument);
+        assert_eq!(err, ProgramError::Custom(error::RECOVERY_EXPIRED));
     }
 
     #[test]
@@ -3262,7 +3389,7 @@ mod tests {
         };
         let err = process_complete_recovery_data(&mut buf, args, 5000)
             .expect_err("completion must fail when expired");
-        assert_eq!(err, ProgramError::InvalidArgument);
+        assert_eq!(err, ProgramError::Custom(error::RECOVERY_EXPIRED));
     }
 
     #[test]
@@ -3316,7 +3443,7 @@ mod tests {
         let mut buf = make_authority_buffer(0);
         let err = process_migrate_authority_data(&mut buf, [9; 32])
             .expect_err("migration on fresh tree is a no-op");
-        assert_eq!(err, ProgramError::InvalidArgument);
+        assert_eq!(err, ProgramError::Custom(error::AUTHORITY_MIGRATION_NO_OP));
     }
 
     #[test]
@@ -3350,7 +3477,10 @@ mod tests {
         let mut buf = make_active_vault_buffer();
         let err = process_advance_policy_version_data(&mut buf, 12)
             .expect_err("skipping versions must fail");
-        assert_eq!(err, ProgramError::InvalidArgument);
+        assert_eq!(
+            err,
+            ProgramError::Custom(error::POLICY_VERSION_NOT_MONOTONIC)
+        );
     }
 
     #[test]
@@ -3358,8 +3488,8 @@ mod tests {
         let mut buf = vec![0u8; VaultRegistry::LEN];
         // Write discriminator but leave status = 0 (not Active)
         buf[..8].copy_from_slice(&VAULT_REGISTRY_DISCRIMINATOR);
-        let err = process_advance_policy_version_data(&mut buf, 1)
-            .expect_err("inactive vault must fail");
+        let err =
+            process_advance_policy_version_data(&mut buf, 1).expect_err("inactive vault must fail");
         assert_eq!(err, ProgramError::InvalidAccountData);
     }
 

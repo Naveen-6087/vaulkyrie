@@ -4,6 +4,7 @@ use pinocchio::{account_info::AccountInfo, pubkey::Pubkey, ProgramResult};
 #[cfg(feature = "bpf-entrypoint")]
 use pinocchio::{default_allocator, default_panic_handler, program_entrypoint};
 
+pub mod error;
 pub mod instruction;
 pub mod pda;
 pub mod processor;
