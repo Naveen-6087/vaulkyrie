@@ -1180,8 +1180,11 @@ mod tests {
 
     use super::{
         ensure_wallet_authority, process_activate_session_data, process_close_quantum_vault,
-        process_consume_receipt_data, process_consume_session_data, process_finalize_session_data,
-        process_init_authority_data, process_init_authority_proof_data, process_init_vault_data,
+        process_commit_spend_orchestration_data, process_complete_spend_orchestration_data,
+        process_consume_receipt_data, process_consume_session_data,
+        process_fail_spend_orchestration_data, process_finalize_session_data,
+        process_init_authority_data, process_init_authority_proof_data,
+        process_init_spend_orchestration_data, process_init_vault_data,
         process_open_session_data, process_rotate_authority_data,
         process_rotate_authority_staged_data, process_set_vault_status_data,
         process_split_quantum_vault, process_stage_bridged_receipt_data, process_stage_receipt_data,
@@ -1189,11 +1192,14 @@ mod tests {
     };
     use crate::{
         instruction::{
-            InitAuthorityArgs, InitAuthorityProofArgs, InitVaultArgs, WriteAuthorityProofChunkArgs,
+            CommitSpendOrchestrationArgs, CompleteSpendOrchestrationArgs,
+            FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs,
+            InitSpendOrchestrationArgs, InitVaultArgs, WriteAuthorityProofChunkArgs,
         },
         state::{
-            ActionSessionState, AuthorityProofState, PolicyReceiptState, QuantumAuthorityState,
-            SessionStatus, VaultRegistry, VaultStatus, ACTION_SESSION_DISCRIMINATOR,
+            ActionSessionState, AuthorityProofState, OrchestrationStatus, PolicyReceiptState,
+            QuantumAuthorityState, SessionStatus, SpendOrchestrationState, VaultRegistry,
+            VaultStatus, ACTION_SESSION_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR,
         },
     };
 
@@ -2633,5 +2639,310 @@ mod tests {
         )
         .expect_err("should reject mismatched commitment");
         assert_eq!(err, ProgramError::InvalidAccountData);
+    }
+
+    // ── Spend Orchestration Processor Tests ──────────────────────────────────
+
+    fn sample_init_spend_args() -> InitSpendOrchestrationArgs {
+        InitSpendOrchestrationArgs {
+            action_hash: [1; 32],
+            session_commitment: [2; 32],
+            signers_commitment: [3; 32],
+            signing_package_hash: [4; 32],
+            expiry_slot: 1000,
+            threshold: 2,
+            participant_count: 3,
+            bump: 255,
+        }
+    }
+
+    fn init_spend_orch_buf(current_slot: u64) -> Vec<u8> {
+        let args = sample_init_spend_args();
+        let mut buf = vec![0u8; SpendOrchestrationState::LEN];
+        process_init_spend_orchestration_data(&mut buf, args, current_slot)
+            .expect("init should succeed");
+        buf
+    }
+
+    #[test]
+    fn init_spend_orchestration_writes_discriminator_and_pending_status() {
+        let buf = init_spend_orch_buf(10);
+        let state = SpendOrchestrationState::decode(&buf).expect("decode");
+        assert_eq!(state.discriminator, SPEND_ORCH_DISCRIMINATOR);
+        assert_eq!(state.status, OrchestrationStatus::Pending as u8);
+        assert_eq!(state.action_hash, [1; 32]);
+        assert_eq!(state.session_commitment, [2; 32]);
+        assert_eq!(state.threshold, 2);
+        assert_eq!(state.participant_count, 3);
+        assert_eq!(state.bump, 255);
+    }
+
+    #[test]
+    fn init_spend_orchestration_rejects_already_initialized() {
+        let mut buf = init_spend_orch_buf(10);
+        let args = sample_init_spend_args();
+        let err = process_init_spend_orchestration_data(&mut buf, args, 10)
+            .expect_err("double init must fail");
+        assert_eq!(err, ProgramError::AccountAlreadyInitialized);
+    }
+
+    #[test]
+    fn init_spend_orchestration_rejects_undersized_buffer() {
+        let mut buf = vec![0u8; SpendOrchestrationState::LEN - 1];
+        let args = sample_init_spend_args();
+        let err = process_init_spend_orchestration_data(&mut buf, args, 10)
+            .expect_err("short buffer must fail");
+        assert_eq!(err, ProgramError::InvalidAccountData);
+    }
+
+    #[test]
+    fn init_spend_orchestration_rejects_already_expired() {
+        let mut buf = vec![0u8; SpendOrchestrationState::LEN];
+        let args = InitSpendOrchestrationArgs {
+            expiry_slot: 5,
+            ..sample_init_spend_args()
+        };
+        let err = process_init_spend_orchestration_data(&mut buf, args, 100)
+            .expect_err("already expired must fail");
+        assert_eq!(err, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn commit_spend_orchestration_transitions_to_committed() {
+        let mut buf = init_spend_orch_buf(10);
+        let args = CommitSpendOrchestrationArgs {
+            action_hash: [1; 32],
+            signing_package_hash: [4; 32],
+        };
+        process_commit_spend_orchestration_data(&mut buf, args, 20)
+            .expect("commit should succeed");
+        let state = SpendOrchestrationState::decode(&buf).expect("decode");
+        assert_eq!(state.status, OrchestrationStatus::Committed as u8);
+    }
+
+    #[test]
+    fn commit_spend_orchestration_rejects_wrong_action_hash() {
+        let mut buf = init_spend_orch_buf(10);
+        let args = CommitSpendOrchestrationArgs {
+            action_hash: [99; 32],
+            signing_package_hash: [4; 32],
+        };
+        let err = process_commit_spend_orchestration_data(&mut buf, args, 20)
+            .expect_err("wrong action hash must fail");
+        assert_eq!(err, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn commit_spend_orchestration_rejects_expired_session() {
+        let mut buf = init_spend_orch_buf(10);
+        let args = CommitSpendOrchestrationArgs {
+            action_hash: [1; 32],
+            signing_package_hash: [4; 32],
+        };
+        let err = process_commit_spend_orchestration_data(&mut buf, args, 2000)
+            .expect_err("expired commit must fail");
+        assert_eq!(err, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn complete_spend_orchestration_transitions_to_complete() {
+        let mut buf = init_spend_orch_buf(10);
+        // First commit
+        process_commit_spend_orchestration_data(
+            &mut buf,
+            CommitSpendOrchestrationArgs {
+                action_hash: [1; 32],
+                signing_package_hash: [4; 32],
+            },
+            20,
+        )
+        .expect("commit");
+        // Then complete
+        let args = CompleteSpendOrchestrationArgs {
+            action_hash: [1; 32],
+        };
+        process_complete_spend_orchestration_data(&mut buf, args, 30)
+            .expect("complete should succeed");
+        let state = SpendOrchestrationState::decode(&buf).expect("decode");
+        assert_eq!(state.status, OrchestrationStatus::Complete as u8);
+    }
+
+    #[test]
+    fn complete_spend_orchestration_rejects_if_not_committed() {
+        let mut buf = init_spend_orch_buf(10);
+        let args = CompleteSpendOrchestrationArgs {
+            action_hash: [1; 32],
+        };
+        let err = process_complete_spend_orchestration_data(&mut buf, args, 20)
+            .expect_err("complete on pending must fail");
+        assert_eq!(err, ProgramError::InvalidAccountData);
+    }
+
+    #[test]
+    fn fail_spend_orchestration_transitions_to_failed() {
+        let mut buf = init_spend_orch_buf(10);
+        let args = FailSpendOrchestrationArgs {
+            action_hash: [1; 32],
+            reason_code: 1,
+        };
+        process_fail_spend_orchestration_data(&mut buf, args)
+            .expect("fail should succeed");
+        let state = SpendOrchestrationState::decode(&buf).expect("decode");
+        assert_eq!(state.status, OrchestrationStatus::Failed as u8);
+    }
+
+    #[test]
+    fn fail_spend_orchestration_rejects_wrong_action_hash() {
+        let mut buf = init_spend_orch_buf(10);
+        let args = FailSpendOrchestrationArgs {
+            action_hash: [88; 32],
+            reason_code: 1,
+        };
+        let err = process_fail_spend_orchestration_data(&mut buf, args)
+            .expect_err("wrong action hash must fail");
+        assert_eq!(err, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn fail_spend_orchestration_rejects_already_complete() {
+        let mut buf = init_spend_orch_buf(10);
+        // Commit then complete
+        process_commit_spend_orchestration_data(
+            &mut buf,
+            CommitSpendOrchestrationArgs {
+                action_hash: [1; 32],
+                signing_package_hash: [4; 32],
+            },
+            20,
+        )
+        .expect("commit");
+        process_complete_spend_orchestration_data(
+            &mut buf,
+            CompleteSpendOrchestrationArgs {
+                action_hash: [1; 32],
+            },
+            25,
+        )
+        .expect("complete");
+        // Try to fail a completed session
+        let err = process_fail_spend_orchestration_data(
+            &mut buf,
+            FailSpendOrchestrationArgs {
+                action_hash: [1; 32],
+                reason_code: 1,
+            },
+        )
+        .expect_err("fail on complete must error");
+        assert_eq!(err, ProgramError::AccountAlreadyInitialized);
+    }
+
+    // ── Multi-chunk Authority Proof Assembly ─────────────────────────────────
+
+    #[test]
+    fn multi_chunk_proof_assembly_fills_entire_buffer() {
+        let mut buf = [0u8; AuthorityProofState::LEN];
+        let args = InitAuthorityProofArgs {
+            statement_digest: [0xBB; 32],
+            proof_commitment: [0xCC; 32],
+        };
+        process_init_authority_proof_data(&mut buf, args)
+            .expect("init proof should succeed");
+
+        let chunk_size = AUTHORITY_PROOF_CHUNK_MAX_BYTES;
+        let total = WotsAuthProof::ENCODED_LEN;
+        let mut offset = 0u32;
+
+        while (offset as usize) < total {
+            let remaining = total - offset as usize;
+            let len = remaining.min(chunk_size);
+            let mut chunk = [0u8; AUTHORITY_PROOF_CHUNK_MAX_BYTES];
+            for b in chunk[..len].iter_mut() {
+                *b = 0xAA;
+            }
+            let args = WriteAuthorityProofChunkArgs {
+                offset,
+                chunk_len: len as u16,
+                chunk,
+            };
+            process_write_authority_proof_chunk_data(&mut buf, args)
+                .expect("chunk write should succeed");
+            offset += len as u32;
+        }
+
+        let state = AuthorityProofState::decode(&buf).expect("decode proof state");
+        assert_eq!(state.bytes_written as usize, total);
+    }
+
+    #[test]
+    fn multi_chunk_proof_rejects_gap_in_offset() {
+        let mut buf = [0u8; AuthorityProofState::LEN];
+        let args = InitAuthorityProofArgs {
+            statement_digest: [0xDD; 32],
+            proof_commitment: [0xEE; 32],
+        };
+        process_init_authority_proof_data(&mut buf, args).expect("init");
+
+        // Write first chunk at offset 0
+        let mut chunk = [0u8; AUTHORITY_PROOF_CHUNK_MAX_BYTES];
+        chunk.fill(0xAA);
+        process_write_authority_proof_chunk_data(
+            &mut buf,
+            WriteAuthorityProofChunkArgs {
+                offset: 0,
+                chunk_len: AUTHORITY_PROOF_CHUNK_MAX_BYTES as u16,
+                chunk,
+            },
+        )
+        .expect("first chunk");
+
+        // Skip to offset 2048 (gap!)
+        let gap_chunk = [0u8; AUTHORITY_PROOF_CHUNK_MAX_BYTES];
+        let err = process_write_authority_proof_chunk_data(
+            &mut buf,
+            WriteAuthorityProofChunkArgs {
+                offset: 2048,
+                chunk_len: 128,
+                chunk: gap_chunk,
+            },
+        )
+        .expect_err("gap in offset must fail");
+        assert_eq!(err, ProgramError::InvalidArgument);
+    }
+
+    // ── Bridged Receipt Replay Prevention ────────────────────────────────────
+
+    #[test]
+    fn stage_bridged_receipt_rejects_double_init() {
+        let receipt = PolicyReceipt {
+            action_hash: [7; 32],
+            policy_version: 5,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 3,
+            expiry_slot: 9999,
+        };
+        let vault_bytes = sample_vault_bytes_for_receipt(&receipt);
+        let eval_bytes = make_finalized_eval_bytes_for_receipt(&receipt);
+        let mut receipt_buf = vec![0u8; PolicyReceiptState::LEN];
+
+        // First staging succeeds
+        process_stage_bridged_receipt_data(
+            &vault_bytes,
+            &mut receipt_buf,
+            &eval_bytes,
+            &receipt,
+            100,
+        )
+        .expect("first staging should succeed");
+
+        // Second staging must fail because the buffer is no longer zeroed
+        let err = process_stage_bridged_receipt_data(
+            &vault_bytes,
+            &mut receipt_buf,
+            &eval_bytes,
+            &receipt,
+            100,
+        )
+        .expect_err("double staging must fail");
+        assert_eq!(err, ProgramError::AccountAlreadyInitialized);
     }
 }
