@@ -1,8 +1,11 @@
 use pinocchio::program_error::ProgramError;
+use solana_winternitz::signature::WinternitzSignature;
 use vaulkyrie_protocol::{
     AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement, WotsAuthProof,
     AUTHORITY_PROOF_CHUNK_MAX_BYTES,
 };
+
+pub const WINTERNITZ_SIGNATURE_BYTES: usize = core::mem::size_of::<WinternitzSignature>();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitVaultArgs {
@@ -21,9 +24,33 @@ pub struct InitAuthorityArgs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitQuantumVaultArgs {
-    pub current_authority_hash: [u8; 32],
-    pub current_authority_root: [u8; 32],
+    pub hash: [u8; 32],
     pub bump: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitQuantumVaultArgs {
+    pub signature: [u8; WINTERNITZ_SIGNATURE_BYTES],
+    pub amount: u64,
+    pub bump: u8,
+}
+
+impl SplitQuantumVaultArgs {
+    pub fn signature(&self) -> WinternitzSignature {
+        WinternitzSignature::from(self.signature)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseQuantumVaultArgs {
+    pub signature: [u8; WINTERNITZ_SIGNATURE_BYTES],
+    pub bump: u8,
+}
+
+impl CloseQuantumVaultArgs {
+    pub fn signature(&self) -> WinternitzSignature {
+        WinternitzSignature::from(self.signature)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,8 +95,8 @@ pub enum CoreInstruction {
     InitAuthorityProof(InitAuthorityProofArgs),
     WriteAuthorityProofChunk(WriteAuthorityProofChunkArgs),
     RotateAuthorityStaged(AuthorityRotationStatement),
-    SplitQuantumVault { proof: WotsAuthProof, amount: u64 },
-    CloseQuantumVault(WotsAuthProof),
+    SplitQuantumVault(SplitQuantumVaultArgs),
+    CloseQuantumVault(CloseQuantumVaultArgs),
 }
 
 impl TryFrom<&[u8]> for CoreInstruction {
@@ -96,13 +123,8 @@ impl TryFrom<&[u8]> for CoreInstruction {
             [14, rest @ ..] => Ok(Self::RotateAuthorityStaged(
                 parse_authority_rotation_statement(rest)?,
             )),
-            [15, rest @ ..] => {
-                let (proof, amount) = parse_split_quantum_vault(rest)?;
-                Ok(Self::SplitQuantumVault { proof, amount })
-            }
-            [16, rest @ ..] => Ok(Self::CloseQuantumVault(
-                WotsAuthProof::decode(rest).ok_or(ProgramError::InvalidInstructionData)?,
-            )),
+            [15, rest @ ..] => Ok(Self::SplitQuantumVault(parse_split_quantum_vault(rest)?)),
+            [16, rest @ ..] => Ok(Self::CloseQuantumVault(parse_close_quantum_vault(rest)?)),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -167,20 +189,16 @@ fn parse_init_authority(data: &[u8]) -> Result<InitAuthorityArgs, ProgramError> 
 }
 
 fn parse_init_quantum_vault(data: &[u8]) -> Result<InitQuantumVaultArgs, ProgramError> {
-    if data.len() != 65 {
+    if data.len() != 33 {
         return Err(ProgramError::InvalidInstructionData);
     }
 
-    let mut current_authority_hash = [0; 32];
-    current_authority_hash.copy_from_slice(&data[..32]);
-
-    let mut current_authority_root = [0; 32];
-    current_authority_root.copy_from_slice(&data[32..64]);
+    let mut hash = [0; 32];
+    hash.copy_from_slice(&data[..32]);
 
     Ok(InitQuantumVaultArgs {
-        current_authority_hash,
-        current_authority_root,
-        bump: data[64],
+        hash,
+        bump: data[32],
     })
 }
 
@@ -300,24 +318,44 @@ fn parse_write_authority_proof_chunk(
     })
 }
 
-fn parse_split_quantum_vault(data: &[u8]) -> Result<(WotsAuthProof, u64), ProgramError> {
-    if data.len() != WotsAuthProof::ENCODED_LEN + 8 {
+fn parse_split_quantum_vault(data: &[u8]) -> Result<SplitQuantumVaultArgs, ProgramError> {
+    if data.len() != WINTERNITZ_SIGNATURE_BYTES + 8 + 1 {
         return Err(ProgramError::InvalidInstructionData);
     }
 
-    let proof = WotsAuthProof::decode(&data[..WotsAuthProof::ENCODED_LEN])
-        .ok_or(ProgramError::InvalidInstructionData)?;
-    let mut amount = [0; 8];
-    amount.copy_from_slice(&data[WotsAuthProof::ENCODED_LEN..]);
+    let mut signature = [0; WINTERNITZ_SIGNATURE_BYTES];
+    signature.copy_from_slice(&data[..WINTERNITZ_SIGNATURE_BYTES]);
 
-    Ok((proof, u64::from_le_bytes(amount)))
+    let mut amount = [0; 8];
+    amount.copy_from_slice(&data[WINTERNITZ_SIGNATURE_BYTES..WINTERNITZ_SIGNATURE_BYTES + 8]);
+
+    Ok(SplitQuantumVaultArgs {
+        signature,
+        amount: u64::from_le_bytes(amount),
+        bump: data[WINTERNITZ_SIGNATURE_BYTES + 8],
+    })
+}
+
+fn parse_close_quantum_vault(data: &[u8]) -> Result<CloseQuantumVaultArgs, ProgramError> {
+    if data.len() != WINTERNITZ_SIGNATURE_BYTES + 1 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut signature = [0; WINTERNITZ_SIGNATURE_BYTES];
+    signature.copy_from_slice(&data[..WINTERNITZ_SIGNATURE_BYTES]);
+
+    Ok(CloseQuantumVaultArgs {
+        signature,
+        bump: data[WINTERNITZ_SIGNATURE_BYTES],
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CoreInstruction, InitAuthorityArgs, InitAuthorityProofArgs, InitQuantumVaultArgs,
-        InitVaultArgs, RotateAuthorityArgs, WriteAuthorityProofChunkArgs,
+        CloseQuantumVaultArgs, CoreInstruction, InitAuthorityArgs, InitAuthorityProofArgs,
+        InitQuantumVaultArgs, InitVaultArgs, RotateAuthorityArgs, SplitQuantumVaultArgs,
+        WriteAuthorityProofChunkArgs, WINTERNITZ_SIGNATURE_BYTES,
     };
     use pinocchio::program_error::ProgramError;
     use vaulkyrie_protocol::{
@@ -595,14 +633,12 @@ mod tests {
     fn parses_init_quantum_vault_instruction() {
         let mut data = vec![3];
         data.extend_from_slice(&[7; 32]);
-        data.extend_from_slice(&[8; 32]);
         data.push(4);
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
             Ok(CoreInstruction::InitQuantumVault(InitQuantumVaultArgs {
-                current_authority_hash: [7; 32],
-                current_authority_root: [8; 32],
+                hash: [7; 32],
                 bump: 4,
             }))
         );
@@ -610,42 +646,37 @@ mod tests {
 
     #[test]
     fn parses_split_quantum_vault_instruction() {
-        let proof = WotsAuthProof {
-            public_key: [1; WOTS_KEY_BYTES],
-            signature: [2; WOTS_KEY_BYTES],
-            leaf_index: 3,
-            auth_path: [4; XMSS_AUTH_PATH_BYTES],
-        };
-        let mut proof_bytes = [0u8; WotsAuthProof::ENCODED_LEN];
-        assert!(proof.encode(&mut proof_bytes));
+        let signature = [1; WINTERNITZ_SIGNATURE_BYTES];
 
         let mut data = vec![15];
-        data.extend_from_slice(&proof_bytes);
+        data.extend_from_slice(&signature);
         data.extend_from_slice(&42u64.to_le_bytes());
+        data.push(5);
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
-            Ok(CoreInstruction::SplitQuantumVault { proof, amount: 42 })
+            Ok(CoreInstruction::SplitQuantumVault(SplitQuantumVaultArgs {
+                signature,
+                amount: 42,
+                bump: 5,
+            }))
         );
     }
 
     #[test]
     fn parses_close_quantum_vault_instruction() {
-        let proof = WotsAuthProof {
-            public_key: [1; WOTS_KEY_BYTES],
-            signature: [2; WOTS_KEY_BYTES],
-            leaf_index: 3,
-            auth_path: [4; XMSS_AUTH_PATH_BYTES],
-        };
-        let mut proof_bytes = [0u8; WotsAuthProof::ENCODED_LEN];
-        assert!(proof.encode(&mut proof_bytes));
+        let signature = [1; WINTERNITZ_SIGNATURE_BYTES];
 
         let mut data = vec![16];
-        data.extend_from_slice(&proof_bytes);
+        data.extend_from_slice(&signature);
+        data.push(6);
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
-            Ok(CoreInstruction::CloseQuantumVault(proof))
+            Ok(CoreInstruction::CloseQuantumVault(CloseQuantumVaultArgs {
+                signature,
+                bump: 6,
+            }))
         );
     }
 }

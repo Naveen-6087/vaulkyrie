@@ -6,7 +6,6 @@ pub const POLICY_RECEIPT_DISCRIMINATOR: [u8; 8] = *b"POLRCPT1";
 pub const ACTION_SESSION_DISCRIMINATOR: [u8; 8] = *b"SESSION1";
 pub const QUANTUM_STATE_DISCRIMINATOR: [u8; 8] = *b"QSTATE01";
 pub const AUTHORITY_PROOF_DISCRIMINATOR: [u8; 8] = *b"AUTHPRF1";
-pub const QUANTUM_VAULT_DISCRIMINATOR: [u8; 8] = *b"QVAULT01";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -22,13 +21,6 @@ pub enum SessionStatus {
     Pending = 1,
     Ready = 2,
     Consumed = 3,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum QuantumVaultStatus {
-    Open = 1,
-    Closed = 2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,85 +383,6 @@ pub struct AuthorityProofState {
     pub proof_bytes: [u8; WotsAuthProof::ENCODED_LEN],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-pub struct QuantumVaultState {
-    pub discriminator: [u8; 8],
-    pub current_authority_hash: [u8; 32],
-    pub current_authority_root: [u8; 32],
-    pub next_leaf_index: u32,
-    pub bump: u8,
-    pub status: u8,
-    pub reserved: [u8; 18],
-}
-
-impl QuantumVaultState {
-    pub const LEN: usize = size_of::<Self>();
-
-    pub const fn new(
-        current_authority_hash: [u8; 32],
-        current_authority_root: [u8; 32],
-        bump: u8,
-    ) -> Self {
-        Self {
-            discriminator: QUANTUM_VAULT_DISCRIMINATOR,
-            current_authority_hash,
-            current_authority_root,
-            next_leaf_index: 0,
-            bump,
-            status: QuantumVaultStatus::Open as u8,
-            reserved: [0; 18],
-        }
-    }
-
-    pub fn encode(self, dst: &mut [u8]) -> bool {
-        if dst.len() != Self::LEN {
-            return false;
-        }
-
-        dst[..8].copy_from_slice(&self.discriminator);
-        dst[8..40].copy_from_slice(&self.current_authority_hash);
-        dst[40..72].copy_from_slice(&self.current_authority_root);
-        dst[72..76].copy_from_slice(&self.next_leaf_index.to_le_bytes());
-        dst[76] = self.bump;
-        dst[77] = self.status;
-        dst[78..96].copy_from_slice(&self.reserved);
-
-        true
-    }
-
-    pub fn decode(src: &[u8]) -> Option<Self> {
-        if src.len() != Self::LEN {
-            return None;
-        }
-
-        let mut discriminator = [0; 8];
-        discriminator.copy_from_slice(&src[..8]);
-
-        let mut current_authority_hash = [0; 32];
-        current_authority_hash.copy_from_slice(&src[8..40]);
-
-        let mut current_authority_root = [0; 32];
-        current_authority_root.copy_from_slice(&src[40..72]);
-
-        let mut next_leaf_index = [0; 4];
-        next_leaf_index.copy_from_slice(&src[72..76]);
-
-        let mut reserved = [0; 18];
-        reserved.copy_from_slice(&src[78..96]);
-
-        Some(Self {
-            discriminator,
-            current_authority_hash,
-            current_authority_root,
-            next_leaf_index: u32::from_le_bytes(next_leaf_index),
-            bump: src[76],
-            status: src[77],
-            reserved,
-        })
-    }
-}
-
 impl AuthorityProofState {
     pub const HEADER_LEN: usize = 80;
     pub const LEN: usize = size_of::<Self>();
@@ -541,9 +454,9 @@ impl AuthorityProofState {
 mod tests {
     use super::{
         ActionSessionState, AuthorityProofState, PolicyReceiptState, QuantumAuthorityState,
-        QuantumVaultState, QuantumVaultStatus, SessionStatus, VaultRegistry, VaultStatus,
-        ACTION_SESSION_DISCRIMINATOR, AUTHORITY_PROOF_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR,
-        QUANTUM_STATE_DISCRIMINATOR, QUANTUM_VAULT_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
+        SessionStatus, VaultRegistry, VaultStatus, ACTION_SESSION_DISCRIMINATOR,
+        AUTHORITY_PROOF_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR,
+        VAULT_REGISTRY_DISCRIMINATOR,
     };
     use vaulkyrie_protocol::WotsAuthProof;
 
@@ -631,26 +544,5 @@ mod tests {
             AuthorityProofState::LEN,
             AuthorityProofState::HEADER_LEN + WotsAuthProof::ENCODED_LEN
         );
-    }
-
-    #[test]
-    fn quantum_vault_state_starts_open() {
-        let state = QuantumVaultState::new([9; 32], [10; 32], 2);
-
-        assert_eq!(state.discriminator, QUANTUM_VAULT_DISCRIMINATOR);
-        assert_eq!(state.status, QuantumVaultStatus::Open as u8);
-        assert_eq!(state.next_leaf_index, 0);
-        assert_eq!(QuantumVaultState::LEN, 96);
-    }
-
-    #[test]
-    fn quantum_vault_state_roundtrips_through_bytes() {
-        let mut state = QuantumVaultState::new([9; 32], [10; 32], 2);
-        state.next_leaf_index = 4;
-        state.status = QuantumVaultStatus::Closed as u8;
-        let mut bytes = [0; QuantumVaultState::LEN];
-
-        assert!(state.encode(&mut bytes));
-        assert_eq!(QuantumVaultState::decode(&bytes), Some(state));
     }
 }

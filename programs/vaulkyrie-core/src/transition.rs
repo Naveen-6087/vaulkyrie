@@ -1,11 +1,13 @@
+use solana_nostd_sha256::hashv;
+use solana_winternitz::signature::WinternitzSignature;
 use vaulkyrie_protocol::{
-    quantum_close_digest, quantum_split_digest, AuthorityRotationStatement, PolicyReceipt,
+    quantum_close_message, quantum_split_message, AuthorityRotationStatement, PolicyReceipt,
     ThresholdRequirement, WotsAuthProof, XMSS_LEAF_COUNT,
 };
 
 use crate::state::{
-    ActionSessionState, PolicyReceiptState, QuantumAuthorityState, QuantumVaultState,
-    QuantumVaultStatus, SessionStatus, VaultRegistry, VaultStatus,
+    ActionSessionState, PolicyReceiptState, QuantumAuthorityState, SessionStatus, VaultRegistry,
+    VaultStatus,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,8 +37,9 @@ pub enum TransitionError {
     AuthorityProofMismatch,
     AuthorityMerkleRootMismatch,
     AuthorityTreeExhausted,
-    QuantumVaultClosed,
     QuantumVaultAmountTooLarge,
+    QuantumVaultSignatureInvalid,
+    QuantumVaultPdaMismatch,
 }
 
 pub fn initialize_vault(
@@ -60,14 +63,6 @@ pub fn initialize_quantum_authority(
     bump: u8,
 ) -> QuantumAuthorityState {
     QuantumAuthorityState::new(current_authority_hash, current_authority_root, bump)
-}
-
-pub fn initialize_quantum_vault(
-    current_authority_hash: [u8; 32],
-    current_authority_root: [u8; 32],
-    bump: u8,
-) -> QuantumVaultState {
-    QuantumVaultState::new(current_authority_hash, current_authority_root, bump)
 }
 
 pub fn parse_vault_status(status: u8) -> Result<VaultStatus, TransitionError> {
@@ -390,34 +385,32 @@ pub fn verify_authority_proof(
     Ok(())
 }
 
-pub fn verify_quantum_vault_split(
-    vault: &QuantumVaultState,
+pub fn validate_quantum_vault_split(
+    signature: &WinternitzSignature,
     amount: u64,
     split_pubkey: [u8; 32],
     refund_pubkey: [u8; 32],
-    proof: &WotsAuthProof,
+    bump: u8,
+    vault_pubkey: [u8; 32],
+    program_id: [u8; 32],
 ) -> Result<(), TransitionError> {
-    validate_quantum_vault_open(vault)?;
-    verify_quantum_vault_proof(
-        vault,
-        quantum_split_digest(amount, split_pubkey, refund_pubkey),
-        proof,
-    )
+    let hash = signature
+        .recover_pubkey(&quantum_split_message(amount, split_pubkey, refund_pubkey))
+        .merklize();
+    validate_quantum_vault_pda(hash, bump, vault_pubkey, program_id)
 }
 
-pub fn verify_quantum_vault_close(
-    vault: &QuantumVaultState,
+pub fn validate_quantum_vault_close(
+    signature: &WinternitzSignature,
     refund_pubkey: [u8; 32],
-    proof: &WotsAuthProof,
+    bump: u8,
+    vault_pubkey: [u8; 32],
+    program_id: [u8; 32],
 ) -> Result<(), TransitionError> {
-    validate_quantum_vault_open(vault)?;
-    verify_quantum_vault_proof(vault, quantum_close_digest(refund_pubkey), proof)
-}
-
-pub fn close_quantum_vault(vault: &mut QuantumVaultState) -> Result<(), TransitionError> {
-    validate_quantum_vault_open(vault)?;
-    vault.status = QuantumVaultStatus::Closed as u8;
-    Ok(())
+    let hash = signature
+        .recover_pubkey(&quantum_close_message(refund_pubkey))
+        .merklize();
+    validate_quantum_vault_pda(hash, bump, vault_pubkey, program_id)
 }
 
 pub fn validate_quantum_vault_split_amount(
@@ -431,36 +424,25 @@ pub fn validate_quantum_vault_split_amount(
     Ok(())
 }
 
-fn validate_quantum_vault_open(vault: &QuantumVaultState) -> Result<(), TransitionError> {
-    if vault.status != QuantumVaultStatus::Open as u8 {
-        return Err(TransitionError::QuantumVaultClosed);
-    }
-
-    Ok(())
-}
-
-fn verify_quantum_vault_proof(
-    vault: &QuantumVaultState,
-    digest: [u8; 32],
-    proof: &WotsAuthProof,
+fn validate_quantum_vault_pda(
+    hash: [u8; 32],
+    bump: u8,
+    vault_pubkey: [u8; 32],
+    program_id: [u8; 32],
 ) -> Result<(), TransitionError> {
-    if vault.next_leaf_index >= XMSS_LEAF_COUNT {
-        return Err(TransitionError::AuthorityTreeExhausted);
-    }
-    if proof.leaf_index != vault.next_leaf_index {
-        return Err(TransitionError::AuthorityLeafIndexMismatch);
-    }
-    if proof.authority_hash() != vault.current_authority_hash {
-        return Err(TransitionError::AuthorityProofMismatch);
-    }
-    if !proof.verify_merkle_root(vault.current_authority_root) {
-        return Err(TransitionError::AuthorityMerkleRootMismatch);
-    }
-    if !proof.verify_digest(digest) {
-        return Err(TransitionError::AuthorityProofInvalid);
-    }
+    let bump_seed = [bump];
+    let derived = hashv(&[
+        hash.as_ref(),
+        bump_seed.as_ref(),
+        program_id.as_ref(),
+        b"ProgramDerivedAddress",
+    ]);
 
-    Ok(())
+    if derived == vault_pubkey {
+        Ok(())
+    } else {
+        Err(TransitionError::QuantumVaultPdaMismatch)
+    }
 }
 
 pub fn validate_vault_for_session(
@@ -486,23 +468,25 @@ fn validate_spend_threshold(threshold: u8) -> Result<(), TransitionError> {
 
 #[cfg(test)]
 mod tests {
+    use solana_nostd_sha256::hashv;
+    use solana_winternitz::privkey::WinternitzPrivkey;
     use vaulkyrie_protocol::{
         ActionDescriptor, ActionKind, AuthorityRotationStatement, ThresholdRequirement,
         WotsSecretKey, WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES, XMSS_LEAF_COUNT,
     };
 
     use super::{
-        apply_authority_rotation, close_quantum_vault, consume_action_session,
-        consume_policy_receipt, finalize_action_session, initialize_quantum_authority,
-        initialize_quantum_vault, initialize_vault, mark_action_session_ready, open_action_session,
-        open_action_session_from_receipt, parse_vault_status, rotate_vault_authority,
-        stage_policy_receipt, update_vault_status, validate_and_advance_receipt_nonce,
-        validate_authority_action_binding, validate_quantum_vault_split_amount,
-        validate_vault_active, validate_vault_authority_alignment, validate_vault_for_receipt,
-        validate_vault_for_session, validate_vault_recovery_mode, verify_authority_proof,
-        verify_quantum_vault_close, verify_quantum_vault_split, TransitionError,
+        apply_authority_rotation, consume_action_session, consume_policy_receipt,
+        finalize_action_session, initialize_quantum_authority, initialize_vault,
+        mark_action_session_ready, open_action_session, open_action_session_from_receipt,
+        parse_vault_status, rotate_vault_authority, stage_policy_receipt, update_vault_status,
+        validate_and_advance_receipt_nonce, validate_authority_action_binding,
+        validate_quantum_vault_close, validate_quantum_vault_split,
+        validate_quantum_vault_split_amount, validate_vault_active,
+        validate_vault_authority_alignment, validate_vault_for_receipt, validate_vault_for_session,
+        validate_vault_recovery_mode, verify_authority_proof, TransitionError,
     };
-    use crate::state::{QuantumAuthorityState, QuantumVaultStatus, SessionStatus, VaultStatus};
+    use crate::state::{QuantumAuthorityState, SessionStatus, VaultStatus};
 
     fn sample_action_hash() -> [u8; 32] {
         ActionDescriptor {
@@ -1406,49 +1390,79 @@ mod tests {
     }
 
     #[test]
-    fn verify_quantum_vault_split_accepts_bound_message() {
-        let secret = sample_wots_secret(44);
-        let auth_path = sample_auth_path(31);
-        let digest = vaulkyrie_protocol::quantum_split_digest(55, [7; 32], [8; 32]);
-        let proof = secret.sign_digest_with_auth_path(digest, 0, auth_path);
-        let vault = initialize_quantum_vault(secret.authority_hash(), proof.merkle_root(), 2);
+    fn validate_quantum_vault_split_accepts_bound_message() {
+        let privkey = WinternitzPrivkey::from([44u8; solana_winternitz::HASH_LENGTH * 32]);
+        let signature = privkey.sign(&vaulkyrie_protocol::quantum_split_message(
+            55, [7; 32], [8; 32],
+        ));
+        let hash = privkey.pubkey().merklize();
+        let program_id = [1; 32];
+        let bump = 2;
+        let vault_pubkey = hashv(&[
+            hash.as_ref(),
+            [bump].as_ref(),
+            program_id.as_ref(),
+            b"ProgramDerivedAddress",
+        ]);
 
-        verify_quantum_vault_split(&vault, 55, [7; 32], [8; 32], &proof)
-            .expect("split proof should verify");
+        validate_quantum_vault_split(
+            &signature,
+            55,
+            [7; 32],
+            [8; 32],
+            bump,
+            vault_pubkey,
+            program_id,
+        )
+        .expect("split signature should validate");
     }
 
     #[test]
-    fn verify_quantum_vault_split_rejects_wrong_amount() {
-        let secret = sample_wots_secret(44);
-        let auth_path = sample_auth_path(32);
-        let digest = vaulkyrie_protocol::quantum_split_digest(55, [7; 32], [8; 32]);
-        let proof = secret.sign_digest_with_auth_path(digest, 0, auth_path);
-        let vault = initialize_quantum_vault(secret.authority_hash(), proof.merkle_root(), 2);
+    fn validate_quantum_vault_split_rejects_wrong_amount() {
+        let privkey = WinternitzPrivkey::from([45u8; solana_winternitz::HASH_LENGTH * 32]);
+        let signature = privkey.sign(&vaulkyrie_protocol::quantum_split_message(
+            55, [7; 32], [8; 32],
+        ));
+        let hash = privkey.pubkey().merklize();
+        let program_id = [1; 32];
+        let bump = 2;
+        let vault_pubkey = hashv(&[
+            hash.as_ref(),
+            [bump].as_ref(),
+            program_id.as_ref(),
+            b"ProgramDerivedAddress",
+        ]);
 
-        let error = verify_quantum_vault_split(&vault, 56, [7; 32], [8; 32], &proof)
-            .expect_err("split proof must be amount-bound");
+        let error = validate_quantum_vault_split(
+            &signature,
+            56,
+            [7; 32],
+            [8; 32],
+            bump,
+            vault_pubkey,
+            program_id,
+        )
+        .expect_err("split signature must be amount-bound");
 
-        assert_eq!(error, TransitionError::AuthorityProofInvalid);
+        assert_eq!(error, TransitionError::QuantumVaultPdaMismatch);
     }
 
     #[test]
-    fn verify_quantum_vault_close_accepts_refund_binding() {
-        let secret = sample_wots_secret(45);
-        let auth_path = sample_auth_path(33);
-        let digest = vaulkyrie_protocol::quantum_close_digest([9; 32]);
-        let proof = secret.sign_digest_with_auth_path(digest, 0, auth_path);
-        let vault = initialize_quantum_vault(secret.authority_hash(), proof.merkle_root(), 2);
+    fn validate_quantum_vault_close_accepts_refund_binding() {
+        let privkey = WinternitzPrivkey::from([46u8; solana_winternitz::HASH_LENGTH * 32]);
+        let signature = privkey.sign(&vaulkyrie_protocol::quantum_close_message([9; 32]));
+        let hash = privkey.pubkey().merklize();
+        let program_id = [2; 32];
+        let bump = 3;
+        let vault_pubkey = hashv(&[
+            hash.as_ref(),
+            [bump].as_ref(),
+            program_id.as_ref(),
+            b"ProgramDerivedAddress",
+        ]);
 
-        verify_quantum_vault_close(&vault, [9; 32], &proof).expect("close proof should verify");
-    }
-
-    #[test]
-    fn close_quantum_vault_marks_state_closed() {
-        let mut vault = initialize_quantum_vault([1; 32], [2; 32], 3);
-
-        close_quantum_vault(&mut vault).expect("vault should close");
-
-        assert_eq!(vault.status, QuantumVaultStatus::Closed as u8);
+        validate_quantum_vault_close(&signature, [9; 32], bump, vault_pubkey, program_id)
+            .expect("close signature should validate");
     }
 
     #[test]

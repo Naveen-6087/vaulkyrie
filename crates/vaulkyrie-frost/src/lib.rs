@@ -464,9 +464,9 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        run_dkg_legacy_message_harness, run_dkg_legacy_message_with_config, run_dkg_signing_harness,
-        run_dkg_signing_with_config, run_dkg_signing_with_retries, run_share_refresh_harness,
-        HarnessConfig, HarnessError,
+        run_dkg_legacy_message_harness, run_dkg_legacy_message_with_config,
+        run_dkg_signing_harness, run_dkg_signing_with_config, run_dkg_signing_with_retries,
+        run_share_refresh_harness, HarnessConfig, HarnessError,
     };
     use solana_signature::Signature as SolanaSignature;
 
@@ -502,8 +502,8 @@ mod tests {
 
     #[test]
     fn legacy_message_harness_signs_serialized_solana_message_bytes() {
-        let report =
-            run_dkg_legacy_message_harness().expect("legacy message signing harness should succeed");
+        let report = run_dkg_legacy_message_harness()
+            .expect("legacy message signing harness should succeed");
         let solana_signature = SolanaSignature::from(report.report.signature);
 
         assert!(!report.message_bytes.is_empty());
