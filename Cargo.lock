@@ -1135,6 +1135,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vaulkyrie-policy-mxe"
+version = "0.1.0"
+dependencies = [
+ "pinocchio",
+ "vaulkyrie-protocol",
+]
+
+[[package]]
 name = "vaulkyrie-protocol"
 version = "0.1.0"
 dependencies = [

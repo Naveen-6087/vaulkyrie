@@ -3,6 +3,7 @@ members = [
     "crates/vaulkyrie-frost",
     "crates/vaulkyrie-protocol",
     "programs/vaulkyrie-core",
+    "programs/vaulkyrie-policy-mxe",
 ]
 resolver = "2"
 

@@ -86,6 +86,50 @@ pub struct PolicyReceipt {
 }
 
 impl PolicyReceipt {
+    pub const ENCODED_LEN: usize = 57;
+
+    pub fn encode(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != Self::ENCODED_LEN {
+            return false;
+        }
+
+        dst[..32].copy_from_slice(&self.action_hash);
+        dst[32..40].copy_from_slice(&self.policy_version.to_le_bytes());
+        dst[40] = self.threshold.as_byte();
+        dst[41..49].copy_from_slice(&self.nonce.to_le_bytes());
+        dst[49..57].copy_from_slice(&self.expiry_slot.to_le_bytes());
+
+        true
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::ENCODED_LEN {
+            return None;
+        }
+
+        let mut action_hash = [0; 32];
+        action_hash.copy_from_slice(&src[..32]);
+
+        let mut policy_version = [0; 8];
+        policy_version.copy_from_slice(&src[32..40]);
+
+        let threshold = ThresholdRequirement::try_from(src[40]).ok()?;
+
+        let mut nonce = [0; 8];
+        nonce.copy_from_slice(&src[41..49]);
+
+        let mut expiry_slot = [0; 8];
+        expiry_slot.copy_from_slice(&src[49..57]);
+
+        Some(Self {
+            action_hash,
+            policy_version: u64::from_le_bytes(policy_version),
+            threshold,
+            nonce: u64::from_le_bytes(nonce),
+            expiry_slot: u64::from_le_bytes(expiry_slot),
+        })
+    }
+
     pub fn commitment(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(self.action_hash);
@@ -95,6 +139,161 @@ impl PolicyReceipt {
         hasher.update(self.expiry_slot.to_le_bytes());
 
         hasher.finalize().into()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyEvaluationRequest {
+    pub vault_id: [u8; 32],
+    pub action_hash: [u8; 32],
+    pub policy_version: u64,
+    pub request_nonce: u64,
+    pub expiry_slot: u64,
+    pub encrypted_input_commitment: [u8; 32],
+}
+
+impl PolicyEvaluationRequest {
+    pub const ENCODED_LEN: usize = 120;
+
+    pub fn encode(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != Self::ENCODED_LEN {
+            return false;
+        }
+
+        dst[..32].copy_from_slice(&self.vault_id);
+        dst[32..64].copy_from_slice(&self.action_hash);
+        dst[64..72].copy_from_slice(&self.policy_version.to_le_bytes());
+        dst[72..80].copy_from_slice(&self.request_nonce.to_le_bytes());
+        dst[80..88].copy_from_slice(&self.expiry_slot.to_le_bytes());
+        dst[88..120].copy_from_slice(&self.encrypted_input_commitment);
+
+        true
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::ENCODED_LEN {
+            return None;
+        }
+
+        let mut vault_id = [0; 32];
+        vault_id.copy_from_slice(&src[..32]);
+
+        let mut action_hash = [0; 32];
+        action_hash.copy_from_slice(&src[32..64]);
+
+        let mut policy_version = [0; 8];
+        policy_version.copy_from_slice(&src[64..72]);
+
+        let mut request_nonce = [0; 8];
+        request_nonce.copy_from_slice(&src[72..80]);
+
+        let mut expiry_slot = [0; 8];
+        expiry_slot.copy_from_slice(&src[80..88]);
+
+        let mut encrypted_input_commitment = [0; 32];
+        encrypted_input_commitment.copy_from_slice(&src[88..120]);
+
+        Some(Self {
+            vault_id,
+            action_hash,
+            policy_version: u64::from_le_bytes(policy_version),
+            request_nonce: u64::from_le_bytes(request_nonce),
+            expiry_slot: u64::from_le_bytes(expiry_slot),
+            encrypted_input_commitment,
+        })
+    }
+
+    pub fn commitment(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.vault_id);
+        hasher.update(self.action_hash);
+        hasher.update(self.policy_version.to_le_bytes());
+        hasher.update(self.request_nonce.to_le_bytes());
+        hasher.update(self.expiry_slot.to_le_bytes());
+        hasher.update(self.encrypted_input_commitment);
+
+        hasher.finalize().into()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDecisionEnvelope {
+    pub request_commitment: [u8; 32],
+    pub receipt: PolicyReceipt,
+    pub delay_until_slot: u64,
+    pub reason_code: u16,
+    pub computation_offset: u64,
+    pub result_commitment: [u8; 32],
+}
+
+impl PolicyDecisionEnvelope {
+    pub const ENCODED_LEN: usize = 139;
+
+    pub fn encode(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != Self::ENCODED_LEN {
+            return false;
+        }
+
+        dst[..32].copy_from_slice(&self.request_commitment);
+        if !self.receipt.encode(&mut dst[32..89]) {
+            return false;
+        }
+        dst[89..97].copy_from_slice(&self.delay_until_slot.to_le_bytes());
+        dst[97..99].copy_from_slice(&self.reason_code.to_le_bytes());
+        dst[99..107].copy_from_slice(&self.computation_offset.to_le_bytes());
+        dst[107..139].copy_from_slice(&self.result_commitment);
+
+        true
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::ENCODED_LEN {
+            return None;
+        }
+
+        let mut request_commitment = [0; 32];
+        request_commitment.copy_from_slice(&src[..32]);
+
+        let receipt = PolicyReceipt::decode(&src[32..89])?;
+
+        let mut delay_until_slot = [0; 8];
+        delay_until_slot.copy_from_slice(&src[89..97]);
+
+        let mut reason_code = [0; 2];
+        reason_code.copy_from_slice(&src[97..99]);
+
+        let mut computation_offset = [0; 8];
+        computation_offset.copy_from_slice(&src[99..107]);
+
+        let mut result_commitment = [0; 32];
+        result_commitment.copy_from_slice(&src[107..139]);
+
+        Some(Self {
+            request_commitment,
+            receipt,
+            delay_until_slot: u64::from_le_bytes(delay_until_slot),
+            reason_code: u16::from_le_bytes(reason_code),
+            computation_offset: u64::from_le_bytes(computation_offset),
+            result_commitment,
+        })
+    }
+
+    pub fn commitment(&self) -> [u8; 32] {
+        let mut encoded = [0u8; Self::ENCODED_LEN];
+        let did_encode = self.encode(&mut encoded);
+        debug_assert!(did_encode);
+
+        let mut hasher = Sha256::new();
+        hasher.update(encoded);
+        hasher.finalize().into()
+    }
+
+    pub fn matches_request(&self, request: &PolicyEvaluationRequest) -> bool {
+        self.request_commitment == request.commitment()
+            && self.receipt.action_hash == request.action_hash
+            && self.receipt.policy_version == request.policy_version
+            && self.receipt.expiry_slot <= request.expiry_slot
+            && self.delay_until_slot <= self.receipt.expiry_slot
     }
 }
 
@@ -364,8 +563,9 @@ fn xmss_get_node(data: &[u8; XMSS_AUTH_PATH_BYTES], level: usize) -> [u8; XMSS_N
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionDescriptor, ActionKind, AuthorityRotationStatement, PolicyReceipt,
-        ThresholdRequirement, WotsAuthProof, WotsSecretKey, WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES,
+        ActionDescriptor, ActionKind, AuthorityRotationStatement, PolicyDecisionEnvelope,
+        PolicyEvaluationRequest, PolicyReceipt, ThresholdRequirement, WotsAuthProof, WotsSecretKey,
+        WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES,
     };
 
     fn descriptor(kind: ActionKind) -> ActionDescriptor {
@@ -423,6 +623,95 @@ mod tests {
         changed.threshold = ThresholdRequirement::RequirePqcAuth;
 
         assert_ne!(receipt.commitment(), changed.commitment());
+    }
+
+    #[test]
+    fn policy_receipt_roundtrips_through_bytes() {
+        let receipt = PolicyReceipt {
+            action_hash: descriptor(ActionKind::Spend).hash(),
+            policy_version: 42,
+            threshold: ThresholdRequirement::ThreeOfThree,
+            nonce: 11,
+            expiry_slot: 900,
+        };
+        let mut bytes = [0u8; PolicyReceipt::ENCODED_LEN];
+
+        assert!(receipt.encode(&mut bytes));
+        assert_eq!(PolicyReceipt::decode(&bytes), Some(receipt));
+    }
+
+    #[test]
+    fn policy_request_commitment_changes_with_encrypted_context() {
+        let request = PolicyEvaluationRequest {
+            vault_id: [3; 32],
+            action_hash: descriptor(ActionKind::Spend).hash(),
+            policy_version: 42,
+            request_nonce: 7,
+            expiry_slot: 1_200,
+            encrypted_input_commitment: [8; 32],
+        };
+        let mut changed = request.clone();
+        changed.encrypted_input_commitment = [9; 32];
+
+        assert_ne!(request.commitment(), changed.commitment());
+    }
+
+    #[test]
+    fn policy_decision_envelope_roundtrips_through_bytes() {
+        let request = PolicyEvaluationRequest {
+            vault_id: [1; 32],
+            action_hash: descriptor(ActionKind::Spend).hash(),
+            policy_version: 42,
+            request_nonce: 3,
+            expiry_slot: 700,
+            encrypted_input_commitment: [4; 32],
+        };
+        let envelope = PolicyDecisionEnvelope {
+            request_commitment: request.commitment(),
+            receipt: PolicyReceipt {
+                action_hash: request.action_hash,
+                policy_version: request.policy_version,
+                threshold: ThresholdRequirement::TwoOfThree,
+                nonce: 5,
+                expiry_slot: 650,
+            },
+            delay_until_slot: 620,
+            reason_code: 17,
+            computation_offset: 99,
+            result_commitment: [6; 32],
+        };
+        let mut bytes = [0u8; PolicyDecisionEnvelope::ENCODED_LEN];
+
+        assert!(envelope.encode(&mut bytes));
+        assert_eq!(PolicyDecisionEnvelope::decode(&bytes), Some(envelope));
+    }
+
+    #[test]
+    fn policy_decision_envelope_matches_request_binding() {
+        let request = PolicyEvaluationRequest {
+            vault_id: [1; 32],
+            action_hash: descriptor(ActionKind::Spend).hash(),
+            policy_version: 42,
+            request_nonce: 3,
+            expiry_slot: 700,
+            encrypted_input_commitment: [4; 32],
+        };
+        let envelope = PolicyDecisionEnvelope {
+            request_commitment: request.commitment(),
+            receipt: PolicyReceipt {
+                action_hash: request.action_hash,
+                policy_version: request.policy_version,
+                threshold: ThresholdRequirement::OneOfThree,
+                nonce: 8,
+                expiry_slot: 680,
+            },
+            delay_until_slot: 640,
+            reason_code: 5,
+            computation_offset: 42,
+            result_commitment: [9; 32],
+        };
+
+        assert!(envelope.matches_request(&request));
     }
 
     #[test]

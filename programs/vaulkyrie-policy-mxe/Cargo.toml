@@ -1,0 +1,17 @@
+[package]
+name = "vaulkyrie-policy-mxe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = []
+bpf-entrypoint = []
+
+[dependencies]
+pinocchio.workspace = true
+vaulkyrie-protocol = { path = "../../crates/vaulkyrie-protocol" }

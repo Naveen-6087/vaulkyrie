@@ -1,0 +1,237 @@
+use vaulkyrie_protocol::{PolicyDecisionEnvelope, PolicyEvaluationRequest};
+
+use crate::state::{PolicyConfigState, PolicyEvaluationState, PolicyEvaluationStatus};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionError {
+    PolicyVersionMismatch,
+    RequestNonceMismatch,
+    RequestExpired,
+    RequestAlreadyFinalized,
+    RequestAlreadyAborted,
+    DecisionMismatch,
+    DelayExceedsExpiry,
+}
+
+pub fn initialize_policy_config(
+    core_program: [u8; 32],
+    arcium_program: [u8; 32],
+    mxe_account: [u8; 32],
+    policy_version: u64,
+    bump: u8,
+) -> PolicyConfigState {
+    PolicyConfigState::new(
+        core_program,
+        arcium_program,
+        mxe_account,
+        policy_version,
+        bump,
+    )
+}
+
+pub fn open_policy_evaluation(
+    config: &mut PolicyConfigState,
+    request: &PolicyEvaluationRequest,
+    computation_offset: u64,
+    current_slot: u64,
+) -> Result<PolicyEvaluationState, TransitionError> {
+    if request.policy_version != config.policy_version {
+        return Err(TransitionError::PolicyVersionMismatch);
+    }
+    if request.request_nonce != config.next_request_nonce {
+        return Err(TransitionError::RequestNonceMismatch);
+    }
+    if request.expiry_slot < current_slot {
+        return Err(TransitionError::RequestExpired);
+    }
+
+    config.next_request_nonce += 1;
+
+    Ok(PolicyEvaluationState::new(
+        request.commitment(),
+        request.vault_id,
+        request.action_hash,
+        request.encrypted_input_commitment,
+        request.policy_version,
+        request.request_nonce,
+        request.expiry_slot,
+        computation_offset,
+    ))
+}
+
+pub fn finalize_policy_evaluation(
+    state: &mut PolicyEvaluationState,
+    envelope: &PolicyDecisionEnvelope,
+    current_slot: u64,
+) -> Result<(), TransitionError> {
+    match state.status {
+        value if value == PolicyEvaluationStatus::Finalized as u8 => {
+            return Err(TransitionError::RequestAlreadyFinalized);
+        }
+        value if value == PolicyEvaluationStatus::Aborted as u8 => {
+            return Err(TransitionError::RequestAlreadyAborted);
+        }
+        _ => {}
+    }
+
+    if state.expiry_slot < current_slot || !matches_envelope(state, envelope) {
+        return Err(TransitionError::DecisionMismatch);
+    }
+    if envelope.delay_until_slot > envelope.receipt.expiry_slot {
+        return Err(TransitionError::DelayExceedsExpiry);
+    }
+
+    state.receipt_commitment = envelope.receipt.commitment();
+    state.decision_commitment = envelope.commitment();
+    state.delay_until_slot = envelope.delay_until_slot;
+    state.reason_code = envelope.reason_code;
+    state.status = PolicyEvaluationStatus::Finalized as u8;
+
+    Ok(())
+}
+
+pub fn abort_policy_evaluation(
+    state: &mut PolicyEvaluationState,
+    reason_code: u16,
+) -> Result<(), TransitionError> {
+    match state.status {
+        value if value == PolicyEvaluationStatus::Finalized as u8 => {
+            return Err(TransitionError::RequestAlreadyFinalized);
+        }
+        value if value == PolicyEvaluationStatus::Aborted as u8 => {
+            return Err(TransitionError::RequestAlreadyAborted);
+        }
+        _ => {}
+    }
+
+    state.reason_code = reason_code;
+    state.status = PolicyEvaluationStatus::Aborted as u8;
+
+    Ok(())
+}
+
+fn matches_envelope(state: &PolicyEvaluationState, envelope: &PolicyDecisionEnvelope) -> bool {
+    state.request_commitment == envelope.request_commitment
+        && state.action_hash == envelope.receipt.action_hash
+        && state.policy_version == envelope.receipt.policy_version
+        && state.computation_offset == envelope.computation_offset
+        && envelope.receipt.expiry_slot <= state.expiry_slot
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        abort_policy_evaluation, finalize_policy_evaluation, initialize_policy_config,
+        open_policy_evaluation, TransitionError,
+    };
+    use crate::state::PolicyEvaluationStatus;
+    use vaulkyrie_protocol::{
+        PolicyDecisionEnvelope, PolicyEvaluationRequest, PolicyReceipt, ThresholdRequirement,
+    };
+
+    fn sample_request() -> PolicyEvaluationRequest {
+        PolicyEvaluationRequest {
+            vault_id: [1; 32],
+            action_hash: [2; 32],
+            policy_version: 9,
+            request_nonce: 0,
+            expiry_slot: 900,
+            encrypted_input_commitment: [3; 32],
+        }
+    }
+
+    #[test]
+    fn opening_policy_evaluation_advances_nonce() {
+        let mut config = initialize_policy_config([4; 32], [5; 32], [6; 32], 9, 2);
+        let request = sample_request();
+
+        let state =
+            open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
+
+        assert_eq!(config.next_request_nonce, 1);
+        assert_eq!(state.request_commitment, request.commitment());
+        assert_eq!(state.status, PolicyEvaluationStatus::Pending as u8);
+    }
+
+    #[test]
+    fn opening_policy_evaluation_rejects_policy_mismatch() {
+        let mut config = initialize_policy_config([4; 32], [5; 32], [6; 32], 10, 2);
+
+        assert_eq!(
+            open_policy_evaluation(&mut config, &sample_request(), 77, 400),
+            Err(TransitionError::PolicyVersionMismatch)
+        );
+    }
+
+    #[test]
+    fn finalizing_policy_evaluation_records_commitments() {
+        let mut config = initialize_policy_config([4; 32], [5; 32], [6; 32], 9, 2);
+        let request = sample_request();
+        let mut state =
+            open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
+        let envelope = PolicyDecisionEnvelope {
+            request_commitment: request.commitment(),
+            receipt: PolicyReceipt {
+                action_hash: request.action_hash,
+                policy_version: request.policy_version,
+                threshold: ThresholdRequirement::TwoOfThree,
+                nonce: 9,
+                expiry_slot: 880,
+            },
+            delay_until_slot: 840,
+            reason_code: 31,
+            computation_offset: 77,
+            result_commitment: [7; 32],
+        };
+
+        finalize_policy_evaluation(&mut state, &envelope, 500)
+            .expect("decision envelope should finalize");
+
+        assert_eq!(state.receipt_commitment, envelope.receipt.commitment());
+        assert_eq!(state.decision_commitment, envelope.commitment());
+        assert_eq!(state.delay_until_slot, 840);
+        assert_eq!(state.reason_code, 31);
+        assert_eq!(state.status, PolicyEvaluationStatus::Finalized as u8);
+    }
+
+    #[test]
+    fn finalizing_policy_evaluation_rejects_mismatched_envelope() {
+        let mut config = initialize_policy_config([4; 32], [5; 32], [6; 32], 9, 2);
+        let request = sample_request();
+        let mut state =
+            open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
+        let mut envelope = PolicyDecisionEnvelope {
+            request_commitment: request.commitment(),
+            receipt: PolicyReceipt {
+                action_hash: request.action_hash,
+                policy_version: request.policy_version,
+                threshold: ThresholdRequirement::TwoOfThree,
+                nonce: 9,
+                expiry_slot: 880,
+            },
+            delay_until_slot: 840,
+            reason_code: 31,
+            computation_offset: 77,
+            result_commitment: [7; 32],
+        };
+        envelope.computation_offset = 88;
+
+        assert_eq!(
+            finalize_policy_evaluation(&mut state, &envelope, 500),
+            Err(TransitionError::DecisionMismatch)
+        );
+    }
+
+    #[test]
+    fn aborting_policy_evaluation_marks_state_aborted() {
+        let mut config = initialize_policy_config([4; 32], [5; 32], [6; 32], 9, 2);
+        let request = sample_request();
+        let mut state =
+            open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
+
+        abort_policy_evaluation(&mut state, 44).expect("abort should succeed");
+
+        assert_eq!(state.reason_code, 44);
+        assert_eq!(state.status, PolicyEvaluationStatus::Aborted as u8);
+    }
+}
