@@ -1,0 +1,35 @@
+[package]
+name = "vaulkyrie-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Client SDK for the Vaulkyrie threshold wallet — instruction builders, account deserialization, PDA derivation, and FROST orchestration."
+
+[features]
+default = ["frost"]
+frost = [
+    "dep:vaulkyrie-frost",
+    "dep:frost-ed25519",
+    "dep:rand_core",
+    "dep:rand_chacha",
+]
+
+[dependencies]
+vaulkyrie-protocol = { path = "../vaulkyrie-protocol" }
+sha2 = { version = "0.10.9" }
+curve25519-dalek.workspace = true
+solana-pubkey.workspace = true
+solana-instruction.workspace = true
+solana-hash.workspace = true
+
+# Optional FROST dependencies (enabled by default)
+vaulkyrie-frost = { path = "../vaulkyrie-frost", optional = true }
+frost-ed25519 = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
+rand_chacha = { workspace = true, optional = true }
+
+[dev-dependencies]
+ed25519-dalek.workspace = true
+solana-message.workspace = true
+solana-signature.workspace = true
