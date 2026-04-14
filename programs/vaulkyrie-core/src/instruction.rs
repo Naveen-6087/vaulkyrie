@@ -19,6 +19,13 @@ pub struct InitAuthorityArgs {
     pub bump: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitQuantumVaultArgs {
+    pub current_authority_hash: [u8; 32],
+    pub current_authority_root: [u8; 32],
+    pub bump: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotateAuthorityArgs {
     pub statement: AuthorityRotationStatement,
@@ -49,6 +56,7 @@ pub enum CoreInstruction {
     Ping,
     InitVault(InitVaultArgs),
     InitAuthority(InitAuthorityArgs),
+    InitQuantumVault(InitQuantumVaultArgs),
     StageReceipt(PolicyReceipt),
     ConsumeReceipt(PolicyReceipt),
     OpenSession(PolicyReceipt),
@@ -60,6 +68,8 @@ pub enum CoreInstruction {
     InitAuthorityProof(InitAuthorityProofArgs),
     WriteAuthorityProofChunk(WriteAuthorityProofChunkArgs),
     RotateAuthorityStaged(AuthorityRotationStatement),
+    SplitQuantumVault { proof: WotsAuthProof, amount: u64 },
+    CloseQuantumVault(WotsAuthProof),
 }
 
 impl TryFrom<&[u8]> for CoreInstruction {
@@ -70,20 +80,28 @@ impl TryFrom<&[u8]> for CoreInstruction {
             [0] => Ok(Self::Ping),
             [1, rest @ ..] => Ok(Self::InitVault(parse_init_vault(rest)?)),
             [2, rest @ ..] => Ok(Self::InitAuthority(parse_init_authority(rest)?)),
-            [3, rest @ ..] => Ok(Self::StageReceipt(parse_policy_receipt(rest)?)),
-            [4, rest @ ..] => Ok(Self::ConsumeReceipt(parse_policy_receipt(rest)?)),
-            [5, rest @ ..] => Ok(Self::OpenSession(parse_policy_receipt(rest)?)),
-            [6, rest @ ..] => Ok(Self::ActivateSession(parse_action_hash(rest)?)),
-            [7, rest @ ..] => Ok(Self::ConsumeSession(parse_action_hash(rest)?)),
-            [8, rest @ ..] => Ok(Self::FinalizeSession(parse_policy_receipt(rest)?)),
-            [9, rest @ ..] => Ok(Self::SetVaultStatus(parse_vault_status(rest)?)),
-            [10, rest @ ..] => Ok(Self::RotateAuthority(parse_rotate_authority_args(rest)?)),
-            [11, rest @ ..] => Ok(Self::InitAuthorityProof(parse_init_authority_proof(rest)?)),
-            [12, rest @ ..] => Ok(Self::WriteAuthorityProofChunk(
+            [3, rest @ ..] => Ok(Self::InitQuantumVault(parse_init_quantum_vault(rest)?)),
+            [4, rest @ ..] => Ok(Self::StageReceipt(parse_policy_receipt(rest)?)),
+            [5, rest @ ..] => Ok(Self::ConsumeReceipt(parse_policy_receipt(rest)?)),
+            [6, rest @ ..] => Ok(Self::OpenSession(parse_policy_receipt(rest)?)),
+            [7, rest @ ..] => Ok(Self::ActivateSession(parse_action_hash(rest)?)),
+            [8, rest @ ..] => Ok(Self::ConsumeSession(parse_action_hash(rest)?)),
+            [9, rest @ ..] => Ok(Self::FinalizeSession(parse_policy_receipt(rest)?)),
+            [10, rest @ ..] => Ok(Self::SetVaultStatus(parse_vault_status(rest)?)),
+            [11, rest @ ..] => Ok(Self::RotateAuthority(parse_rotate_authority_args(rest)?)),
+            [12, rest @ ..] => Ok(Self::InitAuthorityProof(parse_init_authority_proof(rest)?)),
+            [13, rest @ ..] => Ok(Self::WriteAuthorityProofChunk(
                 parse_write_authority_proof_chunk(rest)?,
             )),
-            [13, rest @ ..] => Ok(Self::RotateAuthorityStaged(
+            [14, rest @ ..] => Ok(Self::RotateAuthorityStaged(
                 parse_authority_rotation_statement(rest)?,
+            )),
+            [15, rest @ ..] => {
+                let (proof, amount) = parse_split_quantum_vault(rest)?;
+                Ok(Self::SplitQuantumVault { proof, amount })
+            }
+            [16, rest @ ..] => Ok(Self::CloseQuantumVault(
+                WotsAuthProof::decode(rest).ok_or(ProgramError::InvalidInstructionData)?,
             )),
             _ => Err(ProgramError::InvalidInstructionData),
         }
@@ -142,6 +160,24 @@ fn parse_init_authority(data: &[u8]) -> Result<InitAuthorityArgs, ProgramError> 
     current_authority_root.copy_from_slice(&data[32..64]);
 
     Ok(InitAuthorityArgs {
+        current_authority_hash,
+        current_authority_root,
+        bump: data[64],
+    })
+}
+
+fn parse_init_quantum_vault(data: &[u8]) -> Result<InitQuantumVaultArgs, ProgramError> {
+    if data.len() != 65 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut current_authority_hash = [0; 32];
+    current_authority_hash.copy_from_slice(&data[..32]);
+
+    let mut current_authority_root = [0; 32];
+    current_authority_root.copy_from_slice(&data[32..64]);
+
+    Ok(InitQuantumVaultArgs {
         current_authority_hash,
         current_authority_root,
         bump: data[64],
@@ -264,11 +300,24 @@ fn parse_write_authority_proof_chunk(
     })
 }
 
+fn parse_split_quantum_vault(data: &[u8]) -> Result<(WotsAuthProof, u64), ProgramError> {
+    if data.len() != WotsAuthProof::ENCODED_LEN + 8 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let proof = WotsAuthProof::decode(&data[..WotsAuthProof::ENCODED_LEN])
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    let mut amount = [0; 8];
+    amount.copy_from_slice(&data[WotsAuthProof::ENCODED_LEN..]);
+
+    Ok((proof, u64::from_le_bytes(amount)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CoreInstruction, InitAuthorityArgs, InitAuthorityProofArgs, InitVaultArgs,
-        RotateAuthorityArgs, WriteAuthorityProofChunkArgs,
+        CoreInstruction, InitAuthorityArgs, InitAuthorityProofArgs, InitQuantumVaultArgs,
+        InitVaultArgs, RotateAuthorityArgs, WriteAuthorityProofChunkArgs,
     };
     use pinocchio::program_error::ProgramError;
     use vaulkyrie_protocol::{
@@ -313,7 +362,7 @@ mod tests {
 
     #[test]
     fn parses_stage_receipt_instruction() {
-        let mut data = vec![3];
+        let mut data = vec![4];
         data.extend_from_slice(&[4; 32]);
         data.extend_from_slice(&10u64.to_le_bytes());
         data.push(2);
@@ -351,7 +400,7 @@ mod tests {
 
     #[test]
     fn parses_open_session_instruction() {
-        let mut data = vec![5];
+        let mut data = vec![6];
         data.extend_from_slice(&[4; 32]);
         data.extend_from_slice(&10u64.to_le_bytes());
         data.push(2);
@@ -372,7 +421,7 @@ mod tests {
 
     #[test]
     fn parses_activate_session_instruction() {
-        let mut data = vec![6];
+        let mut data = vec![7];
         data.extend_from_slice(&[7; 32]);
 
         assert_eq!(
@@ -383,7 +432,7 @@ mod tests {
 
     #[test]
     fn parses_consume_session_instruction() {
-        let mut data = vec![7];
+        let mut data = vec![8];
         data.extend_from_slice(&[8; 32]);
 
         assert_eq!(
@@ -394,7 +443,7 @@ mod tests {
 
     #[test]
     fn parses_finalize_session_instruction() {
-        let mut data = vec![8];
+        let mut data = vec![9];
         data.extend_from_slice(&[4; 32]);
         data.extend_from_slice(&10u64.to_le_bytes());
         data.push(2);
@@ -415,7 +464,7 @@ mod tests {
 
     #[test]
     fn parses_rotate_authority_instruction() {
-        let mut data = vec![10];
+        let mut data = vec![11];
         data.extend_from_slice(&[5; 32]);
         data.extend_from_slice(&[6; 32]);
         data.extend_from_slice(&13u64.to_le_bytes());
@@ -446,7 +495,7 @@ mod tests {
 
     #[test]
     fn parses_set_vault_status_instruction() {
-        let data = vec![9, 2];
+        let data = vec![10, 2];
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
@@ -456,7 +505,7 @@ mod tests {
 
     #[test]
     fn parses_init_authority_proof_instruction() {
-        let mut data = vec![11];
+        let mut data = vec![12];
         data.extend_from_slice(&[5; 32]);
         data.extend_from_slice(&[6; 32]);
 
@@ -473,7 +522,7 @@ mod tests {
 
     #[test]
     fn parses_write_authority_proof_chunk_instruction() {
-        let mut data = vec![12];
+        let mut data = vec![13];
         data.extend_from_slice(&9u32.to_le_bytes());
         data.extend_from_slice(&3u16.to_le_bytes());
         data.extend_from_slice(&[7, 8, 9]);
@@ -495,7 +544,7 @@ mod tests {
 
     #[test]
     fn parses_rotate_authority_staged_instruction() {
-        let mut data = vec![13];
+        let mut data = vec![14];
         data.extend_from_slice(&[5; 32]);
         data.extend_from_slice(&[6; 32]);
         data.extend_from_slice(&13u64.to_le_bytes());
@@ -516,7 +565,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_threshold_encoding() {
-        let mut data = vec![3];
+        let mut data = vec![4];
         data.extend_from_slice(&[4; 32]);
         data.extend_from_slice(&10u64.to_le_bytes());
         data.push(99);
@@ -531,7 +580,7 @@ mod tests {
 
     #[test]
     fn rejects_oversized_authority_chunk() {
-        let mut data = vec![12];
+        let mut data = vec![13];
         data.extend_from_slice(&0u32.to_le_bytes());
         data.extend_from_slice(&257u16.to_le_bytes());
         data.resize(1 + 4 + 2 + 257, 1);
@@ -539,6 +588,64 @@ mod tests {
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
             Err(ProgramError::InvalidInstructionData)
+        );
+    }
+
+    #[test]
+    fn parses_init_quantum_vault_instruction() {
+        let mut data = vec![3];
+        data.extend_from_slice(&[7; 32]);
+        data.extend_from_slice(&[8; 32]);
+        data.push(4);
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::InitQuantumVault(InitQuantumVaultArgs {
+                current_authority_hash: [7; 32],
+                current_authority_root: [8; 32],
+                bump: 4,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_split_quantum_vault_instruction() {
+        let proof = WotsAuthProof {
+            public_key: [1; WOTS_KEY_BYTES],
+            signature: [2; WOTS_KEY_BYTES],
+            leaf_index: 3,
+            auth_path: [4; XMSS_AUTH_PATH_BYTES],
+        };
+        let mut proof_bytes = [0u8; WotsAuthProof::ENCODED_LEN];
+        assert!(proof.encode(&mut proof_bytes));
+
+        let mut data = vec![15];
+        data.extend_from_slice(&proof_bytes);
+        data.extend_from_slice(&42u64.to_le_bytes());
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::SplitQuantumVault { proof, amount: 42 })
+        );
+    }
+
+    #[test]
+    fn parses_close_quantum_vault_instruction() {
+        let proof = WotsAuthProof {
+            public_key: [1; WOTS_KEY_BYTES],
+            signature: [2; WOTS_KEY_BYTES],
+            leaf_index: 3,
+            auth_path: [4; XMSS_AUTH_PATH_BYTES],
+        };
+        let mut proof_bytes = [0u8; WotsAuthProof::ENCODED_LEN];
+        assert!(proof.encode(&mut proof_bytes));
+
+        let mut data = vec![16];
+        data.extend_from_slice(&proof_bytes);
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::CloseQuantumVault(proof))
         );
     }
 }

@@ -75,6 +75,8 @@ pub const XMSS_NODE_BYTES: usize = 32;
 pub const XMSS_AUTH_PATH_BYTES: usize = XMSS_TREE_HEIGHT * XMSS_NODE_BYTES;
 pub const XMSS_LEAF_COUNT: u32 = 1u32 << XMSS_TREE_HEIGHT;
 pub const AUTHORITY_PROOF_CHUNK_MAX_BYTES: usize = 256;
+pub const QUANTUM_SPLIT_MESSAGE_BYTES: usize = 72;
+pub const QUANTUM_CLOSE_MESSAGE_BYTES: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyReceipt {
@@ -560,9 +562,42 @@ fn xmss_get_node(data: &[u8; XMSS_AUTH_PATH_BYTES], level: usize) -> [u8; XMSS_N
     node
 }
 
+pub fn quantum_split_message(
+    amount: u64,
+    split_pubkey: [u8; 32],
+    refund_pubkey: [u8; 32],
+) -> [u8; QUANTUM_SPLIT_MESSAGE_BYTES] {
+    let mut message = [0u8; QUANTUM_SPLIT_MESSAGE_BYTES];
+    message[..8].copy_from_slice(&amount.to_le_bytes());
+    message[8..40].copy_from_slice(&split_pubkey);
+    message[40..72].copy_from_slice(&refund_pubkey);
+    message
+}
+
+pub fn quantum_close_message(refund_pubkey: [u8; 32]) -> [u8; QUANTUM_CLOSE_MESSAGE_BYTES] {
+    refund_pubkey
+}
+
+pub fn quantum_split_digest(
+    amount: u64,
+    split_pubkey: [u8; 32],
+    refund_pubkey: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(quantum_split_message(amount, split_pubkey, refund_pubkey));
+    hasher.finalize().into()
+}
+
+pub fn quantum_close_digest(refund_pubkey: [u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(quantum_close_message(refund_pubkey));
+    hasher.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        quantum_close_digest, quantum_close_message, quantum_split_digest, quantum_split_message,
         ActionDescriptor, ActionKind, AuthorityRotationStatement, PolicyDecisionEnvelope,
         PolicyEvaluationRequest, PolicyReceipt, ThresholdRequirement, WotsAuthProof, WotsSecretKey,
         WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES,
@@ -865,5 +900,35 @@ mod tests {
         let mut bytes = [0u8; WotsAuthProof::ENCODED_LEN];
         assert!(proof.encode(&mut bytes));
         assert_eq!(WotsAuthProof::decode(&bytes), Some(proof));
+    }
+
+    #[test]
+    fn quantum_split_message_is_stable() {
+        let message = quantum_split_message(55, [7; 32], [8; 32]);
+
+        assert_eq!(&message[..8], &55u64.to_le_bytes());
+        assert_eq!(&message[8..40], &[7; 32]);
+        assert_eq!(&message[40..72], &[8; 32]);
+    }
+
+    #[test]
+    fn quantum_split_digest_changes_with_refund_recipient() {
+        let first = quantum_split_digest(55, [7; 32], [8; 32]);
+        let second = quantum_split_digest(55, [7; 32], [9; 32]);
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn quantum_close_message_is_refund_pubkey_bytes() {
+        assert_eq!(quantum_close_message([5; 32]), [5; 32]);
+    }
+
+    #[test]
+    fn quantum_close_digest_changes_with_recipient() {
+        let first = quantum_close_digest([5; 32]);
+        let second = quantum_close_digest([6; 32]);
+
+        assert_ne!(first, second);
     }
 }

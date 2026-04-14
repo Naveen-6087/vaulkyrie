@@ -9,13 +9,14 @@ use vaulkyrie_protocol::{AuthorityRotationStatement, PolicyReceipt, WotsAuthProo
 
 use crate::{
     instruction::{
-        CoreInstruction, InitAuthorityArgs, InitAuthorityProofArgs, InitVaultArgs,
-        WriteAuthorityProofChunkArgs,
+        CoreInstruction, InitAuthorityArgs, InitAuthorityProofArgs, InitQuantumVaultArgs,
+        InitVaultArgs, WriteAuthorityProofChunkArgs,
     },
     state::{
         ActionSessionState, AuthorityProofState, PolicyReceiptState, QuantumAuthorityState,
-        VaultRegistry, ACTION_SESSION_DISCRIMINATOR, AUTHORITY_PROOF_DISCRIMINATOR,
-        POLICY_RECEIPT_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
+        QuantumVaultState, VaultRegistry, ACTION_SESSION_DISCRIMINATOR,
+        AUTHORITY_PROOF_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR,
+        QUANTUM_VAULT_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
     },
     transition,
 };
@@ -58,6 +59,13 @@ pub fn process(
             require_program_owner(program_id, account)?;
             let mut data = account.try_borrow_mut_data()?;
             process_init_authority_data(&mut data, args)
+        }
+        CoreInstruction::InitQuantumVault(args) => {
+            let account = get_account_info!(accounts, 0);
+            require_writable(account)?;
+            require_program_owner(program_id, account)?;
+            let mut data = account.try_borrow_mut_data()?;
+            process_init_quantum_vault_data(&mut data, args)
         }
         CoreInstruction::StageReceipt(receipt) => {
             let current_slot = current_slot()?;
@@ -297,6 +305,70 @@ pub fn process(
                 current_slot,
             )
         }
+        CoreInstruction::SplitQuantumVault { proof, amount } => {
+            let vault_account = get_account_info!(accounts, 0);
+            require_writable(vault_account)?;
+            require_program_owner(program_id, vault_account)?;
+
+            let split_account = get_account_info!(accounts, 1);
+            require_writable(split_account)?;
+            let refund_account = get_account_info!(accounts, 2);
+            require_writable(refund_account)?;
+
+            if vault_account.key() == split_account.key()
+                || vault_account.key() == refund_account.key()
+                || split_account.key() == refund_account.key()
+            {
+                return Err(ProgramError::InvalidArgument);
+            }
+
+            {
+                let mut vault_data = vault_account.try_borrow_mut_data()?;
+                process_split_quantum_vault_data(
+                    &mut vault_data,
+                    amount,
+                    *split_account.key(),
+                    *refund_account.key(),
+                    &proof,
+                    vault_account.lamports(),
+                )?;
+            }
+
+            {
+                let mut split_lamports = split_account.try_borrow_mut_lamports()?;
+                *split_lamports += amount;
+            }
+            {
+                let refund_amount = vault_account.lamports().saturating_sub(amount);
+                let mut refund_lamports = refund_account.try_borrow_mut_lamports()?;
+                *refund_lamports += refund_amount;
+            }
+
+            vault_account.close()
+        }
+        CoreInstruction::CloseQuantumVault(proof) => {
+            let vault_account = get_account_info!(accounts, 0);
+            require_writable(vault_account)?;
+            require_program_owner(program_id, vault_account)?;
+
+            let refund_account = get_account_info!(accounts, 1);
+            require_writable(refund_account)?;
+            if vault_account.key() == refund_account.key() {
+                return Err(ProgramError::InvalidArgument);
+            }
+
+            {
+                let mut vault_data = vault_account.try_borrow_mut_data()?;
+                process_close_quantum_vault_data(&mut vault_data, *refund_account.key(), &proof)?;
+            }
+
+            {
+                let mut refund_lamports = refund_account.try_borrow_mut_lamports()?;
+                *refund_lamports += vault_account.lamports();
+            }
+
+            vault_account.close()
+        }
     }
 }
 
@@ -359,6 +431,29 @@ pub fn process_init_authority_data(dst: &mut [u8], args: InitAuthorityArgs) -> P
     Ok(())
 }
 
+pub fn process_init_quantum_vault_data(
+    dst: &mut [u8],
+    args: InitQuantumVaultArgs,
+) -> ProgramResult {
+    if dst.len() != QuantumVaultState::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    if !is_zeroed(dst) {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+
+    let state = transition::initialize_quantum_vault(
+        args.current_authority_hash,
+        args.current_authority_root,
+        args.bump,
+    );
+    if !state.encode(dst) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Ok(())
+}
+
 pub fn process_init_authority_proof_data(
     dst: &mut [u8],
     args: InitAuthorityProofArgs,
@@ -406,6 +501,55 @@ pub fn process_write_authority_proof_chunk_data(
 
     state.proof_bytes[offset..end].copy_from_slice(chunk);
     state.bytes_written = end as u32;
+
+    if !state.encode(dst) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Ok(())
+}
+
+pub fn process_split_quantum_vault_data(
+    dst: &mut [u8],
+    amount: u64,
+    split_pubkey: [u8; 32],
+    refund_pubkey: [u8; 32],
+    proof: &WotsAuthProof,
+    vault_lamports: u64,
+) -> ProgramResult {
+    if dst.len() != QuantumVaultState::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let mut state = QuantumVaultState::decode(dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&state.discriminator, &QUANTUM_VAULT_DISCRIMINATOR)?;
+    transition::validate_quantum_vault_split_amount(vault_lamports, amount)
+        .map_err(map_transition_error)?;
+    transition::verify_quantum_vault_split(&state, amount, split_pubkey, refund_pubkey, proof)
+        .map_err(map_transition_error)?;
+    transition::close_quantum_vault(&mut state).map_err(map_transition_error)?;
+
+    if !state.encode(dst) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Ok(())
+}
+
+pub fn process_close_quantum_vault_data(
+    dst: &mut [u8],
+    refund_pubkey: [u8; 32],
+    proof: &WotsAuthProof,
+) -> ProgramResult {
+    if dst.len() != QuantumVaultState::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let mut state = QuantumVaultState::decode(dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&state.discriminator, &QUANTUM_VAULT_DISCRIMINATOR)?;
+    transition::verify_quantum_vault_close(&state, refund_pubkey, proof)
+        .map_err(map_transition_error)?;
+    transition::close_quantum_vault(&mut state).map_err(map_transition_error)?;
 
     if !state.encode(dst) {
         return Err(ProgramError::InvalidAccountData);
@@ -767,6 +911,8 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::AuthorityProofMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::AuthorityMerkleRootMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::AuthorityTreeExhausted => ProgramError::InvalidArgument,
+        transition::TransitionError::QuantumVaultClosed => ProgramError::AccountAlreadyInitialized,
+        transition::TransitionError::QuantumVaultAmountTooLarge => ProgramError::InsufficientFunds,
     }
 }
 
@@ -774,26 +920,29 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
 mod tests {
     use pinocchio::program_error::ProgramError;
     use vaulkyrie_protocol::{
-        ActionDescriptor, ActionKind, PolicyReceipt, ThresholdRequirement, WotsAuthProof,
-        WotsSecretKey, AUTHORITY_PROOF_CHUNK_MAX_BYTES, WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES,
-        XMSS_LEAF_COUNT,
+        quantum_close_digest, quantum_split_digest, ActionDescriptor, ActionKind, PolicyReceipt,
+        ThresholdRequirement, WotsAuthProof, WotsSecretKey, AUTHORITY_PROOF_CHUNK_MAX_BYTES,
+        WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES, XMSS_LEAF_COUNT,
     };
 
     use super::{
-        ensure_wallet_authority, process_activate_session_data, process_consume_receipt_data,
-        process_consume_session_data, process_finalize_session_data, process_init_authority_data,
-        process_init_authority_proof_data, process_init_vault_data, process_open_session_data,
+        ensure_wallet_authority, process_activate_session_data, process_close_quantum_vault_data,
+        process_consume_receipt_data, process_consume_session_data, process_finalize_session_data,
+        process_init_authority_data, process_init_authority_proof_data,
+        process_init_quantum_vault_data, process_init_vault_data, process_open_session_data,
         process_rotate_authority_data, process_rotate_authority_staged_data,
-        process_set_vault_status_data, process_stage_receipt_data,
-        process_write_authority_proof_chunk_data,
+        process_set_vault_status_data, process_split_quantum_vault_data,
+        process_stage_receipt_data, process_write_authority_proof_chunk_data,
     };
     use crate::{
         instruction::{
-            InitAuthorityArgs, InitAuthorityProofArgs, InitVaultArgs, WriteAuthorityProofChunkArgs,
+            InitAuthorityArgs, InitAuthorityProofArgs, InitQuantumVaultArgs, InitVaultArgs,
+            WriteAuthorityProofChunkArgs,
         },
         state::{
             ActionSessionState, AuthorityProofState, PolicyReceiptState, QuantumAuthorityState,
-            SessionStatus, VaultRegistry, VaultStatus, ACTION_SESSION_DISCRIMINATOR,
+            QuantumVaultState, QuantumVaultStatus, SessionStatus, VaultRegistry, VaultStatus,
+            ACTION_SESSION_DISCRIMINATOR,
         },
     };
 
@@ -2058,5 +2207,76 @@ mod tests {
             .expect_err("consumed staged receipt should fail");
 
         assert_eq!(error, ProgramError::AccountAlreadyInitialized);
+    }
+
+    #[test]
+    fn init_quantum_vault_writes_encoded_state() {
+        let mut bytes = [0; QuantumVaultState::LEN];
+
+        process_init_quantum_vault_data(
+            &mut bytes,
+            InitQuantumVaultArgs {
+                current_authority_hash: [7; 32],
+                current_authority_root: [8; 32],
+                bump: 4,
+            },
+        )
+        .expect("init quantum vault should succeed");
+
+        let state = QuantumVaultState::decode(&bytes).expect("quantum vault should decode");
+        assert_eq!(state.current_authority_hash, [7; 32]);
+        assert_eq!(state.current_authority_root, [8; 32]);
+        assert_eq!(state.status, QuantumVaultStatus::Open as u8);
+    }
+
+    #[test]
+    fn split_quantum_vault_marks_state_closed() {
+        let secret = sample_wots_secret(51);
+        let auth_path = sample_auth_path(41);
+        let digest = quantum_split_digest(55, [7; 32], [8; 32]);
+        let proof = secret.sign_digest_with_auth_path(digest, 0, auth_path);
+        let state = QuantumVaultState::new(secret.authority_hash(), proof.merkle_root(), 3);
+        let mut bytes = [0; QuantumVaultState::LEN];
+        assert!(state.encode(&mut bytes));
+
+        process_split_quantum_vault_data(&mut bytes, 55, [7; 32], [8; 32], &proof, 100)
+            .expect("split quantum vault should succeed");
+
+        let state = QuantumVaultState::decode(&bytes).expect("quantum vault should decode");
+        assert_eq!(state.status, QuantumVaultStatus::Closed as u8);
+    }
+
+    #[test]
+    fn split_quantum_vault_rejects_overspend() {
+        let secret = sample_wots_secret(52);
+        let auth_path = sample_auth_path(42);
+        let digest = quantum_split_digest(101, [7; 32], [8; 32]);
+        let proof = secret.sign_digest_with_auth_path(digest, 0, auth_path);
+        let state = QuantumVaultState::new(secret.authority_hash(), proof.merkle_root(), 3);
+        let mut bytes = [0; QuantumVaultState::LEN];
+        assert!(state.encode(&mut bytes));
+
+        let error =
+            process_split_quantum_vault_data(&mut bytes, 101, [7; 32], [8; 32], &proof, 100)
+                .expect_err("overspend must fail");
+
+        assert_eq!(error, ProgramError::InsufficientFunds);
+    }
+
+    #[test]
+    fn close_quantum_vault_marks_state_closed() {
+        let secret = sample_wots_secret(53);
+        let auth_path = sample_auth_path(43);
+        let digest = quantum_close_digest([9; 32]);
+        let proof = secret.sign_digest_with_auth_path(digest, 0, auth_path);
+        let state = QuantumVaultState::new(secret.authority_hash(), proof.merkle_root(), 3);
+        let mut bytes = [0; QuantumVaultState::LEN];
+        assert!(state.encode(&mut bytes));
+
+        process_close_quantum_vault_data(&mut bytes, [9; 32], &proof)
+            .expect("close quantum vault should succeed");
+
+        let state = QuantumVaultState::decode(&bytes).expect("quantum vault should decode");
+        assert_eq!(state.status, QuantumVaultStatus::Closed as u8);
     }
 }
