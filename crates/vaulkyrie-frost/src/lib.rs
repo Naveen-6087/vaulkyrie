@@ -5,6 +5,10 @@ use ed25519_dalek::{Signature as DalekSignature, Verifier, VerifyingKey as Dalek
 use frost_ed25519 as frost;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
+use solana_hash::Hash as SolanaHash;
+use solana_instruction::{AccountMeta, Instruction};
+use solana_message::legacy::Message as LegacyMessage;
+use solana_pubkey::Pubkey as SolanaPubkey;
 
 pub const DEFAULT_MIN_SIGNERS: u16 = 2;
 pub const DEFAULT_MAX_SIGNERS: u16 = 3;
@@ -62,9 +66,20 @@ pub struct RetryReport {
     pub report: HarnessReport,
 }
 
+#[derive(Debug, Clone)]
+pub struct SolanaMessageReport {
+    pub message_bytes: Vec<u8>,
+    pub report: HarnessReport,
+}
+
 pub fn run_dkg_signing_harness(message: &[u8]) -> Result<HarnessReport, HarnessError> {
     let config = HarnessConfig::default();
     run_dkg_signing_with_config(message, &config)
+}
+
+pub fn run_dkg_legacy_message_harness() -> Result<SolanaMessageReport, HarnessError> {
+    let config = HarnessConfig::default();
+    run_dkg_legacy_message_with_config(&config)
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +124,18 @@ pub fn run_dkg_signing_with_config(
     })
 }
 
+pub fn run_dkg_legacy_message_with_config(
+    config: &HarnessConfig,
+) -> Result<SolanaMessageReport, HarnessError> {
+    let message_bytes = build_sample_legacy_message();
+    let report = run_dkg_signing_with_config(&message_bytes, config)?;
+
+    Ok(SolanaMessageReport {
+        message_bytes,
+        report,
+    })
+}
+
 pub fn run_share_refresh_harness(message: &[u8]) -> Result<RefreshReport, HarnessError> {
     let config = HarnessConfig::default();
     run_share_refresh_with_config(message, &config)
@@ -125,27 +152,24 @@ pub fn run_share_refresh_with_config(
 
     let all_identifiers = participant_identifiers(config.max_signers)?;
     let mut refresh_rng = ChaCha20Rng::from_seed([29; 32]);
-    let (refreshing_shares, refreshed_public_key_package) = frost::keys::refresh::compute_refreshing_shares::<
-        frost::Ed25519Sha512,
-        _,
-    >(
-        public_key_package.clone(),
-        config.max_signers,
-        config.min_signers,
-        &all_identifiers,
-        &mut refresh_rng,
-    )?;
+    let (refreshing_shares, refreshed_public_key_package) =
+        frost::keys::refresh::compute_refreshing_shares::<frost::Ed25519Sha512, _>(
+            public_key_package.clone(),
+            config.max_signers,
+            config.min_signers,
+            &all_identifiers,
+            &mut refresh_rng,
+        )?;
 
     let mut refreshed_key_packages = BTreeMap::new();
     for (identifier, zero_share) in all_identifiers.iter().zip(refreshing_shares.into_iter()) {
         let old_key_package = initial_key_packages
             .get(identifier)
             .ok_or(HarnessError::InvalidConfig("missing original key package"))?;
-        let refreshed_key_package =
-            frost::keys::refresh::refresh_share::<frost::Ed25519Sha512>(
-                zero_share,
-                old_key_package,
-            )?;
+        let refreshed_key_package = frost::keys::refresh::refresh_share::<frost::Ed25519Sha512>(
+            zero_share,
+            old_key_package,
+        )?;
         refreshed_key_packages.insert(*identifier, refreshed_key_package);
     }
 
@@ -203,8 +227,9 @@ pub fn run_dkg_signing_with_retries(
         }
     }
 
-    Err(last_error
-        .unwrap_or(HarnessError::InvalidConfig("retry attempts exhausted without error")))
+    Err(last_error.unwrap_or(HarnessError::InvalidConfig(
+        "retry attempts exhausted without error",
+    )))
 }
 
 fn identifier_from_u16(participant: u16) -> Result<frost::Identifier, HarnessError> {
@@ -268,7 +293,8 @@ fn run_dkg(
             .get(&identifier)
             .ok_or(HarnessError::InvalidConfig("missing round1 secret package"))?
             .clone();
-        let (secret_package, packages) = frost::keys::dkg::part2(round1_secret, &peer_round1_packages)?;
+        let (secret_package, packages) =
+            frost::keys::dkg::part2(round1_secret, &peer_round1_packages)?;
 
         round2_secret_packages.insert(identifier, secret_package);
 
@@ -294,9 +320,12 @@ fn run_dkg(
         let round2_secret = round2_secret_packages
             .get(&identifier)
             .ok_or(HarnessError::InvalidConfig("missing round2 secret package"))?;
-        let round2_packages = round2_public_packages
-            .get(&identifier)
-            .ok_or(HarnessError::InvalidConfig("missing round2 public package set"))?;
+        let round2_packages =
+            round2_public_packages
+                .get(&identifier)
+                .ok_or(HarnessError::InvalidConfig(
+                    "missing round2 public package set",
+                ))?;
         let (key_package, participant_public_key_package) =
             frost::keys::dkg::part3(round2_secret, &peer_round1_packages, round2_packages)?;
 
@@ -323,7 +352,9 @@ fn sign_with_key_packages(
     for identifier in signing_participants {
         let key_package = key_packages
             .get(identifier)
-            .ok_or(HarnessError::InvalidConfig("missing key package for signer"))?;
+            .ok_or(HarnessError::InvalidConfig(
+                "missing key package for signer",
+            ))?;
         let (nonce, commitments) = frost::round1::commit(key_package.signing_share(), &mut *rng);
         nonces.insert(*identifier, nonce);
         nonce_commitments.insert(*identifier, commitments);
@@ -335,7 +366,9 @@ fn sign_with_key_packages(
     for identifier in signing_participants {
         let key_package = key_packages
             .get(identifier)
-            .ok_or(HarnessError::InvalidConfig("missing key package for signer"))?;
+            .ok_or(HarnessError::InvalidConfig(
+                "missing key package for signer",
+            ))?;
         let nonce = nonces
             .get(identifier)
             .ok_or(HarnessError::InvalidConfig("missing nonce for signer"))?;
@@ -343,7 +376,8 @@ fn sign_with_key_packages(
         signature_shares.insert(*identifier, signature_share);
     }
 
-    let group_signature = frost::aggregate(&signing_package, &signature_shares, public_key_package)?;
+    let group_signature =
+        frost::aggregate(&signing_package, &signature_shares, public_key_package)?;
     public_key_package
         .verifying_key()
         .verify(message, &group_signature)?;
@@ -367,12 +401,36 @@ fn sign_with_key_packages(
     Ok((public_key_bytes, signature_bytes))
 }
 
+fn build_sample_legacy_message() -> Vec<u8> {
+    let payer = SolanaPubkey::from([1; 32]);
+    let writable_target = SolanaPubkey::from([2; 32]);
+    let readonly_target = SolanaPubkey::from([3; 32]);
+    let program_id = SolanaPubkey::from([9; 32]);
+    let blockhash = SolanaHash::new_from_array([7; 32]);
+
+    let instruction = Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(writable_target, false),
+            AccountMeta::new_readonly(readonly_target, false),
+        ],
+        data: vec![1, 3, 3, 7],
+    };
+
+    LegacyMessage::new_with_blockhash(&[instruction], Some(&payer), &blockhash).serialize()
+}
+
 fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
     if config.min_signers == 0 || config.max_signers == 0 {
-        return Err(HarnessError::InvalidConfig("min/max signers must be non-zero"));
+        return Err(HarnessError::InvalidConfig(
+            "min/max signers must be non-zero",
+        ));
     }
     if config.min_signers > config.max_signers {
-        return Err(HarnessError::InvalidConfig("min_signers must be <= max_signers"));
+        return Err(HarnessError::InvalidConfig(
+            "min_signers must be <= max_signers",
+        ));
     }
     if config.signing_participants.len() < usize::from(config.min_signers) {
         return Err(HarnessError::InvalidConfig(
@@ -406,8 +464,9 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        run_dkg_signing_harness, run_dkg_signing_with_config, run_dkg_signing_with_retries,
-        run_share_refresh_harness, HarnessConfig, HarnessError,
+        run_dkg_legacy_message_harness, run_dkg_legacy_message_with_config, run_dkg_signing_harness,
+        run_dkg_signing_with_config, run_dkg_signing_with_retries, run_share_refresh_harness,
+        HarnessConfig, HarnessError,
     };
     use solana_signature::Signature as SolanaSignature;
 
@@ -422,10 +481,10 @@ mod tests {
 
     #[test]
     fn dkg_harness_is_deterministic_for_fixed_rng_seed() {
-        let first = run_dkg_signing_harness(b"vaulkyrie frost harness")
-            .expect("first run should succeed");
-        let second = run_dkg_signing_harness(b"vaulkyrie frost harness")
-            .expect("second run should succeed");
+        let first =
+            run_dkg_signing_harness(b"vaulkyrie frost harness").expect("first run should succeed");
+        let second =
+            run_dkg_signing_harness(b"vaulkyrie frost harness").expect("second run should succeed");
 
         assert_eq!(first.group_public_key, second.group_public_key);
         assert_eq!(first.signature, second.signature);
@@ -439,6 +498,33 @@ mod tests {
         let solana_signature = SolanaSignature::from(report.signature);
 
         assert!(solana_signature.verify(&report.group_public_key, message));
+    }
+
+    #[test]
+    fn legacy_message_harness_signs_serialized_solana_message_bytes() {
+        let report =
+            run_dkg_legacy_message_harness().expect("legacy message signing harness should succeed");
+        let solana_signature = SolanaSignature::from(report.report.signature);
+
+        assert!(!report.message_bytes.is_empty());
+        assert!(solana_signature.verify(&report.report.group_public_key, &report.message_bytes));
+    }
+
+    #[test]
+    fn legacy_message_harness_supports_custom_signer_set() {
+        let config = HarnessConfig {
+            min_signers: 3,
+            max_signers: 5,
+            signing_participants: vec![1, 3, 5],
+            rng_seed: [41; 32],
+        };
+
+        let report = run_dkg_legacy_message_with_config(&config)
+            .expect("legacy message harness should support custom signer sets");
+        let solana_signature = SolanaSignature::from(report.report.signature);
+
+        assert_eq!(report.report.signer_set, vec![1, 3, 5]);
+        assert!(solana_signature.verify(&report.report.group_public_key, &report.message_bytes));
     }
 
     #[test]
@@ -519,7 +605,10 @@ mod tests {
         let report = run_share_refresh_harness(message).expect("refresh harness should succeed");
         let solana_signature = SolanaSignature::from(report.signature);
 
-        assert_eq!(report.original_group_public_key, report.refreshed_group_public_key);
+        assert_eq!(
+            report.original_group_public_key,
+            report.refreshed_group_public_key
+        );
         assert!(solana_signature.verify(&report.refreshed_group_public_key, message));
     }
 
