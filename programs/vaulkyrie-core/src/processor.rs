@@ -5,14 +5,17 @@ use pinocchio::{
     sysvars::{clock::Clock, Sysvar},
     ProgramResult,
 };
-use vaulkyrie_protocol::{AuthorityRotationStatement, PolicyReceipt};
+use vaulkyrie_protocol::{AuthorityRotationStatement, PolicyReceipt, WotsAuthProof};
 
 use crate::{
-    instruction::{CoreInstruction, InitAuthorityArgs, InitVaultArgs},
+    instruction::{
+        CoreInstruction, InitAuthorityArgs, InitAuthorityProofArgs, InitVaultArgs,
+        WriteAuthorityProofChunkArgs,
+    },
     state::{
-        ActionSessionState, PolicyReceiptState, QuantumAuthorityState, VaultRegistry,
-        ACTION_SESSION_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR,
-        VAULT_REGISTRY_DISCRIMINATOR,
+        ActionSessionState, AuthorityProofState, PolicyReceiptState, QuantumAuthorityState,
+        VaultRegistry, ACTION_SESSION_DISCRIMINATOR, AUTHORITY_PROOF_DISCRIMINATOR,
+        POLICY_RECEIPT_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
     },
     transition,
 };
@@ -232,6 +235,68 @@ pub fn process(
                 current_slot,
             )
         }
+        CoreInstruction::InitAuthorityProof(args) => {
+            let vault_account = get_account_info!(accounts, 1);
+            require_program_owner(program_id, vault_account)?;
+            let vault_data = vault_account.try_borrow_data()?;
+            let vault = decode_vault_state(&vault_data)?;
+            let wallet_signer = get_account_info!(accounts, 2);
+            require_wallet_authority(&vault, wallet_signer)?;
+
+            let proof_account = get_account_info!(accounts, 0);
+            require_writable(proof_account)?;
+            require_program_owner(program_id, proof_account)?;
+            let mut proof_data = proof_account.try_borrow_mut_data()?;
+
+            process_init_authority_proof_data(&mut proof_data, args)
+        }
+        CoreInstruction::WriteAuthorityProofChunk(args) => {
+            let vault_account = get_account_info!(accounts, 1);
+            require_program_owner(program_id, vault_account)?;
+            let vault_data = vault_account.try_borrow_data()?;
+            let vault = decode_vault_state(&vault_data)?;
+            let wallet_signer = get_account_info!(accounts, 2);
+            require_wallet_authority(&vault, wallet_signer)?;
+
+            let proof_account = get_account_info!(accounts, 0);
+            require_writable(proof_account)?;
+            require_program_owner(program_id, proof_account)?;
+            let mut proof_data = proof_account.try_borrow_mut_data()?;
+
+            process_write_authority_proof_chunk_data(&mut proof_data, args)
+        }
+        CoreInstruction::RotateAuthorityStaged(statement) => {
+            let current_slot = current_slot()?;
+            let vault_account = get_account_info!(accounts, 0);
+            require_program_owner(program_id, vault_account)?;
+            {
+                let vault_data = vault_account.try_borrow_data()?;
+                let vault = decode_vault_state(&vault_data)?;
+                transition::validate_vault_recovery_mode(&vault).map_err(map_transition_error)?;
+                let wallet_signer = get_account_info!(accounts, 3);
+                require_wallet_authority(&vault, wallet_signer)?;
+            }
+            require_writable(vault_account)?;
+            let mut vault_data = vault_account.try_borrow_mut_data()?;
+
+            let authority_account = get_account_info!(accounts, 1);
+            require_writable(authority_account)?;
+            require_program_owner(program_id, authority_account)?;
+            let mut authority_data = authority_account.try_borrow_mut_data()?;
+
+            let proof_account = get_account_info!(accounts, 2);
+            require_writable(proof_account)?;
+            require_program_owner(program_id, proof_account)?;
+            let mut proof_data = proof_account.try_borrow_mut_data()?;
+
+            process_rotate_authority_staged_data(
+                &mut vault_data,
+                &mut authority_data,
+                &mut proof_data,
+                &statement,
+                current_slot,
+            )
+        }
     }
 }
 
@@ -287,6 +352,61 @@ pub fn process_init_authority_data(dst: &mut [u8], args: InitAuthorityArgs) -> P
         args.current_authority_root,
         args.bump,
     );
+    if !state.encode(dst) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Ok(())
+}
+
+pub fn process_init_authority_proof_data(
+    dst: &mut [u8],
+    args: InitAuthorityProofArgs,
+) -> ProgramResult {
+    if dst.len() != AuthorityProofState::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    if !is_zeroed(dst) {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+
+    let state = AuthorityProofState::new(args.statement_digest, args.proof_commitment);
+    if !state.encode(dst) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Ok(())
+}
+
+pub fn process_write_authority_proof_chunk_data(
+    dst: &mut [u8],
+    args: WriteAuthorityProofChunkArgs,
+) -> ProgramResult {
+    if dst.len() != AuthorityProofState::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let mut state = AuthorityProofState::decode(dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&state.discriminator, &AUTHORITY_PROOF_DISCRIMINATOR)?;
+    if state.consumed != 0 {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+
+    let offset = usize::try_from(args.offset).map_err(|_| ProgramError::InvalidArgument)?;
+    let chunk = args.chunk_bytes();
+    if offset != state.bytes_written as usize {
+        return Err(ProgramError::InvalidArgument);
+    }
+    let end = offset
+        .checked_add(chunk.len())
+        .ok_or(ProgramError::InvalidArgument)?;
+    if end > WotsAuthProof::ENCODED_LEN {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    state.proof_bytes[offset..end].copy_from_slice(chunk);
+    state.bytes_written = end as u32;
+
     if !state.encode(dst) {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -512,6 +632,49 @@ pub fn process_rotate_authority_data(
     Ok(())
 }
 
+pub fn process_rotate_authority_staged_data(
+    vault_dst: &mut [u8],
+    authority_dst: &mut [u8],
+    proof_dst: &mut [u8],
+    statement: &AuthorityRotationStatement,
+    current_slot: u64,
+) -> ProgramResult {
+    if vault_dst.len() != VaultRegistry::LEN
+        || authority_dst.len() != QuantumAuthorityState::LEN
+        || proof_dst.len() != AuthorityProofState::LEN
+    {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let mut proof_state =
+        AuthorityProofState::decode(proof_dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&proof_state.discriminator, &AUTHORITY_PROOF_DISCRIMINATOR)?;
+    if proof_state.consumed != 0 {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+    if proof_state.statement_digest != statement.digest() {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if proof_state.bytes_written as usize != WotsAuthProof::ENCODED_LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let proof =
+        WotsAuthProof::decode(&proof_state.proof_bytes).ok_or(ProgramError::InvalidAccountData)?;
+    if proof.commitment() != proof_state.proof_commitment {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    process_rotate_authority_data(vault_dst, authority_dst, statement, &proof, current_slot)?;
+    proof_state.consumed = 1;
+
+    if !proof_state.encode(proof_dst) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Ok(())
+}
+
 fn require_writable(account: &AccountInfo) -> ProgramResult {
     if account.is_writable() {
         Ok(())
@@ -611,21 +774,26 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
 mod tests {
     use pinocchio::program_error::ProgramError;
     use vaulkyrie_protocol::{
-        ActionDescriptor, ActionKind, PolicyReceipt, ThresholdRequirement, WotsSecretKey,
-        WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES, XMSS_LEAF_COUNT,
+        ActionDescriptor, ActionKind, PolicyReceipt, ThresholdRequirement, WotsAuthProof,
+        WotsSecretKey, AUTHORITY_PROOF_CHUNK_MAX_BYTES, WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES,
+        XMSS_LEAF_COUNT,
     };
 
     use super::{
         ensure_wallet_authority, process_activate_session_data, process_consume_receipt_data,
         process_consume_session_data, process_finalize_session_data, process_init_authority_data,
-        process_init_vault_data, process_open_session_data, process_rotate_authority_data,
+        process_init_authority_proof_data, process_init_vault_data, process_open_session_data,
+        process_rotate_authority_data, process_rotate_authority_staged_data,
         process_set_vault_status_data, process_stage_receipt_data,
+        process_write_authority_proof_chunk_data,
     };
     use crate::{
-        instruction::{InitAuthorityArgs, InitVaultArgs},
+        instruction::{
+            InitAuthorityArgs, InitAuthorityProofArgs, InitVaultArgs, WriteAuthorityProofChunkArgs,
+        },
         state::{
-            ActionSessionState, PolicyReceiptState, QuantumAuthorityState, SessionStatus,
-            VaultRegistry, VaultStatus, ACTION_SESSION_DISCRIMINATOR,
+            ActionSessionState, AuthorityProofState, PolicyReceiptState, QuantumAuthorityState,
+            SessionStatus, VaultRegistry, VaultStatus, ACTION_SESSION_DISCRIMINATOR,
         },
     };
 
@@ -680,6 +848,43 @@ mod tests {
             *byte = seed.wrapping_add(index as u8);
         }
         auth_path
+    }
+
+    fn stage_full_authority_proof(
+        statement: &vaulkyrie_protocol::AuthorityRotationStatement,
+        proof: &WotsAuthProof,
+    ) -> [u8; AuthorityProofState::LEN] {
+        let mut bytes = [0; AuthorityProofState::LEN];
+        process_init_authority_proof_data(
+            &mut bytes,
+            InitAuthorityProofArgs {
+                statement_digest: statement.digest(),
+                proof_commitment: proof.commitment(),
+            },
+        )
+        .expect("authority proof init should succeed");
+
+        let mut encoded = [0u8; WotsAuthProof::ENCODED_LEN];
+        assert!(proof.encode(&mut encoded));
+        let mut offset = 0usize;
+        while offset < encoded.len() {
+            let end = core::cmp::min(offset + AUTHORITY_PROOF_CHUNK_MAX_BYTES, encoded.len());
+            let chunk_len = end - offset;
+            let mut chunk = [0u8; AUTHORITY_PROOF_CHUNK_MAX_BYTES];
+            chunk[..chunk_len].copy_from_slice(&encoded[offset..end]);
+            process_write_authority_proof_chunk_data(
+                &mut bytes,
+                WriteAuthorityProofChunkArgs {
+                    offset: offset as u32,
+                    chunk_len: chunk_len as u16,
+                    chunk,
+                },
+            )
+            .expect("authority proof chunk write should succeed");
+            offset = end;
+        }
+
+        bytes
     }
 
     #[test]
@@ -821,6 +1026,82 @@ mod tests {
     }
 
     #[test]
+    fn init_authority_proof_writes_encoded_state() {
+        let mut bytes = [0; AuthorityProofState::LEN];
+
+        process_init_authority_proof_data(
+            &mut bytes,
+            InitAuthorityProofArgs {
+                statement_digest: [7; 32],
+                proof_commitment: [8; 32],
+            },
+        )
+        .expect("authority proof init should succeed");
+
+        let state = AuthorityProofState::decode(&bytes).expect("state should decode");
+        assert_eq!(state.statement_digest, [7; 32]);
+        assert_eq!(state.proof_commitment, [8; 32]);
+        assert_eq!(state.bytes_written, 0);
+        assert_eq!(state.consumed, 0);
+    }
+
+    #[test]
+    fn write_authority_proof_chunk_appends_bytes() {
+        let mut bytes = [0; AuthorityProofState::LEN];
+        process_init_authority_proof_data(
+            &mut bytes,
+            InitAuthorityProofArgs {
+                statement_digest: [7; 32],
+                proof_commitment: [8; 32],
+            },
+        )
+        .expect("authority proof init should succeed");
+
+        let mut chunk = [0u8; AUTHORITY_PROOF_CHUNK_MAX_BYTES];
+        chunk[..3].copy_from_slice(&[1, 2, 3]);
+        process_write_authority_proof_chunk_data(
+            &mut bytes,
+            WriteAuthorityProofChunkArgs {
+                offset: 0,
+                chunk_len: 3,
+                chunk,
+            },
+        )
+        .expect("authority proof chunk write should succeed");
+
+        let state = AuthorityProofState::decode(&bytes).expect("state should decode");
+        assert_eq!(state.bytes_written, 3);
+        assert_eq!(&state.proof_bytes[..3], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn write_authority_proof_chunk_rejects_wrong_offset() {
+        let mut bytes = [0; AuthorityProofState::LEN];
+        process_init_authority_proof_data(
+            &mut bytes,
+            InitAuthorityProofArgs {
+                statement_digest: [7; 32],
+                proof_commitment: [8; 32],
+            },
+        )
+        .expect("authority proof init should succeed");
+
+        let mut chunk = [0u8; AUTHORITY_PROOF_CHUNK_MAX_BYTES];
+        chunk[..3].copy_from_slice(&[1, 2, 3]);
+        let error = process_write_authority_proof_chunk_data(
+            &mut bytes,
+            WriteAuthorityProofChunkArgs {
+                offset: 1,
+                chunk_len: 3,
+                chunk,
+            },
+        )
+        .expect_err("authority proof chunk offset must be append-only");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
+    }
+
+    #[test]
     fn stage_and_consume_receipt_updates_consumed_flag() {
         let receipt = sample_receipt();
         let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
@@ -953,6 +1234,119 @@ mod tests {
         assert_eq!(state.current_authority_hash, [8; 32]);
         assert_eq!(state.next_sequence, 1);
         assert_eq!(state.next_leaf_index, 1);
+    }
+
+    #[test]
+    fn rotate_authority_staged_updates_current_hash() {
+        let mut vault_bytes = [0; VaultRegistry::LEN];
+        let mut authority_bytes = [0; QuantumAuthorityState::LEN];
+        let secret = sample_wots_secret(41);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            secret.authority_hash(),
+            3,
+            crate::state::VaultStatus::Recovery,
+            8,
+        );
+        let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
+        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(40));
+        let initial = QuantumAuthorityState::new(secret.authority_hash(), proof.merkle_root(), 1);
+        let mut proof_bytes = stage_full_authority_proof(&statement, &proof);
+        assert!(vault.encode(&mut vault_bytes));
+        assert!(initial.encode(&mut authority_bytes));
+
+        process_rotate_authority_staged_data(
+            &mut vault_bytes,
+            &mut authority_bytes,
+            &mut proof_bytes,
+            &statement,
+            10,
+        )
+        .expect("staged rotation should succeed");
+
+        let vault = VaultRegistry::decode(&vault_bytes).expect("vault should decode");
+        let state = QuantumAuthorityState::decode(&authority_bytes).expect("state should decode");
+        let proof_state = AuthorityProofState::decode(&proof_bytes).expect("proof should decode");
+        assert_eq!(vault.current_authority_hash, [8; 32]);
+        assert_eq!(state.current_authority_hash, [8; 32]);
+        assert_eq!(state.next_leaf_index, 1);
+        assert_eq!(proof_state.consumed, 1);
+    }
+
+    #[test]
+    fn rotate_authority_staged_rejects_incomplete_proof() {
+        let mut vault_bytes = [0; VaultRegistry::LEN];
+        let mut authority_bytes = [0; QuantumAuthorityState::LEN];
+        let mut proof_bytes = [0; AuthorityProofState::LEN];
+        let secret = sample_wots_secret(41);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            secret.authority_hash(),
+            3,
+            crate::state::VaultStatus::Recovery,
+            8,
+        );
+        let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
+        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(41));
+        let initial = QuantumAuthorityState::new(secret.authority_hash(), proof.merkle_root(), 1);
+        assert!(vault.encode(&mut vault_bytes));
+        assert!(initial.encode(&mut authority_bytes));
+        process_init_authority_proof_data(
+            &mut proof_bytes,
+            InitAuthorityProofArgs {
+                statement_digest: statement.digest(),
+                proof_commitment: proof.commitment(),
+            },
+        )
+        .expect("authority proof init should succeed");
+
+        let error = process_rotate_authority_staged_data(
+            &mut vault_bytes,
+            &mut authority_bytes,
+            &mut proof_bytes,
+            &statement,
+            10,
+        )
+        .expect_err("staged rotation should reject incomplete proof data");
+
+        assert_eq!(error, ProgramError::InvalidAccountData);
+    }
+
+    #[test]
+    fn rotate_authority_staged_rejects_commitment_mismatch() {
+        let mut vault_bytes = [0; VaultRegistry::LEN];
+        let mut authority_bytes = [0; QuantumAuthorityState::LEN];
+        let secret = sample_wots_secret(41);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            secret.authority_hash(),
+            3,
+            crate::state::VaultStatus::Recovery,
+            8,
+        );
+        let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
+        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(42));
+        let initial = QuantumAuthorityState::new(secret.authority_hash(), proof.merkle_root(), 1);
+        let mut proof_bytes = stage_full_authority_proof(&statement, &proof);
+        {
+            let mut proof_state =
+                AuthorityProofState::decode(&proof_bytes).expect("proof should decode");
+            proof_state.proof_commitment = [9; 32];
+            assert!(proof_state.encode(&mut proof_bytes));
+        }
+        assert!(vault.encode(&mut vault_bytes));
+        assert!(initial.encode(&mut authority_bytes));
+
+        let error = process_rotate_authority_staged_data(
+            &mut vault_bytes,
+            &mut authority_bytes,
+            &mut proof_bytes,
+            &statement,
+            10,
+        )
+        .expect_err("staged rotation should reject mismatched proof commitment");
+
+        assert_eq!(error, ProgramError::InvalidArgument);
     }
 
     #[test]

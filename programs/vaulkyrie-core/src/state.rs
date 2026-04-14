@@ -1,9 +1,11 @@
 use core::mem::size_of;
+use vaulkyrie_protocol::WotsAuthProof;
 
 pub const VAULT_REGISTRY_DISCRIMINATOR: [u8; 8] = *b"VAULKYR1";
 pub const POLICY_RECEIPT_DISCRIMINATOR: [u8; 8] = *b"POLRCPT1";
 pub const ACTION_SESSION_DISCRIMINATOR: [u8; 8] = *b"SESSION1";
 pub const QUANTUM_STATE_DISCRIMINATOR: [u8; 8] = *b"QSTATE01";
+pub const AUTHORITY_PROOF_DISCRIMINATOR: [u8; 8] = *b"AUTHPRF1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -369,13 +371,94 @@ impl QuantumAuthorityState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct AuthorityProofState {
+    pub discriminator: [u8; 8],
+    pub statement_digest: [u8; 32],
+    pub proof_commitment: [u8; 32],
+    pub bytes_written: u32,
+    pub consumed: u8,
+    pub reserved: [u8; 3],
+    pub proof_bytes: [u8; WotsAuthProof::ENCODED_LEN],
+}
+
+impl AuthorityProofState {
+    pub const HEADER_LEN: usize = 80;
+    pub const LEN: usize = size_of::<Self>();
+
+    pub const fn new(statement_digest: [u8; 32], proof_commitment: [u8; 32]) -> Self {
+        Self {
+            discriminator: AUTHORITY_PROOF_DISCRIMINATOR,
+            statement_digest,
+            proof_commitment,
+            bytes_written: 0,
+            consumed: 0,
+            reserved: [0; 3],
+            proof_bytes: [0; WotsAuthProof::ENCODED_LEN],
+        }
+    }
+
+    pub fn encode(self, dst: &mut [u8]) -> bool {
+        if dst.len() != Self::LEN {
+            return false;
+        }
+
+        dst[..8].copy_from_slice(&self.discriminator);
+        dst[8..40].copy_from_slice(&self.statement_digest);
+        dst[40..72].copy_from_slice(&self.proof_commitment);
+        dst[72..76].copy_from_slice(&self.bytes_written.to_le_bytes());
+        dst[76] = self.consumed;
+        dst[77..80].copy_from_slice(&self.reserved);
+        dst[80..Self::LEN].copy_from_slice(&self.proof_bytes);
+
+        true
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::LEN {
+            return None;
+        }
+
+        let mut discriminator = [0; 8];
+        discriminator.copy_from_slice(&src[..8]);
+
+        let mut statement_digest = [0; 32];
+        statement_digest.copy_from_slice(&src[8..40]);
+
+        let mut proof_commitment = [0; 32];
+        proof_commitment.copy_from_slice(&src[40..72]);
+
+        let mut bytes_written = [0; 4];
+        bytes_written.copy_from_slice(&src[72..76]);
+
+        let mut reserved = [0; 3];
+        reserved.copy_from_slice(&src[77..80]);
+
+        let mut proof_bytes = [0; WotsAuthProof::ENCODED_LEN];
+        proof_bytes.copy_from_slice(&src[80..Self::LEN]);
+
+        Some(Self {
+            discriminator,
+            statement_digest,
+            proof_commitment,
+            bytes_written: u32::from_le_bytes(bytes_written),
+            consumed: src[76],
+            reserved,
+            proof_bytes,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionSessionState, PolicyReceiptState, QuantumAuthorityState, SessionStatus,
-        VaultRegistry, VaultStatus, ACTION_SESSION_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR,
-        QUANTUM_STATE_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
+        ActionSessionState, AuthorityProofState, PolicyReceiptState, QuantumAuthorityState,
+        SessionStatus, VaultRegistry, VaultStatus, ACTION_SESSION_DISCRIMINATOR,
+        AUTHORITY_PROOF_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR,
+        VAULT_REGISTRY_DISCRIMINATOR,
     };
+    use vaulkyrie_protocol::WotsAuthProof;
 
     #[test]
     fn vault_registry_layout_is_stable() {
@@ -444,5 +527,22 @@ mod tests {
         assert_eq!(state.policy_version, 77);
         assert_eq!(state.status, SessionStatus::Pending as u8);
         assert_eq!(ActionSessionState::LEN, 96);
+    }
+
+    #[test]
+    fn authority_proof_state_roundtrips_through_bytes() {
+        let mut state = AuthorityProofState::new([7; 32], [8; 32]);
+        state.bytes_written = 9;
+        state.consumed = 1;
+        state.proof_bytes[0] = 3;
+        let mut bytes = [0; AuthorityProofState::LEN];
+
+        assert!(state.encode(&mut bytes));
+        assert_eq!(AuthorityProofState::decode(&bytes), Some(state));
+        assert_eq!(state.discriminator, AUTHORITY_PROOF_DISCRIMINATOR);
+        assert_eq!(
+            AuthorityProofState::LEN,
+            AuthorityProofState::HEADER_LEN + WotsAuthProof::ENCODED_LEN
+        );
     }
 }

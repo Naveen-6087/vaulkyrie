@@ -74,6 +74,7 @@ pub const XMSS_TREE_HEIGHT: usize = 8;
 pub const XMSS_NODE_BYTES: usize = 32;
 pub const XMSS_AUTH_PATH_BYTES: usize = XMSS_TREE_HEIGHT * XMSS_NODE_BYTES;
 pub const XMSS_LEAF_COUNT: u32 = 1u32 << XMSS_TREE_HEIGHT;
+pub const AUTHORITY_PROOF_CHUNK_MAX_BYTES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyReceipt {
@@ -157,6 +158,16 @@ impl WotsAuthProof {
     pub fn authority_hash(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(self.public_key);
+        hasher.finalize().into()
+    }
+
+    pub fn commitment(&self) -> [u8; 32] {
+        let mut encoded = [0u8; Self::ENCODED_LEN];
+        let did_encode = self.encode(&mut encoded);
+        debug_assert!(did_encode);
+
+        let mut hasher = Sha256::new();
+        hasher.update(encoded);
         hasher.finalize().into()
     }
 

@@ -1,6 +1,7 @@
 use pinocchio::program_error::ProgramError;
 use vaulkyrie_protocol::{
     AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement, WotsAuthProof,
+    AUTHORITY_PROOF_CHUNK_MAX_BYTES,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +25,25 @@ pub struct RotateAuthorityArgs {
     pub proof: WotsAuthProof,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitAuthorityProofArgs {
+    pub statement_digest: [u8; 32],
+    pub proof_commitment: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteAuthorityProofChunkArgs {
+    pub offset: u32,
+    pub chunk_len: u16,
+    pub chunk: [u8; AUTHORITY_PROOF_CHUNK_MAX_BYTES],
+}
+
+impl WriteAuthorityProofChunkArgs {
+    pub fn chunk_bytes(&self) -> &[u8] {
+        &self.chunk[..usize::from(self.chunk_len)]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreInstruction {
     Ping,
@@ -37,6 +57,9 @@ pub enum CoreInstruction {
     FinalizeSession(PolicyReceipt),
     SetVaultStatus(u8),
     RotateAuthority(RotateAuthorityArgs),
+    InitAuthorityProof(InitAuthorityProofArgs),
+    WriteAuthorityProofChunk(WriteAuthorityProofChunkArgs),
+    RotateAuthorityStaged(AuthorityRotationStatement),
 }
 
 impl TryFrom<&[u8]> for CoreInstruction {
@@ -55,6 +78,13 @@ impl TryFrom<&[u8]> for CoreInstruction {
             [8, rest @ ..] => Ok(Self::FinalizeSession(parse_policy_receipt(rest)?)),
             [9, rest @ ..] => Ok(Self::SetVaultStatus(parse_vault_status(rest)?)),
             [10, rest @ ..] => Ok(Self::RotateAuthority(parse_rotate_authority_args(rest)?)),
+            [11, rest @ ..] => Ok(Self::InitAuthorityProof(parse_init_authority_proof(rest)?)),
+            [12, rest @ ..] => Ok(Self::WriteAuthorityProofChunk(
+                parse_write_authority_proof_chunk(rest)?,
+            )),
+            [13, rest @ ..] => Ok(Self::RotateAuthorityStaged(
+                parse_authority_rotation_statement(rest)?,
+            )),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -185,13 +215,65 @@ fn parse_rotate_authority_args(data: &[u8]) -> Result<RotateAuthorityArgs, Progr
     Ok(RotateAuthorityArgs { statement, proof })
 }
 
+fn parse_init_authority_proof(data: &[u8]) -> Result<InitAuthorityProofArgs, ProgramError> {
+    if data.len() != 64 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut statement_digest = [0; 32];
+    statement_digest.copy_from_slice(&data[..32]);
+
+    let mut proof_commitment = [0; 32];
+    proof_commitment.copy_from_slice(&data[32..64]);
+
+    Ok(InitAuthorityProofArgs {
+        statement_digest,
+        proof_commitment,
+    })
+}
+
+fn parse_write_authority_proof_chunk(
+    data: &[u8],
+) -> Result<WriteAuthorityProofChunkArgs, ProgramError> {
+    if data.len() < 6 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut offset = [0; 4];
+    offset.copy_from_slice(&data[..4]);
+
+    let mut chunk_len = [0; 2];
+    chunk_len.copy_from_slice(&data[4..6]);
+    let chunk_len = u16::from_le_bytes(chunk_len);
+    let chunk_len_usize = usize::from(chunk_len);
+
+    if chunk_len_usize == 0
+        || chunk_len_usize > AUTHORITY_PROOF_CHUNK_MAX_BYTES
+        || data.len() != 6 + chunk_len_usize
+    {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut chunk = [0; AUTHORITY_PROOF_CHUNK_MAX_BYTES];
+    chunk[..chunk_len_usize].copy_from_slice(&data[6..]);
+
+    Ok(WriteAuthorityProofChunkArgs {
+        offset: u32::from_le_bytes(offset),
+        chunk_len,
+        chunk,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CoreInstruction, InitAuthorityArgs, InitVaultArgs, RotateAuthorityArgs};
+    use super::{
+        CoreInstruction, InitAuthorityArgs, InitAuthorityProofArgs, InitVaultArgs,
+        RotateAuthorityArgs, WriteAuthorityProofChunkArgs,
+    };
     use pinocchio::program_error::ProgramError;
     use vaulkyrie_protocol::{
         AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement, WotsAuthProof,
-        WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES,
+        AUTHORITY_PROOF_CHUNK_MAX_BYTES, WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES,
     };
 
     #[test]
@@ -373,6 +455,66 @@ mod tests {
     }
 
     #[test]
+    fn parses_init_authority_proof_instruction() {
+        let mut data = vec![11];
+        data.extend_from_slice(&[5; 32]);
+        data.extend_from_slice(&[6; 32]);
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::InitAuthorityProof(
+                InitAuthorityProofArgs {
+                    statement_digest: [5; 32],
+                    proof_commitment: [6; 32],
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_write_authority_proof_chunk_instruction() {
+        let mut data = vec![12];
+        data.extend_from_slice(&9u32.to_le_bytes());
+        data.extend_from_slice(&3u16.to_le_bytes());
+        data.extend_from_slice(&[7, 8, 9]);
+
+        let mut chunk = [0; AUTHORITY_PROOF_CHUNK_MAX_BYTES];
+        chunk[..3].copy_from_slice(&[7, 8, 9]);
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::WriteAuthorityProofChunk(
+                WriteAuthorityProofChunkArgs {
+                    offset: 9,
+                    chunk_len: 3,
+                    chunk,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_rotate_authority_staged_instruction() {
+        let mut data = vec![13];
+        data.extend_from_slice(&[5; 32]);
+        data.extend_from_slice(&[6; 32]);
+        data.extend_from_slice(&13u64.to_le_bytes());
+        data.extend_from_slice(&14u64.to_le_bytes());
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::RotateAuthorityStaged(
+                AuthorityRotationStatement {
+                    action_hash: [5; 32],
+                    next_authority_hash: [6; 32],
+                    sequence: 13,
+                    expiry_slot: 14,
+                }
+            ))
+        );
+    }
+
+    #[test]
     fn rejects_unknown_threshold_encoding() {
         let mut data = vec![3];
         data.extend_from_slice(&[4; 32]);
@@ -380,6 +522,19 @@ mod tests {
         data.push(99);
         data.extend_from_slice(&11u64.to_le_bytes());
         data.extend_from_slice(&12u64.to_le_bytes());
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Err(ProgramError::InvalidInstructionData)
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_authority_chunk() {
+        let mut data = vec![12];
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&257u16.to_le_bytes());
+        data.resize(1 + 4 + 2 + 257, 1);
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
