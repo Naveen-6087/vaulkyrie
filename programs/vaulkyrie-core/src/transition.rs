@@ -62,6 +62,8 @@ pub enum TransitionError {
     AuthorityMigrationNoOp,
     /// Policy version must advance by exactly 1.
     PolicyVersionNotMonotonic,
+    /// Completing a spend orchestration requires a non-zero tx binding hash.
+    TxBindingMissing,
 }
 
 pub fn initialize_vault(
@@ -583,6 +585,7 @@ pub fn commit_spend_orchestration(
 pub fn complete_spend_orchestration(
     state: &mut SpendOrchestrationState,
     action_hash: [u8; 32],
+    tx_binding: [u8; 32],
     current_slot: u64,
 ) -> Result<(), TransitionError> {
     if state.expiry_slot <= current_slot {
@@ -594,7 +597,11 @@ pub fn complete_spend_orchestration(
     if state.action_hash != action_hash {
         return Err(TransitionError::OrchestrationActionMismatch);
     }
+    if tx_binding == [0; 32] {
+        return Err(TransitionError::TxBindingMissing);
+    }
 
+    state.tx_binding = tx_binding;
     state.status = OrchestrationStatus::Complete as u8;
     Ok(())
 }
@@ -1794,9 +1801,11 @@ mod tests {
         .unwrap();
         commit_spend_orchestration(&mut state, [1; 32], [5; 32], 600).unwrap();
 
-        complete_spend_orchestration(&mut state, [1; 32], 700).expect("should complete");
+        complete_spend_orchestration(&mut state, [1; 32], [99; 32], 700)
+            .expect("should complete");
 
         assert_eq!(state.status, OrchestrationStatus::Complete as u8);
+        assert_eq!(state.tx_binding, [99; 32]);
     }
 
     #[test]
@@ -1823,7 +1832,7 @@ mod tests {
         )
         .unwrap();
         commit_spend_orchestration(&mut state, [1; 32], [5; 32], 600).unwrap();
-        complete_spend_orchestration(&mut state, [1; 32], 700).unwrap();
+        complete_spend_orchestration(&mut state, [1; 32], [99; 32], 700).unwrap();
 
         let error = fail_spend_orchestration(&mut state, [1; 32])
             .expect_err("complete orchestration cannot be failed");

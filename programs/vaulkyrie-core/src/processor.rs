@@ -1128,6 +1128,7 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         }
         transition::TransitionError::AuthorityMigrationNoOp => ProgramError::InvalidArgument,
         transition::TransitionError::PolicyVersionNotMonotonic => ProgramError::InvalidArgument,
+        transition::TransitionError::TxBindingMissing => ProgramError::InvalidInstructionData,
     }
 }
 
@@ -1191,8 +1192,13 @@ pub fn process_complete_spend_orchestration_data(
     let mut state = SpendOrchestrationState::decode(&data[..SpendOrchestrationState::LEN])
         .ok_or(ProgramError::InvalidAccountData)?;
     require_discriminator(&state.discriminator, &SPEND_ORCH_DISCRIMINATOR)?;
-    transition::complete_spend_orchestration(&mut state, args.action_hash, current_slot)
-        .map_err(map_transition_error)?;
+    transition::complete_spend_orchestration(
+        &mut state,
+        args.action_hash,
+        args.tx_binding,
+        current_slot,
+    )
+    .map_err(map_transition_error)?;
     state.encode(&mut data[..SpendOrchestrationState::LEN]);
     Ok(())
 }
@@ -2915,11 +2921,13 @@ mod tests {
         // Then complete
         let args = CompleteSpendOrchestrationArgs {
             action_hash: [1; 32],
+            tx_binding: [88; 32],
         };
         process_complete_spend_orchestration_data(&mut buf, args, 30)
             .expect("complete should succeed");
         let state = SpendOrchestrationState::decode(&buf).expect("decode");
         assert_eq!(state.status, OrchestrationStatus::Complete as u8);
+        assert_eq!(state.tx_binding, [88; 32]);
     }
 
     #[test]
@@ -2927,6 +2935,7 @@ mod tests {
         let mut buf = init_spend_orch_buf(10);
         let args = CompleteSpendOrchestrationArgs {
             action_hash: [1; 32],
+            tx_binding: [88; 32],
         };
         let err = process_complete_spend_orchestration_data(&mut buf, args, 20)
             .expect_err("complete on pending must fail");
@@ -2975,6 +2984,7 @@ mod tests {
             &mut buf,
             CompleteSpendOrchestrationArgs {
                 action_hash: [1; 32],
+                tx_binding: [88; 32],
             },
             25,
         )

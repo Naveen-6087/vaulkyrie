@@ -485,6 +485,7 @@ pub struct SpendOrchestrationState {
     pub session_commitment: [u8; 32],
     pub signers_commitment: [u8; 32],
     pub signing_package_hash: [u8; 32],
+    pub tx_binding: [u8; 32],
     pub expiry_slot: u64,
     pub threshold: u8,
     pub participant_count: u8,
@@ -511,6 +512,7 @@ impl SpendOrchestrationState {
             session_commitment,
             signers_commitment,
             signing_package_hash: [0; 32],
+            tx_binding: [0; 32],
             expiry_slot,
             threshold,
             participant_count,
@@ -530,12 +532,13 @@ impl SpendOrchestrationState {
         dst[40..72].copy_from_slice(&self.session_commitment);
         dst[72..104].copy_from_slice(&self.signers_commitment);
         dst[104..136].copy_from_slice(&self.signing_package_hash);
-        dst[136..144].copy_from_slice(&self.expiry_slot.to_le_bytes());
-        dst[144] = self.threshold;
-        dst[145] = self.participant_count;
-        dst[146] = self.status;
-        dst[147] = self.bump;
-        dst[148..152].copy_from_slice(&self.reserved);
+        dst[136..168].copy_from_slice(&self.tx_binding);
+        dst[168..176].copy_from_slice(&self.expiry_slot.to_le_bytes());
+        dst[176] = self.threshold;
+        dst[177] = self.participant_count;
+        dst[178] = self.status;
+        dst[179] = self.bump;
+        dst[180..184].copy_from_slice(&self.reserved);
 
         true
     }
@@ -560,11 +563,14 @@ impl SpendOrchestrationState {
         let mut signing_package_hash = [0; 32];
         signing_package_hash.copy_from_slice(&src[104..136]);
 
+        let mut tx_binding = [0; 32];
+        tx_binding.copy_from_slice(&src[136..168]);
+
         let mut expiry_slot = [0; 8];
-        expiry_slot.copy_from_slice(&src[136..144]);
+        expiry_slot.copy_from_slice(&src[168..176]);
 
         let mut reserved = [0; 4];
-        reserved.copy_from_slice(&src[148..152]);
+        reserved.copy_from_slice(&src[180..184]);
 
         Some(Self {
             discriminator,
@@ -572,11 +578,12 @@ impl SpendOrchestrationState {
             session_commitment,
             signers_commitment,
             signing_package_hash,
+            tx_binding,
             expiry_slot: u64::from_le_bytes(expiry_slot),
-            threshold: src[144],
-            participant_count: src[145],
-            status: src[146],
-            bump: src[147],
+            threshold: src[176],
+            participant_count: src[177],
+            status: src[178],
+            bump: src[179],
             reserved,
         })
     }
@@ -790,9 +797,10 @@ mod tests {
         );
 
         assert_eq!(state.discriminator, SPEND_ORCH_DISCRIMINATOR);
-        assert_eq!(SpendOrchestrationState::LEN, 152);
+        assert_eq!(SpendOrchestrationState::LEN, 184);
         assert_eq!(state.status, OrchestrationStatus::Pending as u8);
         assert_eq!(state.signing_package_hash, [0; 32]);
+        assert_eq!(state.tx_binding, [0; 32]);
     }
 
     #[test]

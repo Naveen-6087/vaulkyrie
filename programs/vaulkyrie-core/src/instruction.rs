@@ -74,6 +74,7 @@ pub struct CommitSpendOrchestrationArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompleteSpendOrchestrationArgs {
     pub action_hash: [u8; 32],
+    pub tx_binding: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,15 +499,21 @@ fn parse_commit_spend_orchestration(
 fn parse_complete_spend_orchestration(
     data: &[u8],
 ) -> Result<CompleteSpendOrchestrationArgs, ProgramError> {
-    // 32
-    if data.len() != 32 {
+    // 32 (action_hash) + 32 (tx_binding) = 64
+    if data.len() != 64 {
         return Err(ProgramError::InvalidInstructionData);
     }
 
     let mut action_hash = [0; 32];
-    action_hash.copy_from_slice(data);
+    action_hash.copy_from_slice(&data[..32]);
 
-    Ok(CompleteSpendOrchestrationArgs { action_hash })
+    let mut tx_binding = [0; 32];
+    tx_binding.copy_from_slice(&data[32..64]);
+
+    Ok(CompleteSpendOrchestrationArgs {
+        action_hash,
+        tx_binding,
+    })
 }
 
 fn parse_fail_spend_orchestration(
@@ -973,12 +980,16 @@ mod tests {
     #[test]
     fn parses_complete_spend_orchestration_instruction() {
         let mut data = vec![19];
-        data.extend_from_slice(&[7; 32]);
+        data.extend_from_slice(&[7; 32]); // action_hash
+        data.extend_from_slice(&[9; 32]); // tx_binding
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
             Ok(CoreInstruction::CompleteSpendOrchestration(
-                CompleteSpendOrchestrationArgs { action_hash: [7; 32] }
+                CompleteSpendOrchestrationArgs {
+                    action_hash: [7; 32],
+                    tx_binding: [9; 32],
+                }
             ))
         );
     }
