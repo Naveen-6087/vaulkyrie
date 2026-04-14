@@ -13,6 +13,7 @@ pub struct InitVaultArgs {
     pub authority_hash: [u8; 32],
     pub policy_version: u64,
     pub bump: u8,
+    pub policy_mxe_program: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,7 +241,7 @@ fn parse_action_hash(data: &[u8]) -> Result<[u8; 32], ProgramError> {
 }
 
 fn parse_init_vault(data: &[u8]) -> Result<InitVaultArgs, ProgramError> {
-    if data.len() != 73 {
+    if data.len() != 105 {
         return Err(ProgramError::InvalidInstructionData);
     }
 
@@ -253,11 +254,17 @@ fn parse_init_vault(data: &[u8]) -> Result<InitVaultArgs, ProgramError> {
     let mut policy_version = [0; 8];
     policy_version.copy_from_slice(&data[64..72]);
 
+    let bump = data[72];
+
+    let mut policy_mxe_program = [0; 32];
+    policy_mxe_program.copy_from_slice(&data[73..105]);
+
     Ok(InitVaultArgs {
         wallet_pubkey,
         authority_hash,
         policy_version: u64::from_le_bytes(policy_version),
-        bump: data[72],
+        bump,
+        policy_mxe_program,
     })
 }
 
@@ -637,6 +644,7 @@ mod tests {
         data.extend_from_slice(&[9; 32]);
         data.extend_from_slice(&42u64.to_le_bytes());
         data.push(3);
+        data.extend_from_slice(&[11; 32]);
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
@@ -645,6 +653,7 @@ mod tests {
                 authority_hash: [9; 32],
                 policy_version: 42,
                 bump: 3,
+                policy_mxe_program: [11; 32],
             }))
         );
     }

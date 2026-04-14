@@ -488,8 +488,15 @@ pub fn process(
                 require_wallet_authority(&vault, wallet_signer)?;
             }
 
-            // [3] = policy_eval account (readonly, raw bytes validated by transition)
+            // [3] = policy_eval account (readonly, owner validated against vault)
             let policy_eval_account = get_account_info!(accounts, 3);
+            {
+                let vault_data = vault_account.try_borrow_data()?;
+                let vault = decode_vault_state(&vault_data)?;
+                let owner_bytes: [u8; 32] = policy_eval_account.owner().as_ref().try_into().unwrap();
+                transition::validate_eval_account_owner(&owner_bytes, &vault)
+                    .map_err(|_| ProgramError::IllegalOwner)?;
+            }
             let policy_eval_data = policy_eval_account.try_borrow_data()?;
 
             let vault_data = vault_account.try_borrow_data()?;
@@ -583,6 +590,7 @@ pub fn process_init_vault_data(dst: &mut [u8], args: InitVaultArgs) -> ProgramRe
         args.authority_hash,
         args.policy_version,
         args.bump,
+        args.policy_mxe_program,
     );
 
     if !state.encode(dst) {
@@ -1480,7 +1488,7 @@ mod tests {
     #[test]
     fn set_vault_status_updates_state() {
         let mut bytes = [0; VaultRegistry::LEN];
-        let vault = VaultRegistry::new([5; 32], [6; 32], 7, VaultStatus::Active, 8);
+        let vault = VaultRegistry::new([5; 32], [6; 32], 7, VaultStatus::Active, 8, [0; 32]);
         assert!(vault.encode(&mut bytes));
 
         process_set_vault_status_data(&mut bytes, VaultStatus::Locked as u8)
@@ -1493,7 +1501,7 @@ mod tests {
     #[test]
     fn set_vault_status_rejects_unknown_value() {
         let mut bytes = [0; VaultRegistry::LEN];
-        let vault = VaultRegistry::new([5; 32], [6; 32], 7, VaultStatus::Active, 8);
+        let vault = VaultRegistry::new([5; 32], [6; 32], 7, VaultStatus::Active, 8, [0; 32]);
         assert!(vault.encode(&mut bytes));
 
         let error =
@@ -1505,7 +1513,7 @@ mod tests {
     #[test]
     fn set_vault_status_rejects_disallowed_transition() {
         let mut bytes = [0; VaultRegistry::LEN];
-        let vault = VaultRegistry::new([5; 32], [6; 32], 7, VaultStatus::Locked, 8);
+        let vault = VaultRegistry::new([5; 32], [6; 32], 7, VaultStatus::Locked, 8, [0; 32]);
         assert!(vault.encode(&mut bytes));
 
         let error = process_set_vault_status_data(&mut bytes, VaultStatus::Active as u8)
@@ -1525,6 +1533,7 @@ mod tests {
                 authority_hash: [6; 32],
                 policy_version: 7,
                 bump: 8,
+                policy_mxe_program: [0; 32],
             },
         )
         .expect("vault init should succeed");
@@ -1534,6 +1543,7 @@ mod tests {
         assert_eq!(state.current_authority_hash, [6; 32]);
         assert_eq!(state.policy_version, 7);
         assert_eq!(state.bump, 8);
+        assert_eq!(state.policy_mxe_program, [0; 32]);
     }
 
     #[test]
@@ -1547,6 +1557,7 @@ mod tests {
                 authority_hash: [6; 32],
                 policy_version: 7,
                 bump: 8,
+                policy_mxe_program: [0; 32],
             },
         )
         .expect_err("preinitialized bytes should fail");
@@ -1672,7 +1683,7 @@ mod tests {
     #[test]
     fn stage_and_consume_receipt_updates_consumed_flag() {
         let receipt = sample_receipt();
-        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8, [0; 32]);
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
 
@@ -1693,7 +1704,7 @@ mod tests {
     fn consume_receipt_rejects_replayed_nonce() {
         let receipt = sample_receipt();
         let mut vault =
-            VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+            VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8, [0; 32]);
         vault.last_consumed_receipt_nonce = receipt.nonce;
         let staged = PolicyReceiptState::new(
             receipt.commitment(),
@@ -1717,7 +1728,7 @@ mod tests {
     #[test]
     fn stage_receipt_rejects_policy_mismatch() {
         let receipt = sample_receipt();
-        let vault = VaultRegistry::new([5; 32], [6; 32], 99, crate::state::VaultStatus::Active, 8);
+        let vault = VaultRegistry::new([5; 32], [6; 32], 99, crate::state::VaultStatus::Active, 8, [0; 32]);
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
 
@@ -1731,7 +1742,7 @@ mod tests {
     #[test]
     fn stage_receipt_rejects_non_active_vault() {
         let receipt = sample_receipt();
-        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Locked, 8);
+        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Locked, 8, [0; 32]);
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
 
@@ -1748,7 +1759,7 @@ mod tests {
             expiry_slot: 9,
             ..sample_receipt()
         };
-        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8, [0; 32]);
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
 
@@ -1763,7 +1774,7 @@ mod tests {
     fn stage_receipt_rejects_replayed_nonce() {
         let receipt = sample_receipt();
         let mut vault =
-            VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+            VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8, [0; 32]);
         vault.last_consumed_receipt_nonce = receipt.nonce;
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
@@ -1785,7 +1796,8 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-            8,
+             8,
+            [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
         let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(31));
@@ -1814,7 +1826,8 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-            8,
+             8,
+            [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
         let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(40));
@@ -1852,7 +1865,8 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-            8,
+             8,
+            [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
         let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(41));
@@ -1890,7 +1904,8 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-            8,
+             8,
+            [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
         let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(42));
@@ -1927,7 +1942,8 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-            8,
+             8,
+            [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
         let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(32));
@@ -1957,7 +1973,8 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-            8,
+             8,
+            [0; 32],
         );
         let statement = sample_rotation_statement(&vault, secret.authority_hash(), 0, 200);
         let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(33));
@@ -1987,7 +2004,8 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-            8,
+             8,
+            [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 9);
         let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(34));
@@ -2017,7 +2035,8 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Active,
-            8,
+             8,
+            [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
         let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(35));
@@ -2047,7 +2066,8 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-            8,
+             8,
+            [0; 32],
         );
         let statement = vaulkyrie_protocol::AuthorityRotationStatement {
             action_hash: sample_action_hash(),
@@ -2082,7 +2102,8 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-            8,
+             8,
+            [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
         let mut proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(37));
@@ -2113,7 +2134,8 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-            8,
+             8,
+            [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], 0, 200);
         let proof = secret.sign_statement_with_auth_path(&statement, 1, sample_auth_path(38));
@@ -2143,7 +2165,8 @@ mod tests {
             secret.authority_hash(),
             3,
             crate::state::VaultStatus::Recovery,
-            8,
+             8,
+            [0; 32],
         );
         let statement = sample_rotation_statement(&vault, [8; 32], XMSS_LEAF_COUNT as u64, 200);
         let proof =
@@ -2421,7 +2444,7 @@ mod tests {
             receipt.nonce,
             receipt.expiry_slot,
         );
-        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8, [0; 32]);
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
         let mut session_bytes = [0; ActionSessionState::LEN];
@@ -2466,7 +2489,7 @@ mod tests {
             receipt.nonce,
             receipt.expiry_slot,
         );
-        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8, [0; 32]);
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
         let mut session_bytes = [0; ActionSessionState::LEN];
@@ -2500,7 +2523,7 @@ mod tests {
             receipt.nonce,
             receipt.expiry_slot,
         );
-        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+        let vault = VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8, [0; 32]);
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
         let mut session_bytes = [0; ActionSessionState::LEN];
@@ -2539,7 +2562,7 @@ mod tests {
             receipt.expiry_slot,
         );
         let mut vault =
-            VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8);
+            VaultRegistry::new([5; 32], [6; 32], 3, crate::state::VaultStatus::Active, 8, [0; 32]);
         vault.last_consumed_receipt_nonce = receipt.nonce;
         let mut vault_bytes = [0; VaultRegistry::LEN];
         let mut receipt_bytes = [0; PolicyReceiptState::LEN];
@@ -2707,6 +2730,7 @@ mod tests {
     fn make_finalized_eval_bytes_for_receipt(receipt: &PolicyReceipt) -> [u8; 256] {
         let mut bytes = [0u8; 256];
         bytes[0..8].copy_from_slice(b"POLEVAL1");
+        bytes[72..104].copy_from_slice(&receipt.action_hash);
         bytes[168..200].copy_from_slice(&receipt.commitment());
         bytes[240] = 2; // Finalized
         bytes
@@ -2719,6 +2743,7 @@ mod tests {
             [11; 32],
             receipt.policy_version,
             1,
+            [0; 32],
         );
         let mut buf = vec![0u8; VaultRegistry::LEN];
         state.encode(&mut buf);
@@ -3305,7 +3330,7 @@ mod tests {
     // ── Policy version rollover processor tests ─────────────────────
 
     fn make_active_vault_buffer() -> Vec<u8> {
-        let vault = VaultRegistry::new([1; 32], [2; 32], 10, VaultStatus::Active, 1);
+        let vault = VaultRegistry::new([1; 32], [2; 32], 10, VaultStatus::Active, 1, [0; 32]);
         let mut buf = vec![0u8; VaultRegistry::LEN];
         vault.encode(&mut buf);
         buf

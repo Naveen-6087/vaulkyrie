@@ -35,6 +35,7 @@ pub struct VaultRegistry {
     pub last_consumed_receipt_nonce: u64,
     pub status: u8,
     pub bump: u8,
+    pub policy_mxe_program: [u8; 32],
     pub reserved: [u8; 6],
 }
 
@@ -47,6 +48,7 @@ impl VaultRegistry {
         policy_version: u64,
         status: VaultStatus,
         bump: u8,
+        policy_mxe_program: [u8; 32],
     ) -> Self {
         Self {
             discriminator: VAULT_REGISTRY_DISCRIMINATOR,
@@ -56,6 +58,7 @@ impl VaultRegistry {
             last_consumed_receipt_nonce: 0,
             status: status as u8,
             bump,
+            policy_mxe_program,
             reserved: [0; 6],
         }
     }
@@ -72,7 +75,8 @@ impl VaultRegistry {
         dst[80..88].copy_from_slice(&self.last_consumed_receipt_nonce.to_le_bytes());
         dst[88] = self.status;
         dst[89] = self.bump;
-        dst[90..96].copy_from_slice(&self.reserved);
+        dst[90..122].copy_from_slice(&self.policy_mxe_program);
+        dst[122..128].copy_from_slice(&self.reserved);
 
         true
     }
@@ -100,8 +104,11 @@ impl VaultRegistry {
         let mut last_consumed_receipt_nonce = [0; 8];
         last_consumed_receipt_nonce.copy_from_slice(&src[80..88]);
 
+        let mut policy_mxe_program = [0; 32];
+        policy_mxe_program.copy_from_slice(&src[90..122]);
+
         let mut reserved = [0; 6];
-        reserved.copy_from_slice(&src[90..96]);
+        reserved.copy_from_slice(&src[122..128]);
 
         Some(Self {
             discriminator,
@@ -111,6 +118,7 @@ impl VaultRegistry {
             last_consumed_receipt_nonce: u64::from_le_bytes(last_consumed_receipt_nonce),
             status: src[88],
             bump: src[89],
+            policy_mxe_program,
             reserved,
         })
     }
@@ -727,17 +735,18 @@ mod tests {
 
     #[test]
     fn vault_registry_layout_is_stable() {
-        let state = VaultRegistry::new([1; 32], [2; 32], 7, VaultStatus::Active, 9);
+        let state = VaultRegistry::new([1; 32], [2; 32], 7, VaultStatus::Active, 9, [10; 32]);
 
         assert_eq!(state.discriminator, VAULT_REGISTRY_DISCRIMINATOR);
-        assert_eq!(VaultRegistry::LEN, 96);
+        assert_eq!(VaultRegistry::LEN, 128);
         assert_eq!(state.status, VaultStatus::Active as u8);
         assert_eq!(state.last_consumed_receipt_nonce, 0);
+        assert_eq!(state.policy_mxe_program, [10; 32]);
     }
 
     #[test]
     fn vault_registry_roundtrips_through_bytes() {
-        let state = VaultRegistry::new([1; 32], [2; 32], 7, VaultStatus::Active, 9);
+        let state = VaultRegistry::new([1; 32], [2; 32], 7, VaultStatus::Active, 9, [10; 32]);
         let mut bytes = [0; VaultRegistry::LEN];
 
         assert!(state.encode(&mut bytes));
@@ -878,7 +887,7 @@ mod tests {
 
     #[test]
     fn vault_registry_decode_rejects_wrong_discriminator() {
-        let state = VaultRegistry::new([1; 32], [2; 32], 7, VaultStatus::Active, 9);
+        let state = VaultRegistry::new([1; 32], [2; 32], 7, VaultStatus::Active, 9, [10; 32]);
         let mut bytes = [0; VaultRegistry::LEN];
         assert!(state.encode(&mut bytes));
         bytes[0] = 0xFF; // corrupt discriminator

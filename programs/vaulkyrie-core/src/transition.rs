@@ -74,6 +74,7 @@ pub fn initialize_vault(
     authority_hash: [u8; 32],
     policy_version: u64,
     bump: u8,
+    policy_mxe_program: [u8; 32],
 ) -> VaultRegistry {
     VaultRegistry::new(
         wallet_pubkey,
@@ -81,6 +82,7 @@ pub fn initialize_vault(
         policy_version,
         VaultStatus::Active,
         bump,
+        policy_mxe_program,
     )
 }
 
@@ -150,8 +152,25 @@ pub fn validate_vault_for_receipt(
 ///
 /// Layout invariants (see `PolicyEvaluationState::encode`):
 /// - `bytes[0..8]`   == `b"POLEVAL1"` (discriminator)
+/// Validates that the policy evaluation account is owned by the expected
+/// policy-MXE program stored in the vault registry.
+pub fn validate_eval_account_owner(
+    eval_account_owner: &[u8; 32],
+    vault: &VaultRegistry,
+) -> Result<(), TransitionError> {
+    if eval_account_owner != &vault.policy_mxe_program {
+        return Err(TransitionError::BridgedReceiptMismatch);
+    }
+    Ok(())
+}
+
+/// Validates a cross-program PolicyEvaluationState against a staged receipt.
+/// Checks:
+/// - Minimum length (256 bytes)
+/// - `bytes[0..8]`    == `POLEVAL1` (discriminator)
 /// - `bytes[240]`    == `2` (PolicyEvaluationStatus::Finalized)
 /// - `bytes[168..200]` == `receipt.commitment()` (receipt_commitment)
+/// - `bytes[72..104]` == `action_hash` from the receipt (action binding)
 pub fn validate_bridged_receipt_claim(
     eval_data: &[u8],
     receipt: &PolicyReceipt,
@@ -161,6 +180,7 @@ pub fn validate_bridged_receipt_claim(
     const FINALIZED: u8 = 2;
     const MIN_LEN: usize = 256;
     const DISCRIMINATOR_RANGE: core::ops::Range<usize> = 0..8;
+    const ACTION_HASH_RANGE: core::ops::Range<usize> = 72..104;
     const STATUS_OFFSET: usize = 240;
     const RECEIPT_COMMITMENT_RANGE: core::ops::Range<usize> = 168..200;
     const DELAY_UNTIL_SLOT_RANGE: core::ops::Range<usize> = 232..240;
@@ -178,6 +198,11 @@ pub fn validate_bridged_receipt_claim(
     }
 
     if &eval_data[RECEIPT_COMMITMENT_RANGE] != &receipt.commitment() {
+        return Err(TransitionError::BridgedReceiptMismatch);
+    }
+
+    // Cross-validate the action_hash stored in the eval state matches the receipt
+    if &eval_data[ACTION_HASH_RANGE] != &receipt.action_hash {
         return Err(TransitionError::BridgedReceiptMismatch);
     }
 
@@ -728,7 +753,8 @@ mod tests {
         migrate_authority_tree, open_action_session, open_action_session_from_receipt,
         parse_vault_status, rotate_vault_authority, stage_policy_receipt, update_vault_status,
         validate_and_advance_receipt_nonce, validate_authority_action_binding,
-        validate_bridged_receipt_claim, validate_quantum_vault_close, validate_quantum_vault_split,
+        validate_bridged_receipt_claim, validate_eval_account_owner,
+        validate_quantum_vault_close, validate_quantum_vault_split,
         validate_quantum_vault_split_amount, validate_vault_active,
         validate_vault_authority_alignment, validate_vault_for_receipt, validate_vault_for_session,
         validate_vault_recovery_mode, verify_authority_proof, TransitionError,
@@ -783,12 +809,13 @@ mod tests {
 
     #[test]
     fn initialize_vault_sets_active_status() {
-        let vault = initialize_vault([1; 32], [2; 32], 3, 4);
+        let vault = initialize_vault([1; 32], [2; 32], 3, 4, [5; 32]);
 
         assert_eq!(vault.wallet_pubkey, [1; 32]);
         assert_eq!(vault.current_authority_hash, [2; 32]);
         assert_eq!(vault.policy_version, 3);
         assert_eq!(vault.status, 1);
+        assert_eq!(vault.policy_mxe_program, [5; 32]);
     }
 
     #[test]
@@ -804,7 +831,7 @@ mod tests {
 
     #[test]
     fn validate_vault_for_receipt_accepts_matching_active_policy() {
-        let vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         let receipt = vaulkyrie_protocol::PolicyReceipt {
             action_hash: sample_action_hash(),
             policy_version: 9,
@@ -819,7 +846,7 @@ mod tests {
 
     #[test]
     fn validate_vault_for_receipt_rejects_policy_mismatch() {
-        let vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         let receipt = vaulkyrie_protocol::PolicyReceipt {
             action_hash: sample_action_hash(),
             policy_version: 10,
@@ -836,7 +863,7 @@ mod tests {
 
     #[test]
     fn validate_vault_for_receipt_rejects_non_active_vault() {
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         vault.status = VaultStatus::Locked as u8;
         let receipt = vaulkyrie_protocol::PolicyReceipt {
             action_hash: sample_action_hash(),
@@ -854,7 +881,7 @@ mod tests {
 
     #[test]
     fn validate_vault_active_rejects_locked_vault() {
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         vault.status = VaultStatus::Locked as u8;
 
         let error = validate_vault_active(&vault).expect_err("locked vault should fail");
@@ -864,7 +891,7 @@ mod tests {
 
     #[test]
     fn validate_vault_recovery_mode_accepts_recovery() {
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         vault.status = VaultStatus::Recovery as u8;
 
         validate_vault_recovery_mode(&vault).expect("recovery vault should pass");
@@ -872,7 +899,7 @@ mod tests {
 
     #[test]
     fn validate_vault_recovery_mode_accepts_locked() {
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         vault.status = VaultStatus::Locked as u8;
 
         validate_vault_recovery_mode(&vault).expect("locked vault should pass");
@@ -880,7 +907,7 @@ mod tests {
 
     #[test]
     fn validate_vault_recovery_mode_rejects_active() {
-        let vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
 
         let error = validate_vault_recovery_mode(&vault)
             .expect_err("active vault should fail recovery-mode check");
@@ -890,7 +917,7 @@ mod tests {
 
     #[test]
     fn validate_vault_for_receipt_rejects_expired_receipt() {
-        let vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         let receipt = vaulkyrie_protocol::PolicyReceipt {
             action_hash: sample_action_hash(),
             policy_version: 9,
@@ -907,7 +934,7 @@ mod tests {
 
     #[test]
     fn validate_vault_for_receipt_rejects_replayed_nonce() {
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         vault.last_consumed_receipt_nonce = 5;
         let receipt = vaulkyrie_protocol::PolicyReceipt {
             action_hash: sample_action_hash(),
@@ -932,7 +959,7 @@ mod tests {
 
     #[test]
     fn update_vault_status_allows_lock_then_recovery() {
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
 
         update_vault_status(&mut vault, VaultStatus::Locked)
             .expect("active to locked should be allowed");
@@ -944,7 +971,7 @@ mod tests {
 
     #[test]
     fn update_vault_status_rejects_locked_to_active() {
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         vault.status = VaultStatus::Locked as u8;
 
         let error = update_vault_status(&mut vault, VaultStatus::Active)
@@ -955,7 +982,7 @@ mod tests {
 
     #[test]
     fn validate_vault_authority_alignment_accepts_matching_hashes() {
-        let vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         let authority = initialize_quantum_authority([2; 32], [3; 32], 1);
 
         validate_vault_authority_alignment(&vault, &authority)
@@ -964,7 +991,7 @@ mod tests {
 
     #[test]
     fn validate_vault_authority_alignment_rejects_mismatch() {
-        let vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         let authority = initialize_quantum_authority([3; 32], [4; 32], 1);
 
         let error = validate_vault_authority_alignment(&vault, &authority)
@@ -1009,7 +1036,7 @@ mod tests {
 
     #[test]
     fn validate_and_advance_receipt_nonce_rejects_replay() {
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         let receipt = vaulkyrie_protocol::PolicyReceipt {
             action_hash: sample_action_hash(),
             policy_version: 9,
@@ -1290,7 +1317,7 @@ mod tests {
             nonce: 5,
             expiry_slot: 10,
         };
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         let mut session = open_action_session(&receipt);
         let mut staged = stage_policy_receipt(&receipt);
         mark_action_session_ready(&mut session, receipt.action_hash, 10)
@@ -1315,7 +1342,7 @@ mod tests {
         };
         let mut session = open_action_session(&receipt);
         let mut staged = stage_policy_receipt(&receipt);
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         let mismatched = vaulkyrie_protocol::PolicyReceipt {
             nonce: 77,
             ..receipt
@@ -1340,7 +1367,7 @@ mod tests {
         };
         let mut session = open_action_session(&receipt);
         let mut staged = stage_policy_receipt(&receipt);
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         session.status = SessionStatus::Ready as u8;
         session.policy_version = 10;
 
@@ -1361,7 +1388,7 @@ mod tests {
         };
         let mut session = open_action_session(&receipt);
         let mut staged = stage_policy_receipt(&receipt);
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         session.status = SessionStatus::Ready as u8;
 
         let error = finalize_action_session(&mut vault, &mut session, &mut staged, &receipt, 10)
@@ -1379,7 +1406,7 @@ mod tests {
             nonce: 5,
             expiry_slot: 10,
         };
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         let mut session = open_action_session(&receipt);
         let mut staged = stage_policy_receipt(&receipt);
         session.status = SessionStatus::Ready as u8;
@@ -1399,7 +1426,7 @@ mod tests {
             nonce: 5,
             expiry_slot: 10,
         };
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         vault.last_consumed_receipt_nonce = 5;
         let mut session = open_action_session(&receipt);
         let mut staged = stage_policy_receipt(&receipt);
@@ -1544,7 +1571,7 @@ mod tests {
     fn rotate_vault_authority_updates_both_states() {
         let secret = sample_wots_secret(33);
         let auth_path = sample_auth_path(21);
-        let mut vault = initialize_vault([1; 32], secret.authority_hash(), 9, 4);
+        let mut vault = initialize_vault([1; 32], secret.authority_hash(), 9, 4, [0; 32]);
         vault.status = VaultStatus::Recovery as u8;
         let statement =
             sample_rotation_statement(vault.wallet_pubkey, vault.policy_version, [4; 32], 0, 100);
@@ -1564,7 +1591,7 @@ mod tests {
     #[test]
     fn rotate_vault_authority_rejects_active_vault() {
         let secret = sample_wots_secret(33);
-        let mut vault = initialize_vault([1; 32], secret.authority_hash(), 9, 4);
+        let mut vault = initialize_vault([1; 32], secret.authority_hash(), 9, 4, [0; 32]);
         let statement =
             sample_rotation_statement(vault.wallet_pubkey, vault.policy_version, [4; 32], 0, 100);
         let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(22));
@@ -1580,7 +1607,7 @@ mod tests {
     #[test]
     fn rotate_vault_authority_rejects_unbound_action_hash() {
         let secret = sample_wots_secret(33);
-        let mut vault = initialize_vault([1; 32], secret.authority_hash(), 9, 4);
+        let mut vault = initialize_vault([1; 32], secret.authority_hash(), 9, 4, [0; 32]);
         vault.status = VaultStatus::Recovery as u8;
         let mut authority = initialize_quantum_authority(secret.authority_hash(), [8; 32], 1);
         let statement = AuthorityRotationStatement {
@@ -1599,7 +1626,7 @@ mod tests {
 
     #[test]
     fn validate_authority_action_binding_accepts_rekey_bound_hash() {
-        let vault = initialize_vault([1; 32], [3; 32], 9, 4);
+        let vault = initialize_vault([1; 32], [3; 32], 9, 4, [0; 32]);
         let statement =
             sample_rotation_statement(vault.wallet_pubkey, vault.policy_version, [4; 32], 0, 100);
 
@@ -1764,7 +1791,7 @@ mod tests {
 
     #[test]
     fn validate_vault_for_session_rejects_policy_mismatch() {
-        let vault = initialize_vault([1; 32], [2; 32], 9, 4);
+        let vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
         let receipt = vaulkyrie_protocol::PolicyReceipt {
             action_hash: sample_action_hash(),
             policy_version: 10,
@@ -1901,8 +1928,18 @@ mod tests {
     fn make_finalized_eval_bytes(receipt_commitment: [u8; 32]) -> [u8; 256] {
         let mut bytes = [0u8; 256];
         bytes[0..8].copy_from_slice(b"POLEVAL1");
+        // action_hash at [72..104] defaults to [0; 32]
         bytes[168..200].copy_from_slice(&receipt_commitment);
         bytes[240] = 2; // Finalized
+        bytes
+    }
+
+    fn make_finalized_eval_bytes_with_action(
+        receipt_commitment: [u8; 32],
+        action_hash: [u8; 32],
+    ) -> [u8; 256] {
+        let mut bytes = make_finalized_eval_bytes(receipt_commitment);
+        bytes[72..104].copy_from_slice(&action_hash);
         bytes
     }
 
@@ -1918,7 +1955,7 @@ mod tests {
             expiry_slot: 900,
         };
 
-        let eval_bytes = make_finalized_eval_bytes(receipt.commitment());
+        let eval_bytes = make_finalized_eval_bytes_with_action(receipt.commitment(), [3; 32]);
         assert!(validate_bridged_receipt_claim(&eval_bytes, &receipt, 100).is_ok());
     }
 
@@ -1934,7 +1971,7 @@ mod tests {
             expiry_slot: 900,
         };
 
-        let mut eval_bytes = make_finalized_eval_bytes(receipt.commitment());
+        let mut eval_bytes = make_finalized_eval_bytes_with_action(receipt.commitment(), [3; 32]);
         eval_bytes[240] = 1; // Pending, not Finalized
 
         assert_eq!(
@@ -1955,7 +1992,7 @@ mod tests {
             expiry_slot: 900,
         };
 
-        let eval_bytes = make_finalized_eval_bytes([0xff; 32]); // different commitment
+        let eval_bytes = make_finalized_eval_bytes_with_action([0xff; 32], [3; 32]);
 
         assert_eq!(
             validate_bridged_receipt_claim(&eval_bytes, &receipt, 100),
@@ -1975,7 +2012,7 @@ mod tests {
             expiry_slot: 900,
         };
 
-        let mut eval_bytes = make_finalized_eval_bytes(receipt.commitment());
+        let mut eval_bytes = make_finalized_eval_bytes_with_action(receipt.commitment(), [3; 32]);
         eval_bytes[0] = 0; // corrupt discriminator
 
         assert_eq!(
@@ -2016,7 +2053,7 @@ mod tests {
             expiry_slot: 900,
         };
 
-        let mut eval_bytes = make_finalized_eval_bytes(receipt.commitment());
+        let mut eval_bytes = make_finalized_eval_bytes_with_action(receipt.commitment(), [3; 32]);
         // Set delay_until_slot to 500 at bytes 232..240
         eval_bytes[232..240].copy_from_slice(&500u64.to_le_bytes());
 
@@ -2031,6 +2068,44 @@ mod tests {
 
         // current_slot > delay_until_slot => should succeed
         assert!(validate_bridged_receipt_claim(&eval_bytes, &receipt, 600).is_ok());
+    }
+
+    #[test]
+    fn validate_bridged_receipt_claim_rejects_action_hash_mismatch() {
+        use vaulkyrie_protocol::{PolicyReceipt, ThresholdRequirement};
+
+        let receipt = PolicyReceipt {
+            action_hash: [3; 32],
+            policy_version: 9,
+            threshold: ThresholdRequirement::TwoOfThree,
+            nonce: 1,
+            expiry_slot: 900,
+        };
+
+        // Eval has different action_hash than receipt
+        let eval_bytes = make_finalized_eval_bytes_with_action(receipt.commitment(), [0xff; 32]);
+
+        assert_eq!(
+            validate_bridged_receipt_claim(&eval_bytes, &receipt, 100),
+            Err(TransitionError::BridgedReceiptMismatch)
+        );
+    }
+
+    #[test]
+    fn validate_eval_account_owner_accepts_matching_program() {
+        let owner = [7; 32];
+        let vault = VaultRegistry::new([0; 32], [0; 32], 1, VaultStatus::Active, 1, owner);
+        assert!(validate_eval_account_owner(&owner, &vault).is_ok());
+    }
+
+    #[test]
+    fn validate_eval_account_owner_rejects_wrong_program() {
+        let vault = VaultRegistry::new([0; 32], [0; 32], 1, VaultStatus::Active, 1, [7; 32]);
+        let wrong_owner = [8; 32];
+        assert_eq!(
+            validate_eval_account_owner(&wrong_owner, &vault),
+            Err(TransitionError::BridgedReceiptMismatch)
+        );
     }
 
     // ── Recovery transition tests ───────────────────────────────────
@@ -2183,7 +2258,7 @@ mod tests {
 
     #[test]
     fn advance_policy_version_increments_by_one() {
-        let mut vault = VaultRegistry::new([0; 32], [0; 32], 5, VaultStatus::Active, 1);
+        let mut vault = VaultRegistry::new([0; 32], [0; 32], 5, VaultStatus::Active, 1, [0; 32]);
 
         let result = advance_policy_version(&mut vault, 6);
         assert!(result.is_ok());
@@ -2192,7 +2267,7 @@ mod tests {
 
     #[test]
     fn advance_policy_version_rejects_skip() {
-        let mut vault = VaultRegistry::new([0; 32], [0; 32], 5, VaultStatus::Active, 1);
+        let mut vault = VaultRegistry::new([0; 32], [0; 32], 5, VaultStatus::Active, 1, [0; 32]);
 
         let result = advance_policy_version(&mut vault, 7);
         assert_eq!(result.unwrap_err(), TransitionError::PolicyVersionNotMonotonic);
@@ -2200,7 +2275,7 @@ mod tests {
 
     #[test]
     fn advance_policy_version_rejects_same() {
-        let mut vault = VaultRegistry::new([0; 32], [0; 32], 5, VaultStatus::Active, 1);
+        let mut vault = VaultRegistry::new([0; 32], [0; 32], 5, VaultStatus::Active, 1, [0; 32]);
 
         let result = advance_policy_version(&mut vault, 5);
         assert_eq!(result.unwrap_err(), TransitionError::PolicyVersionNotMonotonic);
@@ -2208,7 +2283,7 @@ mod tests {
 
     #[test]
     fn advance_policy_version_rejects_inactive_vault() {
-        let mut vault = VaultRegistry::new([0; 32], [0; 32], 0, VaultStatus::Active, 1);
+        let mut vault = VaultRegistry::new([0; 32], [0; 32], 0, VaultStatus::Active, 1, [0; 32]);
         vault.status = 0; // Force inactive
 
         let result = advance_policy_version(&mut vault, 1);
