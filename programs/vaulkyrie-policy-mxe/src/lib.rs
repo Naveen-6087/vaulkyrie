@@ -2,9 +2,11 @@ use anchor_lang::prelude::*;
 
 // Arcium SDK re-exports: MXE account types, CPI helpers, and the program macro.
 use arcium_anchor::prelude::*;
-use arcium_anchor::traits::QueueCompAccs;
+use arcium_anchor::traits::{InitCompDefAccs, QueueCompAccs};
 use arcium_client::idl::arcium::cpi::accounts::QueueComputation;
-use arcium_client::idl::arcium::types::{CallbackAccount, CallbackInstruction};
+use arcium_client::idl::arcium::types::{
+    CallbackAccount, CallbackInstruction, Output, Parameter,
+};
 
 pub mod errors;
 pub mod state;
@@ -136,6 +138,18 @@ pub mod vaulkyrie_policy_mxe {
 
     // ── Arcium CPI instructions ───────────────────────────────────────────
 
+    /// One-time initialization of the `policy_evaluate` computation definition
+    /// account on the Arcium MXE.
+    ///
+    /// Must be called once after program deployment, before any policy
+    /// evaluations can be queued. Creates the `ComputationDefinitionAccount`
+    /// PDA that stores the circuit interface (parameter/output types).
+    pub fn init_policy_evaluate_comp_def(
+        ctx: Context<InitPolicyEvaluateCompDef>,
+    ) -> Result<()> {
+        handlers::process_init_policy_evaluate_comp_def(ctx)
+    }
+
     /// Queue the encrypted policy evaluation via Arcium MXE CPI.
     ///
     /// Sends encrypted policy inputs to the MXE cluster for private
@@ -220,6 +234,113 @@ pub struct QueueArciumComputation<'info> {
 }
 
 // ── Arcium CPI account structs (manual — no compiled circuit required) ────
+
+/// Accounts for one-time computation definition initialization.
+///
+/// Manually implements `InitCompDefAccs` instead of using
+/// `#[init_computation_definition_accounts("policy_evaluate", payer)]`,
+/// which requires compiled circuit artifacts. The trait maps these accounts
+/// to the fields that `arcium_anchor::init_comp_def()` expects.
+#[derive(Accounts)]
+pub struct InitPolicyEvaluateCompDef<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// Arcium MXE global state account.
+    #[account(
+        mut,
+        address = arcium_anchor::derive_mxe_pda!()
+    )]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+
+    /// CHECK: Computation definition PDA — checked by Arcium CPI.
+    #[account(mut)]
+    pub comp_def_account: UncheckedAccount<'info>,
+
+    /// CHECK: Address lookup table for MXE — checked by Arcium CPI.
+    #[account(mut)]
+    pub address_lookup_table: UncheckedAccount<'info>,
+
+    /// CHECK: Solana Address Lookup Table program.
+    #[account(address = LUT_PROGRAM_ID)]
+    pub lut_program: UncheckedAccount<'info>,
+
+    /// Arcium MXE program.
+    pub arcium_program: Program<'info, Arcium>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Manual `InitCompDefAccs` implementation — equivalent to what
+/// `#[init_computation_definition_accounts("policy_evaluate", payer)]`
+/// would generate.
+///
+/// The `params()` and `outputs()` define the computation signature:
+///   - 3 inputs: x25519 pubkey, u128 nonce, encrypted policy payload
+///   - 5 outputs: 2×ciphertext (commitments), u64, u16, u8
+impl<'info> InitCompDefAccs<'info> for InitPolicyEvaluateCompDef<'info> {
+    fn arcium_program(&self) -> AccountInfo<'info> {
+        self.arcium_program.to_account_info()
+    }
+
+    fn mxe_program(&self) -> Pubkey {
+        crate::ID
+    }
+
+    fn signer(&self) -> AccountInfo<'info> {
+        self.payer.to_account_info()
+    }
+
+    fn mxe_acc(&self) -> AccountInfo<'info> {
+        self.mxe_account.to_account_info()
+    }
+
+    fn comp_def_acc(&self) -> AccountInfo<'info> {
+        self.comp_def_account.to_account_info()
+    }
+
+    fn address_lookup_table(&self) -> AccountInfo<'info> {
+        self.address_lookup_table.to_account_info()
+    }
+
+    fn lut_program(&self) -> AccountInfo<'info> {
+        self.lut_program.to_account_info()
+    }
+
+    fn system_program(&self) -> AccountInfo<'info> {
+        self.system_program.to_account_info()
+    }
+
+    fn params(&self) -> Vec<Parameter> {
+        vec![
+            Parameter::ArcisX25519Pubkey,
+            Parameter::PlaintextU128,
+            Parameter::Ciphertext,
+        ]
+    }
+
+    fn outputs(&self) -> Vec<Output> {
+        vec![
+            Output::Ciphertext,        // receipt_commitment  (32 bytes)
+            Output::Ciphertext,        // decision_commitment (32 bytes)
+            Output::PlaintextU64,      // delay_until_slot
+            Output::PlaintextU16,      // reason_code
+            Output::PlaintextU8,       // approved flag
+        ]
+    }
+
+    fn comp_def_offset(&self) -> u32 {
+        POLICY_EVALUATE_COMP_DEF_OFFSET
+    }
+
+    fn compiled_circuit_len(&self) -> u32 {
+        0 // Circuit stored offchain — bytecode not uploaded onchain
+    }
+
+    fn weight(&self) -> u64 {
+        0 // Placeholder — actual weight set during `arcium deploy`
+    }
+}
 
 /// Accounts required to queue a policy evaluation computation via Arcium CPI.
 ///
@@ -533,6 +654,18 @@ mod handlers {
     }
 
     // ── Arcium CPI handlers ──────────────────────────────────────────────
+
+    /// Initialize the `policy_evaluate` computation definition on the Arcium MXE.
+    ///
+    /// This is a one-time setup instruction called after program deployment.
+    /// It creates the `ComputationDefinitionAccount` PDA that stores the
+    /// circuit interface (parameter types, output types, and metadata).
+    pub fn process_init_policy_evaluate_comp_def(
+        ctx: Context<InitPolicyEvaluateCompDef>,
+    ) -> Result<()> {
+        arcium_anchor::init_comp_def(&*ctx.accounts, None, None)?;
+        Ok(())
+    }
 
     /// Queue the encrypted policy evaluation through the Arcium MXE.
     ///
