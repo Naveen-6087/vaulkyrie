@@ -532,6 +532,12 @@ pub fn process(
             let mut authority_data = authority_account.try_borrow_mut_data()?;
             process_migrate_authority_data(&mut authority_data, args.new_authority_root)
         }
+        CoreInstruction::AdvancePolicyVersion(args) => {
+            // [0] = vault_registry (writable)
+            let vault_account = get_account_info!(accounts, 0);
+            let mut vault_data = vault_account.try_borrow_mut_data()?;
+            process_advance_policy_version_data(&mut vault_data, args.new_version)
+        }
     }
 }
 
@@ -1121,6 +1127,7 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
             ProgramError::InvalidInstructionData
         }
         transition::TransitionError::AuthorityMigrationNoOp => ProgramError::InvalidArgument,
+        transition::TransitionError::PolicyVersionNotMonotonic => ProgramError::InvalidArgument,
     }
 }
 
@@ -1289,6 +1296,26 @@ pub fn process_migrate_authority_data(
     Ok(())
 }
 
+pub fn process_advance_policy_version_data(
+    data: &mut [u8],
+    new_version: u64,
+) -> ProgramResult {
+    use crate::state::{VaultRegistry, VAULT_REGISTRY_DISCRIMINATOR};
+
+    if data.len() < VaultRegistry::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut vault = VaultRegistry::decode(&data[..VaultRegistry::LEN])
+        .ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&vault.discriminator, &VAULT_REGISTRY_DISCRIMINATOR)?;
+
+    transition::advance_policy_version(&mut vault, new_version)
+        .map_err(map_transition_error)?;
+
+    vault.encode(&mut data[..VaultRegistry::LEN]);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use pinocchio::program_error::ProgramError;
@@ -1301,7 +1328,8 @@ mod tests {
     };
 
     use super::{
-        ensure_wallet_authority, process_activate_session_data, process_close_quantum_vault,
+        ensure_wallet_authority, process_activate_session_data,
+        process_advance_policy_version_data, process_close_quantum_vault,
         process_commit_spend_orchestration_data, process_complete_recovery_data,
         process_complete_spend_orchestration_data, process_consume_receipt_data,
         process_consume_session_data, process_fail_spend_orchestration_data,
@@ -1326,6 +1354,7 @@ mod tests {
             QuantumAuthorityState, RecoveryState, RecoveryStatus, SessionStatus,
             SpendOrchestrationState, VaultRegistry, VaultStatus, ACTION_SESSION_DISCRIMINATOR,
             QUANTUM_STATE_DISCRIMINATOR, RECOVERY_STATE_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR,
+            VAULT_REGISTRY_DISCRIMINATOR,
         },
     };
 
@@ -3259,6 +3288,50 @@ mod tests {
         let mut buf = vec![0u8; QuantumAuthorityState::LEN - 1];
         let err = process_migrate_authority_data(&mut buf, [9; 32])
             .expect_err("buffer must be at least QuantumAuthorityState::LEN");
+        assert_eq!(err, ProgramError::InvalidAccountData);
+    }
+
+    // ── Policy version rollover processor tests ─────────────────────
+
+    fn make_active_vault_buffer() -> Vec<u8> {
+        let vault = VaultRegistry::new([1; 32], [2; 32], 10, VaultStatus::Active, 1);
+        let mut buf = vec![0u8; VaultRegistry::LEN];
+        vault.encode(&mut buf);
+        buf
+    }
+
+    #[test]
+    fn advance_policy_version_happy_path() {
+        let mut buf = make_active_vault_buffer();
+        let result = process_advance_policy_version_data(&mut buf, 11);
+        assert!(result.is_ok());
+        let vault = VaultRegistry::decode(&buf).unwrap();
+        assert_eq!(vault.policy_version, 11);
+    }
+
+    #[test]
+    fn advance_policy_version_rejects_skip() {
+        let mut buf = make_active_vault_buffer();
+        let err = process_advance_policy_version_data(&mut buf, 12)
+            .expect_err("skipping versions must fail");
+        assert_eq!(err, ProgramError::InvalidArgument);
+    }
+
+    #[test]
+    fn advance_policy_version_rejects_inactive_vault() {
+        let mut buf = vec![0u8; VaultRegistry::LEN];
+        // Write discriminator but leave status = 0 (not Active)
+        buf[..8].copy_from_slice(&VAULT_REGISTRY_DISCRIMINATOR);
+        let err = process_advance_policy_version_data(&mut buf, 1)
+            .expect_err("inactive vault must fail");
+        assert_eq!(err, ProgramError::InvalidAccountData);
+    }
+
+    #[test]
+    fn advance_policy_version_rejects_undersized_buffer() {
+        let mut buf = vec![0u8; VaultRegistry::LEN - 1];
+        let err = process_advance_policy_version_data(&mut buf, 1)
+            .expect_err("buffer must be at least VaultRegistry::LEN");
         assert_eq!(err, ProgramError::InvalidAccountData);
     }
 }

@@ -103,6 +103,11 @@ pub struct MigrateAuthorityArgs {
     pub new_authority_root: [u8; 32],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdvancePolicyVersionArgs {
+    pub new_version: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotateAuthorityArgs {
     pub statement: AuthorityRotationStatement,
@@ -163,6 +168,8 @@ pub enum CoreInstruction {
     /// Migrate to a new XMSS tree when the current authority tree is nearing
     /// exhaustion.  Requires a valid WOTS+ proof on the current tree.
     MigrateAuthority(MigrateAuthorityArgs),
+    /// Advance the vault's policy version by exactly 1 (monotonic).
+    AdvancePolicyVersion(AdvancePolicyVersionArgs),
 }
 
 impl TryFrom<&[u8]> for CoreInstruction {
@@ -207,6 +214,7 @@ impl TryFrom<&[u8]> for CoreInstruction {
             [22, rest @ ..] => Ok(Self::InitRecovery(parse_init_recovery(rest)?)),
             [23, rest @ ..] => Ok(Self::CompleteRecovery(parse_complete_recovery(rest)?)),
             [24, rest @ ..] => Ok(Self::MigrateAuthority(parse_migrate_authority(rest)?)),
+            [25, rest @ ..] => Ok(Self::AdvancePolicyVersion(parse_advance_policy_version(rest)?)),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -572,14 +580,26 @@ fn parse_migrate_authority(data: &[u8]) -> Result<MigrateAuthorityArgs, ProgramE
     })
 }
 
+fn parse_advance_policy_version(data: &[u8]) -> Result<AdvancePolicyVersionArgs, ProgramError> {
+    if data.len() != 8 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let mut buf = [0; 8];
+    buf.copy_from_slice(data);
+    Ok(AdvancePolicyVersionArgs {
+        new_version: u64::from_le_bytes(buf),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CloseQuantumVaultArgs, CommitSpendOrchestrationArgs, CompleteRecoveryArgs,
-        CompleteSpendOrchestrationArgs, CoreInstruction, FailSpendOrchestrationArgs,
-        InitAuthorityArgs, InitAuthorityProofArgs, InitQuantumVaultArgs, InitRecoveryArgs,
-        InitSpendOrchestrationArgs, InitVaultArgs, MigrateAuthorityArgs, RotateAuthorityArgs,
-        SplitQuantumVaultArgs, WriteAuthorityProofChunkArgs, WINTERNITZ_SIGNATURE_BYTES,
+        AdvancePolicyVersionArgs, CloseQuantumVaultArgs, CommitSpendOrchestrationArgs,
+        CompleteRecoveryArgs, CompleteSpendOrchestrationArgs, CoreInstruction,
+        FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs,
+        InitQuantumVaultArgs, InitRecoveryArgs, InitSpendOrchestrationArgs, InitVaultArgs,
+        MigrateAuthorityArgs, RotateAuthorityArgs, SplitQuantumVaultArgs,
+        WriteAuthorityProofChunkArgs, WINTERNITZ_SIGNATURE_BYTES,
     };
     use pinocchio::program_error::ProgramError;
     use vaulkyrie_protocol::{
@@ -1048,6 +1068,19 @@ mod tests {
             CoreInstruction::try_from(data.as_slice()),
             Ok(CoreInstruction::MigrateAuthority(MigrateAuthorityArgs {
                 new_authority_root: [5; 32],
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_advance_policy_version_instruction() {
+        let mut data = vec![25];
+        data.extend_from_slice(&42u64.to_le_bytes());
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::AdvancePolicyVersion(AdvancePolicyVersionArgs {
+                new_version: 42,
             }))
         );
     }

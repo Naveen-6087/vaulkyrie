@@ -60,6 +60,8 @@ pub enum TransitionError {
     /// Authority migration requires the current tree to have at least one leaf
     /// used (prevents no-op migrations on brand new trees).
     AuthorityMigrationNoOp,
+    /// Policy version must advance by exactly 1.
+    PolicyVersionNotMonotonic,
 }
 
 pub fn initialize_vault(
@@ -670,6 +672,22 @@ pub fn migrate_authority_tree(
     Ok(())
 }
 
+// ── Policy version rollover transition ──────────────────────────────
+
+/// Advance the vault's policy version by exactly 1.  The vault must be in
+/// Active status (governance changes happen while active, not in recovery).
+pub fn advance_policy_version(
+    vault: &mut VaultRegistry,
+    new_version: u64,
+) -> Result<(), TransitionError> {
+    validate_vault_active(vault)?;
+    if new_version != vault.policy_version + 1 {
+        return Err(TransitionError::PolicyVersionNotMonotonic);
+    }
+    vault.policy_version = new_version;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use solana_nostd_sha256::hashv;
@@ -680,8 +698,8 @@ mod tests {
     };
 
     use super::{
-        apply_authority_rotation, complete_recovery, consume_action_session,
-        consume_policy_receipt, finalize_action_session, init_recovery,
+        advance_policy_version, apply_authority_rotation, complete_recovery,
+        consume_action_session, consume_policy_receipt, finalize_action_session, init_recovery,
         initialize_quantum_authority, initialize_vault, mark_action_session_ready,
         migrate_authority_tree, open_action_session, open_action_session_from_receipt,
         parse_vault_status, rotate_vault_authority, stage_policy_receipt, update_vault_status,
@@ -692,7 +710,8 @@ mod tests {
         validate_vault_recovery_mode, verify_authority_proof, TransitionError,
     };
     use crate::state::{
-        QuantumAuthorityState, RecoveryState, RecoveryStatus, SessionStatus, VaultStatus,
+        QuantumAuthorityState, RecoveryState, RecoveryStatus, SessionStatus, VaultRegistry,
+        VaultStatus,
     };
 
     fn sample_action_hash() -> [u8; 32] {
@@ -2064,5 +2083,41 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(authority.next_leaf_index, 0);
         assert_eq!(authority.current_authority_root, new_root);
+    }
+
+    // ── Policy version rollover tests ───────────────────────────────
+
+    #[test]
+    fn advance_policy_version_increments_by_one() {
+        let mut vault = VaultRegistry::new([0; 32], [0; 32], 5, VaultStatus::Active, 1);
+
+        let result = advance_policy_version(&mut vault, 6);
+        assert!(result.is_ok());
+        assert_eq!(vault.policy_version, 6);
+    }
+
+    #[test]
+    fn advance_policy_version_rejects_skip() {
+        let mut vault = VaultRegistry::new([0; 32], [0; 32], 5, VaultStatus::Active, 1);
+
+        let result = advance_policy_version(&mut vault, 7);
+        assert_eq!(result.unwrap_err(), TransitionError::PolicyVersionNotMonotonic);
+    }
+
+    #[test]
+    fn advance_policy_version_rejects_same() {
+        let mut vault = VaultRegistry::new([0; 32], [0; 32], 5, VaultStatus::Active, 1);
+
+        let result = advance_policy_version(&mut vault, 5);
+        assert_eq!(result.unwrap_err(), TransitionError::PolicyVersionNotMonotonic);
+    }
+
+    #[test]
+    fn advance_policy_version_rejects_inactive_vault() {
+        let mut vault = VaultRegistry::new([0; 32], [0; 32], 0, VaultStatus::Active, 1);
+        vault.status = 0; // Force inactive
+
+        let result = advance_policy_version(&mut vault, 1);
+        assert_eq!(result.unwrap_err(), TransitionError::VaultNotActive);
     }
 }
