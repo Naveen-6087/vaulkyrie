@@ -777,14 +777,17 @@ mod handlers {
             return Err(PolicyMxeError::NotInitialized.into());
         }
 
-        // Write MPC-produced commitments into the evaluation state.
-        eval_state.receipt_commitment = verified_output.receipt_commitment;
-        eval_state.decision_commitment = verified_output.decision_commitment;
-        eval_state.delay_until_slot = verified_output.delay_until_slot;
-        eval_state.reason_code = verified_output.reason_code;
-
-        // Transition to Finalized (status byte = 2).
-        eval_state.status = 2;
+        // Route through the transition layer so denied evaluations are aborted
+        // instead of finalized — preventing them from passing the core bridge.
+        transition::apply_mxe_callback(
+            &mut eval_state,
+            verified_output.receipt_commitment,
+            verified_output.decision_commitment,
+            verified_output.delay_until_slot,
+            verified_output.reason_code,
+            verified_output.approved == 1,
+        )
+        .map_err(PolicyMxeError::from)?;
 
         eval_state.encode(&mut eval_data);
         Ok(())

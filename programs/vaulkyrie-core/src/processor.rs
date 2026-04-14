@@ -1101,7 +1101,6 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::AuthorityMerkleRootMismatch => ProgramError::InvalidArgument,
         transition::TransitionError::AuthorityTreeExhausted => ProgramError::InvalidArgument,
         transition::TransitionError::QuantumVaultAmountTooLarge => ProgramError::InsufficientFunds,
-        transition::TransitionError::QuantumVaultSignatureInvalid => ProgramError::InvalidArgument,
         transition::TransitionError::QuantumVaultPdaMismatch => {
             ProgramError::MissingRequiredSignature
         }

@@ -72,6 +72,9 @@ impl PolicyConfigState {
 
         let mut discriminator = [0; 8];
         discriminator.copy_from_slice(&src[..8]);
+        if discriminator != POLICY_CONFIG_DISCRIMINATOR {
+            return None;
+        }
 
         let mut core_program = [0; 32];
         core_program.copy_from_slice(&src[8..40]);
@@ -187,6 +190,9 @@ impl PolicyEvaluationState {
 
         let mut discriminator = [0; 8];
         discriminator.copy_from_slice(&src[..8]);
+        if discriminator != POLICY_EVAL_DISCRIMINATOR {
+            return None;
+        }
 
         let mut request_commitment = [0; 32];
         request_commitment.copy_from_slice(&src[8..40]);
@@ -277,5 +283,23 @@ mod tests {
         assert!(state.encode(&mut bytes));
         assert_eq!(PolicyEvaluationState::decode(&bytes), Some(state));
         assert_eq!(state.discriminator, POLICY_EVAL_DISCRIMINATOR);
+    }
+
+    #[test]
+    fn policy_config_decode_rejects_wrong_discriminator() {
+        let state = PolicyConfigState::new([1; 32], [2; 32], [3; 32], 9, 4);
+        let mut bytes = [0u8; PolicyConfigState::LEN];
+        assert!(state.encode(&mut bytes));
+        bytes[0..8].copy_from_slice(b"XXXXXXXX");
+        assert_eq!(PolicyConfigState::decode(&bytes), None);
+    }
+
+    #[test]
+    fn policy_evaluation_state_decode_rejects_wrong_discriminator() {
+        let state = PolicyEvaluationState::new([1; 32], [2; 32], [3; 32], [4; 32], 5, 6, 7, 8);
+        let mut bytes = [0u8; PolicyEvaluationState::LEN];
+        assert!(state.encode(&mut bytes));
+        bytes[0..8].copy_from_slice(b"XXXXXXXX");
+        assert_eq!(PolicyEvaluationState::decode(&bytes), None);
     }
 }

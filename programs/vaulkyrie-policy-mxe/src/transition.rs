@@ -156,6 +156,36 @@ pub fn queue_arcium_computation(
     Ok(())
 }
 
+/// Apply the Arcium MXE callback result to an evaluation in `ComputationQueued`
+/// status.  If the circuit approved the action the state transitions to
+/// `Finalized` with the computed commitments.  If denied, it transitions to
+/// `Aborted` — preventing the core bridge from accepting the evaluation.
+pub fn apply_mxe_callback(
+    state: &mut PolicyEvaluationState,
+    receipt_commitment: [u8; 32],
+    decision_commitment: [u8; 32],
+    delay_until_slot: u64,
+    reason_code: u16,
+    approved: bool,
+) -> Result<(), TransitionError> {
+    if state.status != PolicyEvaluationStatus::ComputationQueued as u8 {
+        return Err(TransitionError::InvalidComputationStatus);
+    }
+
+    state.reason_code = reason_code;
+
+    if approved {
+        state.receipt_commitment = receipt_commitment;
+        state.decision_commitment = decision_commitment;
+        state.delay_until_slot = delay_until_slot;
+        state.status = PolicyEvaluationStatus::Finalized as u8;
+    } else {
+        state.status = PolicyEvaluationStatus::Aborted as u8;
+    }
+
+    Ok(())
+}
+
 fn matches_envelope(state: &PolicyEvaluationState, envelope: &PolicyDecisionEnvelope) -> bool {
     state.request_commitment == envelope.request_commitment
         && state.action_hash == envelope.receipt.action_hash
@@ -167,8 +197,9 @@ fn matches_envelope(state: &PolicyEvaluationState, envelope: &PolicyDecisionEnve
 #[cfg(test)]
 mod tests {
     use super::{
-        abort_policy_evaluation, finalize_policy_evaluation, initialize_policy_config,
-        open_policy_evaluation, queue_arcium_computation, TransitionError,
+        abort_policy_evaluation, apply_mxe_callback, finalize_policy_evaluation,
+        initialize_policy_config, open_policy_evaluation, queue_arcium_computation,
+        TransitionError,
     };
     use crate::state::PolicyEvaluationStatus;
     use vaulkyrie_protocol::{
@@ -364,5 +395,73 @@ mod tests {
 
         assert_eq!(state.status, PolicyEvaluationStatus::Aborted as u8);
         assert_eq!(state.reason_code, 11);
+    }
+
+    // ── apply_mxe_callback tests ──────────────────────────────────────────
+
+    #[test]
+    fn mxe_callback_approved_finalizes_evaluation() {
+        let mut config = initialize_policy_config([4; 32], [5; 32], [6; 32], 9, 2);
+        let request = sample_request();
+        let mut state =
+            open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
+        queue_arcium_computation(&mut state, 77, 400).expect("queue should succeed");
+
+        apply_mxe_callback(&mut state, [10; 32], [11; 32], 850, 0, true)
+            .expect("approved callback should finalize");
+
+        assert_eq!(state.status, PolicyEvaluationStatus::Finalized as u8);
+        assert_eq!(state.receipt_commitment, [10; 32]);
+        assert_eq!(state.decision_commitment, [11; 32]);
+        assert_eq!(state.delay_until_slot, 850);
+        assert_eq!(state.reason_code, 0);
+    }
+
+    #[test]
+    fn mxe_callback_denied_aborts_evaluation() {
+        let mut config = initialize_policy_config([4; 32], [5; 32], [6; 32], 9, 2);
+        let request = sample_request();
+        let mut state =
+            open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
+        queue_arcium_computation(&mut state, 77, 400).expect("queue should succeed");
+
+        apply_mxe_callback(&mut state, [10; 32], [11; 32], 850, 42, false)
+            .expect("denied callback should abort");
+
+        assert_eq!(state.status, PolicyEvaluationStatus::Aborted as u8);
+        assert_eq!(state.reason_code, 42);
+        // Commitments should NOT be written on denial.
+        assert_eq!(state.receipt_commitment, [0; 32]);
+        assert_eq!(state.decision_commitment, [0; 32]);
+    }
+
+    #[test]
+    fn mxe_callback_rejects_non_queued_status() {
+        let mut config = initialize_policy_config([4; 32], [5; 32], [6; 32], 9, 2);
+        let request = sample_request();
+        let mut state =
+            open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
+        // State is Pending, not ComputationQueued.
+        assert_eq!(
+            apply_mxe_callback(&mut state, [10; 32], [11; 32], 850, 0, true),
+            Err(TransitionError::InvalidComputationStatus)
+        );
+    }
+
+    #[test]
+    fn mxe_callback_rejects_already_finalized() {
+        let mut config = initialize_policy_config([4; 32], [5; 32], [6; 32], 9, 2);
+        let request = sample_request();
+        let mut state =
+            open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
+        queue_arcium_computation(&mut state, 77, 400).expect("queue should succeed");
+        apply_mxe_callback(&mut state, [10; 32], [11; 32], 850, 0, true)
+            .expect("first callback should succeed");
+
+        // Second callback on already-finalized state should fail.
+        assert_eq!(
+            apply_mxe_callback(&mut state, [10; 32], [11; 32], 850, 0, true),
+            Err(TransitionError::InvalidComputationStatus)
+        );
     }
 }

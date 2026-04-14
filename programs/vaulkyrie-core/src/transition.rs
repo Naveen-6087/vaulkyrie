@@ -38,7 +38,6 @@ pub enum TransitionError {
     AuthorityMerkleRootMismatch,
     AuthorityTreeExhausted,
     QuantumVaultAmountTooLarge,
-    QuantumVaultSignatureInvalid,
     QuantumVaultPdaMismatch,
     OrchestrationExpired,
     OrchestrationInvalidParams,
