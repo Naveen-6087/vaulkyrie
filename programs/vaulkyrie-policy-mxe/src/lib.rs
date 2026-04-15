@@ -11,7 +11,7 @@ pub mod state;
 pub mod transition;
 
 // Placeholder program ID — replace with actual deployed address.
-declare_id!("99gQafBBNAZitScYub5BnJcA7asqdRVndwvCj2Zt7m7L");
+declare_id!("6XVfpzDXRDQXLHfvwkLA6So3WTriQfWQphsHzfWSSGr7");
 
 /// Arcium computation definition offset for "policy_evaluate" circuit.
 /// Deterministic u32 derived from SHA-256("policy_evaluate")[0..4].

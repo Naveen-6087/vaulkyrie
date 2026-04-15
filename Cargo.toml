@@ -32,6 +32,11 @@ solana-message = { version = "4.1.0", features = ["wincode"] }
 solana-pubkey = "4.2.0"
 solana-signature = { version = "2.0.19", features = ["verify"] }
 
+# Pin blake3 to 1.5.x to avoid edition2024 deps (block-buffer 0.12.0)
+# that the BPF toolchain (Cargo 1.84) cannot parse.
+# solana-blake3-hasher accepts blake3 ^1, so 1.5.5 is compatible.
+blake3 = "=1.5.5"
+
 [profile.release]
 overflow-checks = true
 

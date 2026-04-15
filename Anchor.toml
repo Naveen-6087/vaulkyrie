@@ -4,7 +4,7 @@ skip-lint = false
 
 [programs.devnet]
 vaulkyrie_core = "HUf5TWL4H18qJigd9m7h6MihX1xnzr2BVbbyGYFLEGPx"
-vaulkyrie_policy_mxe = "99gQafBBNAZitScYub5BnJcA7asqdRVndwvCj2Zt7m7L"
+vaulkyrie_policy_mxe = "6XVfpzDXRDQXLHfvwkLA6So3WTriQfWQphsHzfWSSGr7"
 
 [provider]
 cluster = "devnet"

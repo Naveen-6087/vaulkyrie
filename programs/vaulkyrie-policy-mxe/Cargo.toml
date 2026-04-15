@@ -19,4 +19,5 @@ anchor-lang = { version = "0.32.1", features = ["init-if-needed"] }
 arcium-anchor = "=0.9.3"
 arcium-client = { version = "=0.9.3", default-features = false }
 arcium-macros = "=0.9.3"
+blake3 = { workspace = true }
 vaulkyrie-protocol = { path = "../../crates/vaulkyrie-protocol" }
