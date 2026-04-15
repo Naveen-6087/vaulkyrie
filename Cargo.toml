@@ -32,3 +32,6 @@ solana-message = { version = "4.1.0", features = ["wincode"] }
 solana-pubkey = "4.2.0"
 solana-signature = { version = "2.0.19", features = ["verify"] }
 
+[profile.release]
+overflow-checks = true
+

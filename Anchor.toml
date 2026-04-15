@@ -1,0 +1,18 @@
+[features]
+seeds = false
+skip-lint = false
+
+[programs.devnet]
+vaulkyrie_core = "HUf5TWL4H18qJigd9m7h6MihX1xnzr2BVbbyGYFLEGPx"
+vaulkyrie_policy_mxe = "99gQafBBNAZitScYub5BnJcA7asqdRVndwvCj2Zt7m7L"
+
+[provider]
+cluster = "devnet"
+wallet = "~/.config/solana/id.json"
+
+[toolchain]
+anchor_version = "0.32.1"
+solana_version = "2.2.12"
+
+[scripts]
+test = "echo 'No JS tests configured'"
