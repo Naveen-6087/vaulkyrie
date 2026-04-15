@@ -18,12 +18,6 @@ default_allocator!();
 #[cfg(feature = "bpf-entrypoint")]
 default_panic_handler!();
 
-#[cfg(feature = "bpf-entrypoint")]
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
-    loop {}
-}
-
 pub fn process_instruction(
     program_id: &Pubkey,
     accounts: &[AccountInfo],

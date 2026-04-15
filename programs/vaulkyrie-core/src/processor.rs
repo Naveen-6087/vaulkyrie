@@ -989,31 +989,60 @@ pub fn process_rotate_authority_staged_data(
         return Err(ProgramError::AccountDataTooSmall);
     }
 
-    let mut proof_state =
-        AuthorityProofState::decode(proof_dst).ok_or(ProgramError::InvalidAccountData)?;
-    require_discriminator(&proof_state.discriminator, &AUTHORITY_PROOF_DISCRIMINATOR)?;
-    if proof_state.consumed != 0 {
+    // Read header fields directly from byte slice to avoid putting the
+    // full AuthorityProofState (~1360 bytes) on the stack alongside the
+    // decoded WotsAuthProof (~1280 bytes), which would exceed BPF's 4 KB
+    // stack limit.
+    let mut disc = [0u8; 8];
+    disc.copy_from_slice(&proof_dst[..8]);
+    require_discriminator(&disc, &AUTHORITY_PROOF_DISCRIMINATOR)?;
+
+    if proof_dst[76] != 0 {
+        // consumed != 0
         return Err(ProgramError::AccountAlreadyInitialized);
     }
-    if proof_state.statement_digest != statement.digest() {
+
+    let mut sd = [0u8; 32];
+    sd.copy_from_slice(&proof_dst[8..40]);
+    if sd != statement.digest() {
         return Err(ProgramError::Custom(error::PROOF_STATEMENT_MISMATCH));
     }
-    if proof_state.bytes_written as usize != WotsAuthProof::ENCODED_LEN {
+
+    let mut pc = [0u8; 32];
+    pc.copy_from_slice(&proof_dst[40..72]);
+
+    let mut bw = [0u8; 4];
+    bw.copy_from_slice(&proof_dst[72..76]);
+    if u32::from_le_bytes(bw) as usize != WotsAuthProof::ENCODED_LEN {
         return Err(ProgramError::InvalidAccountData);
     }
 
-    let proof =
-        WotsAuthProof::decode(&proof_state.proof_bytes).ok_or(ProgramError::InvalidAccountData)?;
-    if proof.commitment() != proof_state.proof_commitment {
+    // Decode proof directly from the slice; only WotsAuthProof is on the
+    // stack at this point (the header fields above are small).
+    validate_and_rotate_with_proof(vault_dst, authority_dst, proof_dst, &pc, statement, current_slot)
+}
+
+/// Separate function so the large `WotsAuthProof` lives in its own stack
+/// frame and does not overlap with the caller's locals.
+#[inline(never)]
+fn validate_and_rotate_with_proof(
+    vault_dst: &mut [u8],
+    authority_dst: &mut [u8],
+    proof_dst: &mut [u8],
+    proof_commitment: &[u8; 32],
+    statement: &AuthorityRotationStatement,
+    current_slot: u64,
+) -> ProgramResult {
+    let proof_bytes = &proof_dst[AuthorityProofState::HEADER_LEN..AuthorityProofState::LEN];
+    let proof = WotsAuthProof::decode(proof_bytes).ok_or(ProgramError::InvalidAccountData)?;
+    if proof.commitment() != *proof_commitment {
         return Err(ProgramError::Custom(error::PROOF_COMMITMENT_MISMATCH));
     }
 
     process_rotate_authority_data(vault_dst, authority_dst, statement, &proof, current_slot)?;
-    proof_state.consumed = 1;
 
-    if !proof_state.encode(proof_dst) {
-        return Err(ProgramError::InvalidAccountData);
-    }
+    // Mark consumed directly in the byte slice
+    proof_dst[76] = 1;
 
     Ok(())
 }
