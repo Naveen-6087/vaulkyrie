@@ -1,0 +1,22 @@
+[package]
+name = "vaulkyrie-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Command-line interface for the Vaulkyrie threshold wallet — vault management, DKG ceremonies, policy receipts, authority rotation, and quantum vault operations."
+
+[[bin]]
+name = "vaulkyrie"
+path = "src/main.rs"
+
+[dependencies]
+vaulkyrie-sdk = { path = "../vaulkyrie-sdk" }
+vaulkyrie-protocol = { path = "../vaulkyrie-protocol" }
+clap = { version = "4", features = ["derive"] }
+solana-pubkey.workspace = true
+solana-hash.workspace = true
+hex = "0.4"
+bs58 = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

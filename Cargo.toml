@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/vaulkyrie-cli",
     "crates/vaulkyrie-frost",
     "crates/vaulkyrie-protocol",
     "crates/vaulkyrie-sdk",
