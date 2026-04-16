@@ -2,6 +2,7 @@
 members = [
     "crates/vaulkyrie-cli",
     "crates/vaulkyrie-frost",
+    "crates/vaulkyrie-frost-wasm",
     "crates/vaulkyrie-protocol",
     "crates/vaulkyrie-sdk",
     "programs/vaulkyrie-core",

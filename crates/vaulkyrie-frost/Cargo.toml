@@ -5,13 +5,23 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = ["solana-harness"]
+solana-harness = [
+    "dep:solana-hash",
+    "dep:solana-instruction",
+    "dep:solana-message",
+    "dep:solana-pubkey",
+    "dep:solana-signature",
+]
+
 [dependencies]
 ed25519-dalek.workspace = true
 frost-ed25519.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true
-solana-hash.workspace = true
-solana-instruction.workspace = true
-solana-message.workspace = true
-solana-pubkey.workspace = true
-solana-signature.workspace = true
+solana-hash = { workspace = true, optional = true }
+solana-instruction = { workspace = true, optional = true }
+solana-message = { workspace = true, optional = true }
+solana-pubkey = { workspace = true, optional = true }
+solana-signature = { workspace = true, optional = true }

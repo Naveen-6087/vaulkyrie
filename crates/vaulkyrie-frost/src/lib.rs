@@ -5,9 +5,14 @@ use ed25519_dalek::{Signature as DalekSignature, Verifier, VerifyingKey as Dalek
 use frost_ed25519 as frost;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
+
+#[cfg(feature = "solana-harness")]
 use solana_hash::Hash as SolanaHash;
+#[cfg(feature = "solana-harness")]
 use solana_instruction::{AccountMeta, Instruction};
+#[cfg(feature = "solana-harness")]
 use solana_message::legacy::Message as LegacyMessage;
+#[cfg(feature = "solana-harness")]
 use solana_pubkey::Pubkey as SolanaPubkey;
 
 pub const DEFAULT_MIN_SIGNERS: u16 = 2;
@@ -66,6 +71,7 @@ pub struct RetryReport {
     pub report: HarnessReport,
 }
 
+#[cfg(feature = "solana-harness")]
 #[derive(Debug, Clone)]
 pub struct SolanaMessageReport {
     pub message_bytes: Vec<u8>,
@@ -77,6 +83,7 @@ pub fn run_dkg_signing_harness(message: &[u8]) -> Result<HarnessReport, HarnessE
     run_dkg_signing_with_config(message, &config)
 }
 
+#[cfg(feature = "solana-harness")]
 pub fn run_dkg_legacy_message_harness() -> Result<SolanaMessageReport, HarnessError> {
     let config = HarnessConfig::default();
     run_dkg_legacy_message_with_config(&config)
@@ -124,6 +131,7 @@ pub fn run_dkg_signing_with_config(
     })
 }
 
+#[cfg(feature = "solana-harness")]
 pub fn run_dkg_legacy_message_with_config(
     config: &HarnessConfig,
 ) -> Result<SolanaMessageReport, HarnessError> {
@@ -401,6 +409,7 @@ fn sign_with_key_packages(
     Ok((public_key_bytes, signature_bytes))
 }
 
+#[cfg(feature = "solana-harness")]
 fn build_sample_legacy_message() -> Vec<u8> {
     let payer = SolanaPubkey::from([1; 32]);
     let writable_target = SolanaPubkey::from([2; 32]);
@@ -464,10 +473,14 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        run_dkg_legacy_message_harness, run_dkg_legacy_message_with_config,
         run_dkg_signing_harness, run_dkg_signing_with_config, run_dkg_signing_with_retries,
         run_share_refresh_harness, HarnessConfig, HarnessError,
     };
+
+    #[cfg(feature = "solana-harness")]
+    use super::{run_dkg_legacy_message_harness, run_dkg_legacy_message_with_config};
+
+    #[cfg(feature = "solana-harness")]
     use solana_signature::Signature as SolanaSignature;
 
     #[test]
@@ -490,6 +503,7 @@ mod tests {
         assert_eq!(first.signature, second.signature);
     }
 
+    #[cfg(feature = "solana-harness")]
     #[test]
     fn dkg_harness_signature_verifies_with_solana_signature_api() {
         let message = b"vaulkyrie frost harness";
@@ -500,6 +514,7 @@ mod tests {
         assert!(solana_signature.verify(&report.group_public_key, message));
     }
 
+    #[cfg(feature = "solana-harness")]
     #[test]
     fn legacy_message_harness_signs_serialized_solana_message_bytes() {
         let report = run_dkg_legacy_message_harness()
@@ -510,6 +525,7 @@ mod tests {
         assert!(solana_signature.verify(&report.report.group_public_key, &report.message_bytes));
     }
 
+    #[cfg(feature = "solana-harness")]
     #[test]
     fn legacy_message_harness_supports_custom_signer_set() {
         let config = HarnessConfig {
@@ -527,6 +543,7 @@ mod tests {
         assert!(solana_signature.verify(&report.report.group_public_key, &report.message_bytes));
     }
 
+    #[cfg(feature = "solana-harness")]
     #[test]
     fn dkg_harness_supports_custom_signer_set() {
         let message = b"vaulkyrie custom signers";
@@ -599,6 +616,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "solana-harness")]
     #[test]
     fn share_refresh_harness_preserves_group_key_and_signature_compatibility() {
         let message = b"vaulkyrie refresh harness";
@@ -612,6 +630,7 @@ mod tests {
         assert!(solana_signature.verify(&report.refreshed_group_public_key, message));
     }
 
+    #[cfg(feature = "solana-harness")]
     #[test]
     fn retry_harness_falls_back_to_later_signer_set() {
         let message = b"vaulkyrie retry harness";
