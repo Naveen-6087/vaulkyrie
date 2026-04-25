@@ -362,7 +362,14 @@ pub struct QueuePolicyEvaluate<'info> {
     pub mxe_account: Account<'info, MXEAccount>,
 
     /// Program-owned PDA signer (seeds = [SIGN_PDA_SEED]).
-    #[account(mut)]
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 9,
+        seeds = [SIGN_PDA_SEED],
+        bump,
+        address = arcium_anchor::derive_sign_pda!(),
+    )]
     pub sign_pda_account: Account<'info, ArciumSignerAccount>,
 
     /// CHECK: Arcium mempool account (writable, validated by Arcium CPI)
