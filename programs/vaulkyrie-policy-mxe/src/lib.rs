@@ -13,6 +13,9 @@ pub mod transition;
 // Placeholder program ID — replace with actual deployed address.
 declare_id!("6XVfpzDXRDQXLHfvwkLA6So3WTriQfWQphsHzfWSSGr7");
 
+pub const POLICY_CONFIG_SEED: &[u8] = b"policy_config";
+pub const POLICY_EVAL_SEED: &[u8] = b"policy_eval";
+
 /// Arcium computation definition offset for "policy_evaluate" circuit.
 /// Deterministic u32 derived from SHA-256("policy_evaluate")[0..4].
 pub const POLICY_EVALUATE_COMP_DEF_OFFSET: u32 = arcium_anchor::comp_def_offset("policy_evaluate");
@@ -187,7 +190,9 @@ pub struct InitPolicyConfig<'info> {
     /// CHECK: manual validation — preserves custom `POLCFG01` discriminator
     #[account(mut)]
     pub config: UncheckedAccount<'info>,
+    #[account(mut)]
     pub authority: Signer<'info>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -198,8 +203,10 @@ pub struct OpenPolicyEvaluation<'info> {
     /// CHECK: manual validation — preserves custom `POLEVAL1` discriminator
     #[account(mut)]
     pub evaluation: UncheckedAccount<'info>,
+    #[account(mut)]
     pub authority: Signer<'info>,
     pub clock: Sysvar<'info, Clock>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -462,9 +469,57 @@ mod handlers {
         PolicyConfigState, PolicyEvaluationState, POLICY_CONFIG_DISCRIMINATOR,
         POLICY_EVAL_DISCRIMINATOR,
     };
+    use anchor_lang::solana_program::{
+        program::invoke_signed, system_instruction, system_program, sysvar::rent::Rent,
+    };
     use vaulkyrie_protocol::{
         PolicyDecisionEnvelope, PolicyEvaluationRequest, PolicyReceipt, ThresholdRequirement,
     };
+
+    fn bootstrap_program_account<'info>(
+        payer: &Signer<'info>,
+        target: &UncheckedAccount<'info>,
+        system_program_account: &Program<'info, System>,
+        seeds_without_bump: &[&[u8]],
+        space: usize,
+    ) -> Result<()> {
+        let (expected, bump) = Pubkey::find_program_address(seeds_without_bump, &crate::ID);
+        if expected != target.key() {
+            return Err(PolicyMxeError::InvalidInstructionData.into());
+        }
+
+        if target.owner == &crate::ID {
+            return Ok(());
+        }
+
+        if target.owner != &system_program::ID || target.lamports() != 0 || target.data_len() != 0 {
+            return Err(PolicyMxeError::AccountOwnerMismatch.into());
+        }
+
+        let lamports = Rent::get()?.minimum_balance(space);
+        let bump_seed = [bump];
+        let mut signer_seeds = seeds_without_bump.to_vec();
+        signer_seeds.push(&bump_seed);
+        let signer = [signer_seeds.as_slice()];
+
+        invoke_signed(
+            &system_instruction::create_account(
+                &payer.key(),
+                &target.key(),
+                lamports,
+                space as u64,
+                &crate::ID,
+            ),
+            &[
+                payer.to_account_info(),
+                target.to_account_info(),
+                system_program_account.to_account_info(),
+            ],
+            &signer,
+        )?;
+
+        Ok(())
+    }
 
     pub fn process_init_policy_config(
         ctx: Context<InitPolicyConfig>,
@@ -475,6 +530,14 @@ mod handlers {
         bump: u8,
     ) -> Result<()> {
         let config_info = &ctx.accounts.config;
+        let authority_key = ctx.accounts.authority.key();
+        bootstrap_program_account(
+            &ctx.accounts.authority,
+            config_info,
+            &ctx.accounts.system_program,
+            &[POLICY_CONFIG_SEED, authority_key.as_ref()],
+            PolicyConfigState::LEN,
+        )?;
         let mut data = config_info.try_borrow_mut_data()?;
 
         if data.len() != PolicyConfigState::LEN {
@@ -518,6 +581,15 @@ mod handlers {
         if config.discriminator != POLICY_CONFIG_DISCRIMINATOR {
             return Err(PolicyMxeError::NotInitialized.into());
         }
+        let config_key = config_info.key();
+
+        bootstrap_program_account(
+            &ctx.accounts.authority,
+            eval_info,
+            &ctx.accounts.system_program,
+            &[POLICY_EVAL_SEED, config_key.as_ref(), &action_hash],
+            PolicyEvaluationState::LEN,
+        )?;
 
         // Validate evaluation account.
         let mut eval_data = eval_info.try_borrow_mut_data()?;
