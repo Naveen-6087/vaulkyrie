@@ -8,7 +8,10 @@ use pinocchio::{
     ProgramResult,
 };
 use solana_winternitz::signature::WinternitzSignature;
-use vaulkyrie_protocol::{AuthorityRotationStatement, PolicyReceipt, WotsAuthProof};
+use vaulkyrie_protocol::{
+    AuthorityRotationStatement, PolicyReceipt, WotsAuthProof, SPEND_ORCH_SEED,
+    VAULT_REGISTRY_SEED,
+};
 
 use crate::{
     error,
@@ -47,7 +50,11 @@ pub fn process(
 
             let account = get_account_info!(accounts, 0);
             require_writable(account)?;
-            require_program_owner(program_id, account)?;
+            if let Some(system_program) = accounts.get(2) {
+                process_open_vault_registry(program_id, wallet_signer, account, system_program, args)?;
+            } else {
+                require_program_owner(program_id, account)?;
+            }
             pda::verify_vault_registry(account.key(), &args.wallet_pubkey, args.bump, program_id)?;
             let mut data = account.try_borrow_mut_data()?;
             process_init_vault_data(&mut data, args)
@@ -391,7 +398,6 @@ pub fn process(
             let current_slot = current_slot()?;
             let orch_account = get_account_info!(accounts, 0);
             require_writable(orch_account)?;
-            require_program_owner(program_id, orch_account)?;
 
             let vault_account = get_account_info!(accounts, 1);
             require_program_owner(program_id, vault_account)?;
@@ -408,6 +414,19 @@ pub fn process(
                 let vault_data = vault_account.try_borrow_data()?;
                 let vault = decode_vault_state(&vault_data)?;
                 require_wallet_authority(&vault, wallet_signer)?;
+            }
+
+            if let Some(system_program) = accounts.get(3) {
+                process_open_spend_orchestration(
+                    program_id,
+                    wallet_signer,
+                    orch_account,
+                    vault_account,
+                    system_program,
+                    args,
+                )?;
+            } else {
+                require_program_owner(program_id, orch_account)?;
             }
 
             let mut orch_data = orch_account.try_borrow_mut_data()?;
@@ -630,26 +649,38 @@ pub fn process_open_quantum_vault(
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
-    if !payer.is_signer() {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-    require_writable(payer)?;
-    require_writable(vault)?;
-    if system_program.key() != &SYSTEM_PROGRAM_ID {
-        return Err(ProgramError::IncorrectProgramId);
-    }
-
     let lamports = Rent::get()?.minimum_balance(0);
     let bump_seed = [args.bump];
     let seeds = [Seed::from(&args.hash), Seed::from(&bump_seed)];
     let signers = [Signer::from(&seeds)];
+    create_program_owned_account(program_id, payer, vault, system_program, &signers, lamports, 0)
+}
+
+fn create_program_owned_account(
+    program_id: &pinocchio::pubkey::Pubkey,
+    payer: &AccountInfo,
+    new_account: &AccountInfo,
+    system_program: &AccountInfo,
+    signers: &[Signer],
+    lamports: u64,
+    space: u64,
+) -> ProgramResult {
+    if !payer.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    require_writable(payer)?;
+    require_writable(new_account)?;
+    if system_program.key() != &SYSTEM_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
     let account_metas = [
         AccountMeta::writable_signer(payer.key()),
-        AccountMeta::writable_signer(vault.key()),
+        AccountMeta::writable_signer(new_account.key()),
     ];
     let mut instruction_data = [0u8; 52];
     instruction_data[4..12].copy_from_slice(&lamports.to_le_bytes());
-    instruction_data[12..20].copy_from_slice(&0u64.to_le_bytes());
+    instruction_data[12..20].copy_from_slice(&space.to_le_bytes());
     instruction_data[20..52].copy_from_slice(program_id);
     let instruction = Instruction {
         program_id: &SYSTEM_PROGRAM_ID,
@@ -657,7 +688,61 @@ pub fn process_open_quantum_vault(
         data: &instruction_data,
     };
 
-    invoke_signed(&instruction, &[payer, vault], &signers)
+    invoke_signed(&instruction, &[payer, new_account], signers)
+}
+
+fn process_open_vault_registry(
+    program_id: &pinocchio::pubkey::Pubkey,
+    payer: &AccountInfo,
+    vault_registry: &AccountInfo,
+    system_program: &AccountInfo,
+    args: InitVaultArgs,
+) -> ProgramResult {
+    let bump_seed = [args.bump];
+    let seeds = [
+        Seed::from(VAULT_REGISTRY_SEED),
+        Seed::from(&args.wallet_pubkey),
+        Seed::from(&bump_seed),
+    ];
+    let signers = [Signer::from(&seeds)];
+    let lamports = Rent::get()?.minimum_balance(VaultRegistry::LEN);
+    create_program_owned_account(
+        program_id,
+        payer,
+        vault_registry,
+        system_program,
+        &signers,
+        lamports,
+        VaultRegistry::LEN as u64,
+    )
+}
+
+fn process_open_spend_orchestration(
+    program_id: &pinocchio::pubkey::Pubkey,
+    payer: &AccountInfo,
+    orch_account: &AccountInfo,
+    vault_account: &AccountInfo,
+    system_program: &AccountInfo,
+    args: InitSpendOrchestrationArgs,
+) -> ProgramResult {
+    let bump_seed = [args.bump];
+    let seeds = [
+        Seed::from(SPEND_ORCH_SEED),
+        Seed::from(vault_account.key().as_ref()),
+        Seed::from(&args.action_hash),
+        Seed::from(&bump_seed),
+    ];
+    let signers = [Signer::from(&seeds)];
+    let lamports = Rent::get()?.minimum_balance(SpendOrchestrationState::LEN);
+    create_program_owned_account(
+        program_id,
+        payer,
+        orch_account,
+        system_program,
+        &signers,
+        lamports,
+        SpendOrchestrationState::LEN as u64,
+    )
 }
 
 pub fn process_init_authority_proof_data(

@@ -98,7 +98,8 @@ pub fn init_vault(
         &data,
         vec![
             AccountMeta::new(*vault_registry, false),
-            AccountMeta::new_readonly(*wallet_signer, true),
+            AccountMeta::new(*wallet_signer, true),
+            AccountMeta::new_readonly(Pubkey::from([0u8; 32]), false),
         ],
     )
 }
@@ -494,7 +495,8 @@ pub fn init_spend_orchestration(
         vec![
             AccountMeta::new(*orch_account, false),
             AccountMeta::new_readonly(*vault, false),
-            AccountMeta::new_readonly(*wallet_signer, true),
+            AccountMeta::new(*wallet_signer, true),
+            AccountMeta::new_readonly(Pubkey::from([0u8; 32]), false),
         ],
     )
 }
@@ -709,9 +711,10 @@ mod tests {
         let ix = init_vault(&pid(), &key(2), &key(3), [7; 32], [9; 32], 42, 3, [11; 32]);
         assert_eq!(ix.data[0], 1);
         assert_eq!(ix.data.len(), 1 + 105);
-        assert_eq!(ix.accounts.len(), 2);
+        assert_eq!(ix.accounts.len(), 3);
         assert!(ix.accounts[0].is_writable);
         assert!(ix.accounts[1].is_signer);
+        assert_eq!(ix.accounts[2].pubkey, Pubkey::from([0u8; 32]));
     }
 
     #[test]
@@ -783,6 +786,8 @@ mod tests {
         );
         assert_eq!(ix.data[0], 17);
         assert_eq!(ix.data.len(), 1 + 139);
+        assert_eq!(ix.accounts.len(), 4);
+        assert_eq!(ix.accounts[3].pubkey, Pubkey::from([0u8; 32]));
     }
 
     #[test]
