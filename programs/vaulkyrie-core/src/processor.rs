@@ -13,7 +13,8 @@ use pinocchio::{
 };
 use solana_winternitz::signature::WinternitzSignature;
 use vaulkyrie_protocol::{
-    AuthorityRotationStatement, PolicyReceipt, WotsAuthProof, SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
+    AuthorityRotationStatement, PolicyReceipt, WotsAuthProof, QUANTUM_AUTHORITY_SEED,
+    SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
 };
 
 use crate::{
@@ -89,7 +90,18 @@ pub fn process(
 
             let account = get_account_info!(accounts, 0);
             require_writable(account)?;
-            require_program_owner(program_id, account)?;
+            if let Some(system_program) = accounts.get(3) {
+                process_open_quantum_authority(
+                    program_id,
+                    wallet_signer,
+                    account,
+                    vault_account,
+                    system_program,
+                    args,
+                )?;
+            } else {
+                require_program_owner(program_id, account)?;
+            }
             pda::verify_quantum_authority(
                 account.key(),
                 vault_account.key(),
@@ -738,6 +750,33 @@ fn process_open_vault_registry(
         &signers,
         lamports,
         VaultRegistry::LEN as u64,
+    )
+}
+
+fn process_open_quantum_authority(
+    program_id: &pinocchio::pubkey::Pubkey,
+    payer: &AccountInfo,
+    authority_account: &AccountInfo,
+    vault_account: &AccountInfo,
+    system_program: &AccountInfo,
+    args: InitAuthorityArgs,
+) -> ProgramResult {
+    let bump_seed = [args.bump];
+    let seeds = [
+        Seed::from(QUANTUM_AUTHORITY_SEED),
+        Seed::from(vault_account.key().as_ref()),
+        Seed::from(&bump_seed),
+    ];
+    let signers = [Signer::from(&seeds)];
+    let lamports = Rent::get()?.minimum_balance(QuantumAuthorityState::LEN);
+    create_program_owned_account(
+        program_id,
+        payer,
+        authority_account,
+        system_program,
+        &signers,
+        lamports,
+        QuantumAuthorityState::LEN as u64,
     )
 }
 

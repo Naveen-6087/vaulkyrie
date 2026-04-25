@@ -127,7 +127,8 @@ pub fn init_authority(
         vec![
             AccountMeta::new(*authority, false),
             AccountMeta::new_readonly(*vault, false),
-            AccountMeta::new_readonly(*wallet_signer, true),
+            AccountMeta::new(*wallet_signer, true),
+            AccountMeta::new_readonly(Pubkey::from([0u8; 32]), false),
         ],
     )
 }
@@ -722,7 +723,11 @@ mod tests {
         let ix = init_authority(&pid(), &key(2), &key(3), &key(4), [5; 32], [6; 32], 1);
         assert_eq!(ix.data[0], 2);
         assert_eq!(ix.data.len(), 1 + 65);
-        assert_eq!(ix.accounts.len(), 3);
+        assert_eq!(ix.accounts.len(), 4);
+        assert!(ix.accounts[0].is_writable);
+        assert!(ix.accounts[2].is_signer);
+        assert!(ix.accounts[2].is_writable);
+        assert_eq!(ix.accounts[3].pubkey, Pubkey::from([0u8; 32]));
     }
 
     #[test]
