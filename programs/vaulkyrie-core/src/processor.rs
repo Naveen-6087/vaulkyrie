@@ -1,16 +1,19 @@
+#[cfg(not(feature = "bpf-entrypoint"))]
+use core::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "bpf-entrypoint")]
+use pinocchio::sysvars::clock::Clock;
 use pinocchio::{
     account_info::AccountInfo,
     get_account_info,
     instruction::{AccountMeta, Instruction, Seed, Signer},
     program::invoke_signed,
     program_error::ProgramError,
-    sysvars::{clock::Clock, rent::Rent, Sysvar},
+    sysvars::{rent::Rent, Sysvar},
     ProgramResult,
 };
 use solana_winternitz::signature::WinternitzSignature;
 use vaulkyrie_protocol::{
-    AuthorityRotationStatement, PolicyReceipt, WotsAuthProof, SPEND_ORCH_SEED,
-    VAULT_REGISTRY_SEED,
+    AuthorityRotationStatement, PolicyReceipt, WotsAuthProof, SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
 };
 
 use crate::{
@@ -32,6 +35,13 @@ use crate::{
 };
 
 const SYSTEM_PROGRAM_ID: pinocchio::pubkey::Pubkey = [0; 32];
+#[cfg(not(feature = "bpf-entrypoint"))]
+static HOST_TEST_SLOT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(not(feature = "bpf-entrypoint"))]
+pub fn set_host_test_slot(slot: u64) {
+    HOST_TEST_SLOT.store(slot, Ordering::Relaxed);
+}
 
 pub fn process(
     program_id: &pinocchio::pubkey::Pubkey,
@@ -51,7 +61,13 @@ pub fn process(
             let account = get_account_info!(accounts, 0);
             require_writable(account)?;
             if let Some(system_program) = accounts.get(2) {
-                process_open_vault_registry(program_id, wallet_signer, account, system_program, args)?;
+                process_open_vault_registry(
+                    program_id,
+                    wallet_signer,
+                    account,
+                    system_program,
+                    args,
+                )?;
             } else {
                 require_program_owner(program_id, account)?;
             }
@@ -653,7 +669,15 @@ pub fn process_open_quantum_vault(
     let bump_seed = [args.bump];
     let seeds = [Seed::from(&args.hash), Seed::from(&bump_seed)];
     let signers = [Signer::from(&seeds)];
-    create_program_owned_account(program_id, payer, vault, system_program, &signers, lamports, 0)
+    create_program_owned_account(
+        program_id,
+        payer,
+        vault,
+        system_program,
+        &signers,
+        lamports,
+        0,
+    )
 }
 
 fn create_program_owned_account(
@@ -1104,7 +1128,14 @@ pub fn process_rotate_authority_staged_data(
 
     // Decode proof directly from the slice; only WotsAuthProof is on the
     // stack at this point (the header fields above are small).
-    validate_and_rotate_with_proof(vault_dst, authority_dst, proof_dst, &pc, statement, current_slot)
+    validate_and_rotate_with_proof(
+        vault_dst,
+        authority_dst,
+        proof_dst,
+        &pc,
+        statement,
+        current_slot,
+    )
 }
 
 /// Separate function so the large `WotsAuthProof` lives in its own stack
@@ -1190,7 +1221,15 @@ fn require_wallet_authority(vault: &VaultRegistry, signer: &AccountInfo) -> Prog
 }
 
 fn current_slot() -> Result<u64, ProgramError> {
-    Ok(Clock::get()?.slot)
+    #[cfg(feature = "bpf-entrypoint")]
+    {
+        Ok(Clock::get()?.slot)
+    }
+
+    #[cfg(not(feature = "bpf-entrypoint"))]
+    {
+        Ok(HOST_TEST_SLOT.load(Ordering::Relaxed))
+    }
 }
 
 fn map_transition_error(error: transition::TransitionError) -> ProgramError {

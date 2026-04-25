@@ -1,11 +1,22 @@
-use pinocchio::{
-    program_error::ProgramError,
-    pubkey::{create_program_address, Pubkey},
-};
+#[cfg(feature = "bpf-entrypoint")]
+use pinocchio::pubkey::create_program_address;
+use pinocchio::{program_error::ProgramError, pubkey::Pubkey};
 use vaulkyrie_protocol::{
     ACTION_SESSION_SEED, AUTHORITY_PROOF_SEED, POLICY_RECEIPT_SEED, QUANTUM_AUTHORITY_SEED,
     QUANTUM_VAULT_SEED, SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
 };
+
+fn create_pda_address(seeds: &[&[u8]], program_id: &Pubkey) -> Result<Pubkey, ProgramError> {
+    #[cfg(feature = "bpf-entrypoint")]
+    {
+        create_program_address(seeds, program_id)
+    }
+
+    #[cfg(not(feature = "bpf-entrypoint"))]
+    {
+        host_pda::create_program_address(seeds, program_id).ok_or(ProgramError::InvalidSeeds)
+    }
+}
 
 // ── VaultRegistry PDA ──────────────────────────────────────────────────────
 // Seeds: ["vault_registry", wallet_pubkey, bump]
@@ -16,7 +27,7 @@ pub fn derive_vault_registry(
     program_id: &Pubkey,
 ) -> Result<Pubkey, ProgramError> {
     let bump_slice = [bump];
-    create_program_address(
+    create_pda_address(
         &[VAULT_REGISTRY_SEED, wallet_pubkey, &bump_slice],
         program_id,
     )
@@ -45,7 +56,7 @@ pub fn derive_policy_receipt(
     program_id: &Pubkey,
 ) -> Result<Pubkey, ProgramError> {
     let bump_slice = [bump];
-    create_program_address(
+    create_pda_address(
         &[POLICY_RECEIPT_SEED, vault_id, action_hash, &bump_slice],
         program_id,
     )
@@ -75,7 +86,7 @@ pub fn derive_action_session(
     program_id: &Pubkey,
 ) -> Result<Pubkey, ProgramError> {
     let bump_slice = [bump];
-    create_program_address(
+    create_pda_address(
         &[ACTION_SESSION_SEED, vault_id, action_hash, &bump_slice],
         program_id,
     )
@@ -104,7 +115,7 @@ pub fn derive_quantum_authority(
     program_id: &Pubkey,
 ) -> Result<Pubkey, ProgramError> {
     let bump_slice = [bump];
-    create_program_address(&[QUANTUM_AUTHORITY_SEED, vault_id, &bump_slice], program_id)
+    create_pda_address(&[QUANTUM_AUTHORITY_SEED, vault_id, &bump_slice], program_id)
 }
 
 pub fn verify_quantum_authority(
@@ -129,7 +140,7 @@ pub fn derive_authority_proof(
     program_id: &Pubkey,
 ) -> Result<Pubkey, ProgramError> {
     let bump_slice = [bump];
-    create_program_address(
+    create_pda_address(
         &[AUTHORITY_PROOF_SEED, authority_key, &bump_slice],
         program_id,
     )
@@ -157,7 +168,7 @@ pub fn derive_quantum_vault(
     program_id: &Pubkey,
 ) -> Result<Pubkey, ProgramError> {
     let bump_slice = [bump];
-    create_program_address(&[QUANTUM_VAULT_SEED, hash, &bump_slice], program_id)
+    create_pda_address(&[QUANTUM_VAULT_SEED, hash, &bump_slice], program_id)
 }
 
 pub fn verify_quantum_vault(
@@ -183,7 +194,7 @@ pub fn derive_spend_orchestration(
     program_id: &Pubkey,
 ) -> Result<Pubkey, ProgramError> {
     let bump_slice = [bump];
-    create_program_address(
+    create_pda_address(
         &[SPEND_ORCH_SEED, vault_id, action_hash, &bump_slice],
         program_id,
     )
@@ -209,7 +220,7 @@ pub fn verify_spend_orchestration(
 // derivation in pure Rust using `solana-nostd-sha256` and
 // `curve25519-dalek`.
 
-#[cfg(test)]
+#[cfg(not(feature = "bpf-entrypoint"))]
 mod host_pda {
     use solana_nostd_sha256::hashv;
 
@@ -242,6 +253,7 @@ mod host_pda {
     }
 
     /// Pure-Rust equivalent of `solana_program::pubkey::Pubkey::find_program_address`.
+    #[cfg(test)]
     pub fn find_program_address(seeds: &[&[u8]], program_id: &[u8; 32]) -> Option<([u8; 32], u8)> {
         let mut bump = 255u8;
         loop {
