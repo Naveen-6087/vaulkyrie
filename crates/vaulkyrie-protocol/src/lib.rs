@@ -74,6 +74,15 @@ pub const XMSS_TREE_HEIGHT: usize = 8;
 pub const XMSS_NODE_BYTES: usize = 32;
 pub const XMSS_AUTH_PATH_BYTES: usize = XMSS_TREE_HEIGHT * XMSS_NODE_BYTES;
 pub const XMSS_LEAF_COUNT: u32 = 1u32 << XMSS_TREE_HEIGHT;
+pub const WINTER_AUTHORITY_MESSAGE_SCALARS: usize = 22;
+pub const WINTER_AUTHORITY_CHECKSUM_SCALARS: usize = 2;
+pub const WINTER_AUTHORITY_TOTAL_SCALARS: usize =
+    WINTER_AUTHORITY_MESSAGE_SCALARS + WINTER_AUTHORITY_CHECKSUM_SCALARS;
+pub const WINTER_AUTHORITY_SCALAR_BYTES: usize = 32;
+pub const WINTER_AUTHORITY_SIGNATURE_BYTES: usize =
+    WINTER_AUTHORITY_TOTAL_SCALARS * WINTER_AUTHORITY_SCALAR_BYTES;
+pub const WINTER_AUTHORITY_DOMAIN: &[u8] = b"VAULKYRIE_WINTER_AUTHORITY_V1";
+pub const WINTER_AUTHORITY_ADVANCE_DOMAIN: &[u8] = b"VAULKYRIE_WINTER_AUTHORITY_ADVANCE";
 pub const AUTHORITY_PROOF_CHUNK_MAX_BYTES: usize = 256;
 pub const QUANTUM_SPLIT_MESSAGE_BYTES: usize = 72;
 pub const QUANTUM_CLOSE_MESSAGE_BYTES: usize = 32;
@@ -318,6 +327,169 @@ pub struct AuthorityRotationStatement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WinterAuthorityAdvanceStatement {
+    pub action_hash: [u8; 32],
+    pub current_root: [u8; 32],
+    pub next_root: [u8; 32],
+    pub sequence: u64,
+    pub expiry_slot: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WinterAuthoritySignature {
+    pub scalars: [u8; WINTER_AUTHORITY_SIGNATURE_BYTES],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WinterAuthoritySecretKey {
+    pub scalars: [u8; WINTER_AUTHORITY_SIGNATURE_BYTES],
+}
+
+impl WinterAuthorityAdvanceStatement {
+    pub fn payload_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.current_root);
+        hasher.update(self.next_root);
+        hasher.update(self.sequence.to_le_bytes());
+        hasher.update(self.expiry_slot.to_le_bytes());
+
+        hasher.finalize().into()
+    }
+
+    pub fn expected_action_hash(&self, vault_id: [u8; 32], policy_version: u64) -> [u8; 32] {
+        ActionDescriptor {
+            vault_id,
+            payload_hash: self.payload_hash(),
+            policy_version,
+            kind: ActionKind::Rekey,
+        }
+        .hash()
+    }
+
+    pub fn is_action_bound(&self, vault_id: [u8; 32], policy_version: u64) -> bool {
+        self.action_hash == self.expected_action_hash(vault_id, policy_version)
+    }
+
+    pub fn digest(&self) -> [u8; WINTER_AUTHORITY_MESSAGE_SCALARS] {
+        winter_authority_digest(&[
+            WINTER_AUTHORITY_ADVANCE_DOMAIN,
+            self.action_hash.as_ref(),
+            self.current_root.as_ref(),
+            self.next_root.as_ref(),
+            self.sequence.to_le_bytes().as_ref(),
+            self.expiry_slot.to_le_bytes().as_ref(),
+        ])
+    }
+}
+
+impl WinterAuthoritySignature {
+    pub const ENCODED_LEN: usize = WINTER_AUTHORITY_SIGNATURE_BYTES;
+
+    pub fn encode(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != Self::ENCODED_LEN {
+            return false;
+        }
+
+        dst.copy_from_slice(&self.scalars);
+        true
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::ENCODED_LEN {
+            return None;
+        }
+
+        let mut scalars = [0u8; WINTER_AUTHORITY_SIGNATURE_BYTES];
+        scalars.copy_from_slice(src);
+        Some(Self { scalars })
+    }
+
+    pub fn recover_public_key(
+        &self,
+        digest: [u8; WINTER_AUTHORITY_MESSAGE_SCALARS],
+    ) -> [u8; WINTER_AUTHORITY_SIGNATURE_BYTES] {
+        let checksum = winter_authority_checksum(digest);
+        let mut public_key = [0u8; WINTER_AUTHORITY_SIGNATURE_BYTES];
+
+        for (index, digit) in digest.iter().copied().enumerate() {
+            let sig_scalar = winter_authority_get_scalar(&self.scalars, index);
+            let public_scalar = winter_authority_hash_chain(sig_scalar, 255u8.wrapping_sub(digit));
+            winter_authority_set_scalar(&mut public_key, index, public_scalar);
+        }
+
+        for (offset, digit) in checksum.iter().copied().enumerate() {
+            let scalar_index = WINTER_AUTHORITY_MESSAGE_SCALARS + offset;
+            let sig_scalar = winter_authority_get_scalar(&self.scalars, scalar_index);
+            let public_scalar = winter_authority_hash_chain(sig_scalar, 255u8.wrapping_sub(digit));
+            winter_authority_set_scalar(&mut public_key, scalar_index, public_scalar);
+        }
+
+        public_key
+    }
+
+    pub fn verify_digest(
+        &self,
+        digest: [u8; WINTER_AUTHORITY_MESSAGE_SCALARS],
+        expected_root: [u8; 32],
+    ) -> bool {
+        let public_key = self.recover_public_key(digest);
+        winter_authority_root(&public_key) == expected_root
+    }
+
+    pub fn verify_statement(&self, statement: &WinterAuthorityAdvanceStatement) -> bool {
+        self.verify_digest(statement.digest(), statement.current_root)
+    }
+}
+
+impl WinterAuthoritySecretKey {
+    pub fn public_key(&self) -> [u8; WINTER_AUTHORITY_SIGNATURE_BYTES] {
+        let mut public_key = [0u8; WINTER_AUTHORITY_SIGNATURE_BYTES];
+
+        for index in 0..WINTER_AUTHORITY_TOTAL_SCALARS {
+            let secret_scalar = winter_authority_get_scalar(&self.scalars, index);
+            let public_scalar = winter_authority_hash_chain(secret_scalar, u8::MAX);
+            winter_authority_set_scalar(&mut public_key, index, public_scalar);
+        }
+
+        public_key
+    }
+
+    pub fn root(&self) -> [u8; 32] {
+        winter_authority_root(&self.public_key())
+    }
+
+    pub fn sign_digest(
+        &self,
+        digest: [u8; WINTER_AUTHORITY_MESSAGE_SCALARS],
+    ) -> WinterAuthoritySignature {
+        let checksum = winter_authority_checksum(digest);
+        let mut scalars = [0u8; WINTER_AUTHORITY_SIGNATURE_BYTES];
+
+        for (index, digit) in digest.iter().copied().enumerate() {
+            let secret_scalar = winter_authority_get_scalar(&self.scalars, index);
+            let signature_scalar = winter_authority_hash_chain(secret_scalar, digit);
+            winter_authority_set_scalar(&mut scalars, index, signature_scalar);
+        }
+
+        for (offset, digit) in checksum.iter().copied().enumerate() {
+            let scalar_index = WINTER_AUTHORITY_MESSAGE_SCALARS + offset;
+            let secret_scalar = winter_authority_get_scalar(&self.scalars, scalar_index);
+            let signature_scalar = winter_authority_hash_chain(secret_scalar, digit);
+            winter_authority_set_scalar(&mut scalars, scalar_index, signature_scalar);
+        }
+
+        WinterAuthoritySignature { scalars }
+    }
+
+    pub fn sign_statement(
+        &self,
+        statement: &WinterAuthorityAdvanceStatement,
+    ) -> WinterAuthoritySignature {
+        self.sign_digest(statement.digest())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WotsAuthProof {
     pub public_key: [u8; WOTS_KEY_BYTES],
     pub signature: [u8; WOTS_KEY_BYTES],
@@ -519,6 +691,104 @@ impl AuthorityRotationStatement {
     }
 }
 
+pub fn winter_authority_digest(message_parts: &[&[u8]]) -> [u8; WINTER_AUTHORITY_MESSAGE_SCALARS] {
+    let mut hasher = Sha256::new();
+    hasher.update(WINTER_AUTHORITY_DOMAIN);
+    for part in message_parts {
+        hasher.update(part);
+    }
+
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut out = [0u8; WINTER_AUTHORITY_MESSAGE_SCALARS];
+    out.copy_from_slice(&digest[..WINTER_AUTHORITY_MESSAGE_SCALARS]);
+    out
+}
+
+pub fn winter_authority_root(public_key: &[u8; WINTER_AUTHORITY_SIGNATURE_BYTES]) -> [u8; 32] {
+    let mut level = [[0u8; 32]; WINTER_AUTHORITY_TOTAL_SCALARS];
+    for index in 0..WINTER_AUTHORITY_TOTAL_SCALARS {
+        level[index] = winter_authority_leaf_hash(winter_authority_get_scalar(public_key, index));
+    }
+
+    let mut len = WINTER_AUTHORITY_TOTAL_SCALARS;
+    while len > 1 {
+        let mut next_len = 0;
+        let mut index = 0;
+        while index < len {
+            let left = level[index];
+            let right = if index + 1 < len {
+                level[index + 1]
+            } else {
+                left
+            };
+            level[next_len] = winter_authority_node_hash(left, right);
+            next_len += 1;
+            index += 2;
+        }
+        len = next_len;
+    }
+
+    level[0]
+}
+
+fn winter_authority_checksum(digest: [u8; WINTER_AUTHORITY_MESSAGE_SCALARS]) -> [u8; 2] {
+    let mut checksum = 0u16;
+    for digit in digest {
+        checksum += 255u16 - digit as u16;
+    }
+
+    [(checksum >> 8) as u8, checksum as u8]
+}
+
+fn winter_authority_hash_chain(
+    mut scalar: [u8; WINTER_AUTHORITY_SCALAR_BYTES],
+    steps: u8,
+) -> [u8; WINTER_AUTHORITY_SCALAR_BYTES] {
+    for _ in 0..steps {
+        let mut hasher = Sha256::new();
+        hasher.update(scalar);
+        scalar = hasher.finalize().into();
+    }
+
+    scalar
+}
+
+fn winter_authority_leaf_hash(scalar: [u8; WINTER_AUTHORITY_SCALAR_BYTES]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update([0u8]);
+    hasher.update(scalar);
+    hasher.finalize().into()
+}
+
+fn winter_authority_node_hash(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update([1u8]);
+    hasher.update(left);
+    hasher.update(right);
+    hasher.finalize().into()
+}
+
+fn winter_authority_get_scalar(
+    data: &[u8; WINTER_AUTHORITY_SIGNATURE_BYTES],
+    scalar_index: usize,
+) -> [u8; WINTER_AUTHORITY_SCALAR_BYTES] {
+    let start = scalar_index * WINTER_AUTHORITY_SCALAR_BYTES;
+    let end = start + WINTER_AUTHORITY_SCALAR_BYTES;
+    let mut scalar = [0; WINTER_AUTHORITY_SCALAR_BYTES];
+    scalar.copy_from_slice(&data[start..end]);
+    scalar
+}
+
+fn winter_authority_set_scalar(
+    dst: &mut [u8; WINTER_AUTHORITY_SIGNATURE_BYTES],
+    scalar_index: usize,
+    value: [u8; WINTER_AUTHORITY_SCALAR_BYTES],
+) {
+    let start = scalar_index * WINTER_AUTHORITY_SCALAR_BYTES;
+    let end = start + WINTER_AUTHORITY_SCALAR_BYTES;
+    dst[start..end].copy_from_slice(&value);
+}
+
 fn wots_message_digits(digest: [u8; 32]) -> [u8; WOTS_CHAIN_COUNT] {
     let mut digits = [0; WOTS_CHAIN_COUNT];
     for (index, value) in digest[..8].iter().enumerate() {
@@ -609,8 +879,10 @@ mod tests {
     use super::{
         quantum_close_digest, quantum_close_message, quantum_split_digest, quantum_split_message,
         ActionDescriptor, ActionKind, AuthorityRotationStatement, PolicyDecisionEnvelope,
-        PolicyEvaluationRequest, PolicyReceipt, ThresholdRequirement, WotsAuthProof, WotsSecretKey,
-        WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES,
+        PolicyEvaluationRequest, PolicyReceipt, ThresholdRequirement,
+        WinterAuthorityAdvanceStatement, WinterAuthoritySecretKey, WinterAuthoritySignature,
+        WotsAuthProof, WotsSecretKey, WINTER_AUTHORITY_SIGNATURE_BYTES, WOTS_KEY_BYTES,
+        XMSS_AUTH_PATH_BYTES,
     };
 
     fn descriptor(kind: ActionKind) -> ActionDescriptor {
@@ -803,6 +1075,73 @@ mod tests {
     }
 
     #[test]
+    fn winter_authority_statement_is_action_bound() {
+        let current = sample_winter_secret(3).root();
+        let next = sample_winter_secret(4).root();
+        let mut statement = WinterAuthorityAdvanceStatement {
+            action_hash: [0; 32],
+            current_root: current,
+            next_root: next,
+            sequence: 9,
+            expiry_slot: 1_400,
+        };
+        statement.action_hash = statement.expected_action_hash([7; 32], 42);
+
+        assert!(statement.is_action_bound([7; 32], 42));
+        assert!(!statement.is_action_bound([8; 32], 42));
+    }
+
+    #[test]
+    fn winter_authority_signature_verifies_against_current_root() {
+        let current = sample_winter_secret(11);
+        let next = sample_winter_secret(12);
+        let mut statement = WinterAuthorityAdvanceStatement {
+            action_hash: [0; 32],
+            current_root: current.root(),
+            next_root: next.root(),
+            sequence: 1,
+            expiry_slot: 900,
+        };
+        statement.action_hash = statement.expected_action_hash([7; 32], 42);
+
+        let signature = current.sign_statement(&statement);
+
+        assert!(signature.verify_statement(&statement));
+    }
+
+    #[test]
+    fn winter_authority_signature_rejects_wrong_next_root() {
+        let current = sample_winter_secret(21);
+        let next = sample_winter_secret(22);
+        let mut statement = WinterAuthorityAdvanceStatement {
+            action_hash: [0; 32],
+            current_root: current.root(),
+            next_root: next.root(),
+            sequence: 1,
+            expiry_slot: 900,
+        };
+        statement.action_hash = statement.expected_action_hash([7; 32], 42);
+
+        let signature = current.sign_statement(&statement);
+        let mut tampered = statement.clone();
+        tampered.next_root = sample_winter_secret(23).root();
+        tampered.action_hash = tampered.expected_action_hash([7; 32], 42);
+
+        assert!(!signature.verify_statement(&tampered));
+    }
+
+    #[test]
+    fn winter_authority_signature_roundtrips_through_bytes() {
+        let signature = WinterAuthoritySignature {
+            scalars: [7; WINTER_AUTHORITY_SIGNATURE_BYTES],
+        };
+        let mut bytes = [0u8; WinterAuthoritySignature::ENCODED_LEN];
+
+        assert!(signature.encode(&mut bytes));
+        assert_eq!(WinterAuthoritySignature::decode(&bytes), Some(signature));
+    }
+
+    #[test]
     fn threshold_encoding_is_fixed() {
         assert_eq!(ThresholdRequirement::OneOfThree.as_byte(), 1);
         assert_eq!(ThresholdRequirement::TwoOfThree.as_byte(), 2);
@@ -833,6 +1172,14 @@ mod tests {
             *byte = seed.wrapping_add(index as u8);
         }
         WotsSecretKey { elements }
+    }
+
+    fn sample_winter_secret(seed: u8) -> WinterAuthoritySecretKey {
+        let mut scalars = [0u8; WINTER_AUTHORITY_SIGNATURE_BYTES];
+        for (index, byte) in scalars.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(index as u8);
+        }
+        WinterAuthoritySecretKey { scalars }
     }
 
     #[test]
