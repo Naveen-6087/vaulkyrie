@@ -346,6 +346,15 @@ pub struct WinterAuthoritySecretKey {
 }
 
 impl WinterAuthorityAdvanceStatement {
+    fn update_hasher(&self, hasher: &mut Sha256) {
+        hasher.update(WINTER_AUTHORITY_ADVANCE_DOMAIN);
+        hasher.update(self.action_hash);
+        hasher.update(self.current_root);
+        hasher.update(self.next_root);
+        hasher.update(self.sequence.to_le_bytes());
+        hasher.update(self.expiry_slot.to_le_bytes());
+    }
+
     pub fn payload_hash(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(self.current_root);
@@ -371,14 +380,21 @@ impl WinterAuthorityAdvanceStatement {
     }
 
     pub fn digest(&self) -> [u8; WINTER_AUTHORITY_MESSAGE_SCALARS] {
-        winter_authority_digest(&[
-            WINTER_AUTHORITY_ADVANCE_DOMAIN,
-            self.action_hash.as_ref(),
-            self.current_root.as_ref(),
-            self.next_root.as_ref(),
-            self.sequence.to_le_bytes().as_ref(),
-            self.expiry_slot.to_le_bytes().as_ref(),
-        ])
+        let mut hasher = Sha256::new();
+        hasher.update(WINTER_AUTHORITY_DOMAIN);
+        self.update_hasher(&mut hasher);
+
+        let digest: [u8; 32] = hasher.finalize().into();
+        let mut out = [0u8; WINTER_AUTHORITY_MESSAGE_SCALARS];
+        out.copy_from_slice(&digest[..WINTER_AUTHORITY_MESSAGE_SCALARS]);
+        out
+    }
+
+    pub fn replay_digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(WINTER_AUTHORITY_DOMAIN);
+        self.update_hasher(&mut hasher);
+        hasher.finalize().into()
     }
 }
 

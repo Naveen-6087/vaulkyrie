@@ -1,4 +1,4 @@
-//! Instruction builders for all 26 `vaulkyrie-core` instructions.
+//! Instruction builders for all 27 `vaulkyrie-core` instructions.
 //!
 //! Each function returns a `solana_instruction::Instruction` with the correct
 //! wire-format data and `AccountMeta` list matching the on-chain processor
@@ -7,7 +7,8 @@
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 use vaulkyrie_protocol::{
-    AuthorityRotationStatement, PolicyReceipt, WotsAuthProof, AUTHORITY_PROOF_CHUNK_MAX_BYTES,
+    AuthorityRotationStatement, PolicyReceipt, WinterAuthorityAdvanceStatement,
+    WinterAuthoritySignature, WotsAuthProof, AUTHORITY_PROOF_CHUNK_MAX_BYTES,
 };
 
 // ─── Discriminators ──────────────────────────────────────────────────────────
@@ -37,6 +38,7 @@ const DISC_INIT_RECOVERY: u8 = 22;
 const DISC_COMPLETE_RECOVERY: u8 = 23;
 const DISC_MIGRATE_AUTHORITY: u8 = 24;
 const DISC_ADVANCE_POLICY_VERSION: u8 = 25;
+const DISC_ADVANCE_WINTER_AUTHORITY: u8 = 26;
 
 // ─── Receipt helpers ─────────────────────────────────────────────────────────
 
@@ -62,6 +64,16 @@ fn serialize_authority_rotation_statement(stmt: &AuthorityRotationStatement) -> 
     let mut v = Vec::with_capacity(80);
     v.extend_from_slice(&stmt.action_hash);
     v.extend_from_slice(&stmt.next_authority_hash);
+    v.extend_from_slice(&stmt.sequence.to_le_bytes());
+    v.extend_from_slice(&stmt.expiry_slot.to_le_bytes());
+    v
+}
+
+fn serialize_winter_authority_advance_statement(stmt: &WinterAuthorityAdvanceStatement) -> Vec<u8> {
+    let mut v = Vec::with_capacity(112);
+    v.extend_from_slice(&stmt.action_hash);
+    v.extend_from_slice(&stmt.current_root);
+    v.extend_from_slice(&stmt.next_root);
     v.extend_from_slice(&stmt.sequence.to_le_bytes());
     v.extend_from_slice(&stmt.expiry_slot.to_le_bytes());
     v
@@ -405,6 +417,32 @@ pub fn rotate_authority_staged(
             AccountMeta::new(*vault, false),
             AccountMeta::new(*authority, false),
             AccountMeta::new(*proof_account, false),
+            AccountMeta::new_readonly(*wallet_signer, true),
+        ],
+    )
+}
+
+// ─── 26: AdvanceWinterAuthority ──────────────────────────────────────────────
+
+pub fn advance_winter_authority(
+    program_id: &Pubkey,
+    vault: &Pubkey,
+    authority: &Pubkey,
+    wallet_signer: &Pubkey,
+    statement: &WinterAuthorityAdvanceStatement,
+    signature: &WinterAuthoritySignature,
+) -> Instruction {
+    let mut data = Vec::with_capacity(1 + 112 + WinterAuthoritySignature::ENCODED_LEN);
+    data.push(DISC_ADVANCE_WINTER_AUTHORITY);
+    data.extend_from_slice(&serialize_winter_authority_advance_statement(statement));
+    data.extend_from_slice(&signature.scalars);
+
+    Instruction::new_with_bytes(
+        *program_id,
+        &data,
+        vec![
+            AccountMeta::new(*vault, false),
+            AccountMeta::new(*authority, false),
             AccountMeta::new_readonly(*wallet_signer, true),
         ],
     )
@@ -857,5 +895,31 @@ mod tests {
         let ix = advance_policy_version(&pid(), &key(2), 42);
         assert_eq!(ix.data[0], 25);
         assert_eq!(ix.data.len(), 1 + 8);
+    }
+
+    #[test]
+    fn advance_winter_authority_serializes_correctly() {
+        let statement = WinterAuthorityAdvanceStatement {
+            action_hash: [1; 32],
+            current_root: [2; 32],
+            next_root: [3; 32],
+            sequence: 4,
+            expiry_slot: 5,
+        };
+        let signature = WinterAuthoritySignature {
+            scalars: [6; WinterAuthoritySignature::ENCODED_LEN],
+        };
+        let ix =
+            advance_winter_authority(&pid(), &key(2), &key(3), &key(4), &statement, &signature);
+
+        assert_eq!(ix.data[0], 26);
+        assert_eq!(
+            ix.data.len(),
+            1 + 112 + WinterAuthoritySignature::ENCODED_LEN
+        );
+        assert_eq!(ix.accounts.len(), 3);
+        assert!(ix.accounts[0].is_writable);
+        assert!(ix.accounts[1].is_writable);
+        assert!(ix.accounts[2].is_signer);
     }
 }

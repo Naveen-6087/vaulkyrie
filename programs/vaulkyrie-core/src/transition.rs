@@ -2,7 +2,8 @@ use solana_nostd_sha256::hashv;
 use solana_winternitz::signature::WinternitzSignature;
 use vaulkyrie_protocol::{
     quantum_close_message, quantum_split_message, AuthorityRotationStatement, PolicyReceipt,
-    ThresholdRequirement, WotsAuthProof, XMSS_LEAF_COUNT,
+    ThresholdRequirement, WinterAuthorityAdvanceStatement, WinterAuthoritySignature, WotsAuthProof,
+    XMSS_LEAF_COUNT,
 };
 
 use crate::state::{
@@ -453,6 +454,74 @@ pub fn rotate_vault_authority(
     Ok(())
 }
 
+pub fn advance_winter_authority(
+    vault: &mut VaultRegistry,
+    authority: &mut QuantumAuthorityState,
+    statement: &WinterAuthorityAdvanceStatement,
+    signature: &WinterAuthoritySignature,
+    current_slot: u64,
+) -> Result<(), TransitionError> {
+    validate_vault_recovery_mode(vault)?;
+    if !statement.is_action_bound(vault.wallet_pubkey, vault.policy_version) {
+        return Err(TransitionError::AuthorityActionMismatch);
+    }
+    validate_vault_authority_alignment(vault, authority)?;
+    verify_winter_authority_advance(authority, statement, signature)?;
+    apply_winter_authority_advance(authority, statement, current_slot)?;
+    vault.current_authority_hash = authority.current_authority_hash;
+
+    Ok(())
+}
+
+pub fn verify_winter_authority_advance(
+    authority: &QuantumAuthorityState,
+    statement: &WinterAuthorityAdvanceStatement,
+    signature: &WinterAuthoritySignature,
+) -> Result<(), TransitionError> {
+    if statement.current_root != authority.current_authority_root {
+        return Err(TransitionError::AuthorityMerkleRootMismatch);
+    }
+    if authority.current_authority_hash != statement.current_root {
+        return Err(TransitionError::AuthorityProofMismatch);
+    }
+    if !signature.verify_statement(statement) {
+        return Err(TransitionError::AuthorityProofInvalid);
+    }
+
+    Ok(())
+}
+
+pub fn apply_winter_authority_advance(
+    authority: &mut QuantumAuthorityState,
+    statement: &WinterAuthorityAdvanceStatement,
+    current_slot: u64,
+) -> Result<(), TransitionError> {
+    if statement.current_root == statement.next_root {
+        return Err(TransitionError::AuthorityNoOp);
+    }
+
+    if statement.expiry_slot < current_slot {
+        return Err(TransitionError::AuthorityStatementExpired);
+    }
+
+    if authority.next_sequence != statement.sequence {
+        return Err(TransitionError::AuthoritySequenceMismatch);
+    }
+
+    let digest = statement.replay_digest();
+    if authority.last_consumed_digest != [0u8; 32] && authority.last_consumed_digest == digest {
+        return Err(TransitionError::AuthorityStatementReplay);
+    }
+
+    authority.last_consumed_digest = digest;
+    authority.current_authority_hash = statement.next_root;
+    authority.current_authority_root = statement.next_root;
+    authority.next_sequence += 1;
+    authority.next_leaf_index = 0;
+
+    Ok(())
+}
+
 pub fn validate_authority_action_binding(
     vault: &VaultRegistry,
     statement: &AuthorityRotationStatement,
@@ -743,12 +812,14 @@ mod tests {
     use solana_winternitz::privkey::WinternitzPrivkey;
     use vaulkyrie_protocol::{
         ActionDescriptor, ActionKind, AuthorityRotationStatement, ThresholdRequirement,
-        WotsSecretKey, WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES, XMSS_LEAF_COUNT,
+        WinterAuthorityAdvanceStatement, WinterAuthoritySecretKey, WotsSecretKey,
+        WINTER_AUTHORITY_SIGNATURE_BYTES, WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES, XMSS_LEAF_COUNT,
     };
 
     use super::{
-        advance_policy_version, apply_authority_rotation, complete_recovery,
-        consume_action_session, consume_policy_receipt, finalize_action_session, init_recovery,
+        advance_policy_version, advance_winter_authority, apply_authority_rotation,
+        apply_winter_authority_advance, complete_recovery, consume_action_session,
+        consume_policy_receipt, finalize_action_session, init_recovery,
         initialize_quantum_authority, initialize_vault, mark_action_session_ready,
         migrate_authority_tree, open_action_session, open_action_session_from_receipt,
         parse_vault_status, rotate_vault_authority, stage_policy_receipt, update_vault_status,
@@ -756,7 +827,8 @@ mod tests {
         validate_bridged_receipt_claim, validate_eval_account_owner, validate_quantum_vault_close,
         validate_quantum_vault_split, validate_quantum_vault_split_amount, validate_vault_active,
         validate_vault_authority_alignment, validate_vault_for_receipt, validate_vault_for_session,
-        validate_vault_recovery_mode, verify_authority_proof, TransitionError,
+        validate_vault_recovery_mode, verify_authority_proof, verify_winter_authority_advance,
+        TransitionError,
     };
     use crate::state::{
         QuantumAuthorityState, RecoveryState, RecoveryStatus, SessionStatus, VaultRegistry,
@@ -796,6 +868,14 @@ mod tests {
             *byte = seed.wrapping_add(index as u8);
         }
         WotsSecretKey { elements }
+    }
+
+    fn sample_winter_secret(seed: u8) -> WinterAuthoritySecretKey {
+        let mut scalars = [0u8; WINTER_AUTHORITY_SIGNATURE_BYTES];
+        for (index, byte) in scalars.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(index as u8);
+        }
+        WinterAuthoritySecretKey { scalars }
     }
 
     fn sample_auth_path(seed: u8) -> [u8; XMSS_AUTH_PATH_BYTES] {
@@ -1470,6 +1550,79 @@ mod tests {
         assert_eq!(state.next_sequence, 1);
         assert_eq!(state.next_leaf_index, 1);
         assert_eq!(state.last_consumed_digest, statement.digest());
+    }
+
+    #[test]
+    fn winter_authority_advance_rolls_root_and_sequence() {
+        let current = sample_winter_secret(41);
+        let next = sample_winter_secret(42);
+        let mut vault = initialize_vault([1; 32], current.root(), 9, 4, [0; 32]);
+        vault.status = VaultStatus::Recovery as u8;
+        let mut authority = QuantumAuthorityState::new(current.root(), current.root(), 1);
+        let mut statement = WinterAuthorityAdvanceStatement {
+            action_hash: [0; 32],
+            current_root: current.root(),
+            next_root: next.root(),
+            sequence: 0,
+            expiry_slot: 100,
+        };
+        statement.action_hash = statement.expected_action_hash(vault.wallet_pubkey, 9);
+        let signature = current.sign_statement(&statement);
+
+        verify_winter_authority_advance(&authority, &statement, &signature)
+            .expect("winter signature should verify");
+        advance_winter_authority(&mut vault, &mut authority, &statement, &signature, 10)
+            .expect("winter authority should advance");
+
+        assert_eq!(vault.current_authority_hash, next.root());
+        assert_eq!(authority.current_authority_hash, next.root());
+        assert_eq!(authority.current_authority_root, next.root());
+        assert_eq!(authority.next_sequence, 1);
+        assert_eq!(authority.next_leaf_index, 0);
+        assert_eq!(authority.last_consumed_digest, statement.replay_digest());
+    }
+
+    #[test]
+    fn winter_authority_advance_rejects_wrong_signature_root() {
+        let current = sample_winter_secret(51);
+        let next = sample_winter_secret(52);
+        let wrong = sample_winter_secret(53);
+        let authority = QuantumAuthorityState::new(current.root(), current.root(), 1);
+        let mut statement = WinterAuthorityAdvanceStatement {
+            action_hash: [0; 32],
+            current_root: current.root(),
+            next_root: next.root(),
+            sequence: 0,
+            expiry_slot: 100,
+        };
+        statement.action_hash = statement.expected_action_hash([1; 32], 9);
+        let signature = wrong.sign_statement(&statement);
+
+        let error = verify_winter_authority_advance(&authority, &statement, &signature)
+            .expect_err("signature from a different root should fail");
+
+        assert_eq!(error, TransitionError::AuthorityProofInvalid);
+    }
+
+    #[test]
+    fn winter_authority_advance_rejects_replayed_statement() {
+        let current = sample_winter_secret(61);
+        let next = sample_winter_secret(62);
+        let mut authority = QuantumAuthorityState::new(current.root(), current.root(), 1);
+        let mut statement = WinterAuthorityAdvanceStatement {
+            action_hash: [0; 32],
+            current_root: current.root(),
+            next_root: next.root(),
+            sequence: 0,
+            expiry_slot: 100,
+        };
+        statement.action_hash = statement.expected_action_hash([1; 32], 9);
+        authority.last_consumed_digest = statement.replay_digest();
+
+        let error = apply_winter_authority_advance(&mut authority, &statement, 10)
+            .expect_err("replayed winter statement should fail");
+
+        assert_eq!(error, TransitionError::AuthorityStatementReplay);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use pinocchio::program_error::ProgramError;
 use solana_winternitz::signature::WinternitzSignature;
 use vaulkyrie_protocol::{
-    AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement, WotsAuthProof,
+    AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement,
+    WinterAuthorityAdvanceStatement, WinterAuthoritySignature, WotsAuthProof,
     AUTHORITY_PROOF_CHUNK_MAX_BYTES,
 };
 
@@ -116,6 +117,12 @@ pub struct RotateAuthorityArgs {
     pub proof: WotsAuthProof,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvanceWinterAuthorityArgs {
+    pub statement: WinterAuthorityAdvanceStatement,
+    pub signature: WinterAuthoritySignature,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitAuthorityProofArgs {
     pub statement_digest: [u8; 32],
@@ -172,6 +179,8 @@ pub enum CoreInstruction {
     MigrateAuthority(MigrateAuthorityArgs),
     /// Advance the vault's policy version by exactly 1 (monotonic).
     AdvancePolicyVersion(AdvancePolicyVersionArgs),
+    /// WinterWallet-style root-rolling PQC authority advance.
+    AdvanceWinterAuthority(AdvanceWinterAuthorityArgs),
 }
 
 impl TryFrom<&[u8]> for CoreInstruction {
@@ -219,6 +228,9 @@ impl TryFrom<&[u8]> for CoreInstruction {
             [25, rest @ ..] => Ok(Self::AdvancePolicyVersion(parse_advance_policy_version(
                 rest,
             )?)),
+            [26, rest @ ..] => Ok(Self::AdvanceWinterAuthority(
+                parse_advance_winter_authority(rest)?,
+            )),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -358,6 +370,37 @@ fn parse_authority_rotation_statement(
     })
 }
 
+fn parse_winter_authority_advance_statement(
+    data: &[u8],
+) -> Result<WinterAuthorityAdvanceStatement, ProgramError> {
+    if data.len() != 112 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut action_hash = [0; 32];
+    action_hash.copy_from_slice(&data[..32]);
+
+    let mut current_root = [0; 32];
+    current_root.copy_from_slice(&data[32..64]);
+
+    let mut next_root = [0; 32];
+    next_root.copy_from_slice(&data[64..96]);
+
+    let mut sequence = [0; 8];
+    sequence.copy_from_slice(&data[96..104]);
+
+    let mut expiry_slot = [0; 8];
+    expiry_slot.copy_from_slice(&data[104..112]);
+
+    Ok(WinterAuthorityAdvanceStatement {
+        action_hash,
+        current_root,
+        next_root,
+        sequence: u64::from_le_bytes(sequence),
+        expiry_slot: u64::from_le_bytes(expiry_slot),
+    })
+}
+
 fn parse_rotate_authority_args(data: &[u8]) -> Result<RotateAuthorityArgs, ProgramError> {
     if data.len() != 80 + WotsAuthProof::ENCODED_LEN {
         return Err(ProgramError::InvalidInstructionData);
@@ -367,6 +410,21 @@ fn parse_rotate_authority_args(data: &[u8]) -> Result<RotateAuthorityArgs, Progr
     let proof = WotsAuthProof::decode(&data[80..]).ok_or(ProgramError::InvalidInstructionData)?;
 
     Ok(RotateAuthorityArgs { statement, proof })
+}
+
+fn parse_advance_winter_authority(data: &[u8]) -> Result<AdvanceWinterAuthorityArgs, ProgramError> {
+    if data.len() != 112 + WinterAuthoritySignature::ENCODED_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let statement = parse_winter_authority_advance_statement(&data[..112])?;
+    let signature = WinterAuthoritySignature::decode(&data[112..])
+        .ok_or(ProgramError::InvalidInstructionData)?;
+
+    Ok(AdvanceWinterAuthorityArgs {
+        statement,
+        signature,
+    })
 }
 
 fn parse_init_authority_proof(data: &[u8]) -> Result<InitAuthorityProofArgs, ProgramError> {
@@ -604,17 +662,19 @@ fn parse_advance_policy_version(data: &[u8]) -> Result<AdvancePolicyVersionArgs,
 #[cfg(test)]
 mod tests {
     use super::{
-        AdvancePolicyVersionArgs, CloseQuantumVaultArgs, CommitSpendOrchestrationArgs,
-        CompleteRecoveryArgs, CompleteSpendOrchestrationArgs, CoreInstruction,
-        FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs,
+        AdvancePolicyVersionArgs, AdvanceWinterAuthorityArgs, CloseQuantumVaultArgs,
+        CommitSpendOrchestrationArgs, CompleteRecoveryArgs, CompleteSpendOrchestrationArgs,
+        CoreInstruction, FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs,
         InitQuantumVaultArgs, InitRecoveryArgs, InitSpendOrchestrationArgs, InitVaultArgs,
         MigrateAuthorityArgs, RotateAuthorityArgs, SplitQuantumVaultArgs,
         WriteAuthorityProofChunkArgs, WINTERNITZ_SIGNATURE_BYTES,
     };
     use pinocchio::program_error::ProgramError;
     use vaulkyrie_protocol::{
-        AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement, WotsAuthProof,
-        AUTHORITY_PROOF_CHUNK_MAX_BYTES, WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES,
+        AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement,
+        WinterAuthorityAdvanceStatement, WinterAuthoritySignature, WotsAuthProof,
+        AUTHORITY_PROOF_CHUNK_MAX_BYTES, WINTER_AUTHORITY_SIGNATURE_BYTES, WOTS_KEY_BYTES,
+        XMSS_AUTH_PATH_BYTES,
     };
 
     #[test]
@@ -852,6 +912,35 @@ mod tests {
                     next_authority_hash: [6; 32],
                     sequence: 13,
                     expiry_slot: 14,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_advance_winter_authority_instruction() {
+        let mut data = vec![26];
+        data.extend_from_slice(&[5; 32]);
+        data.extend_from_slice(&[6; 32]);
+        data.extend_from_slice(&[7; 32]);
+        data.extend_from_slice(&13u64.to_le_bytes());
+        data.extend_from_slice(&14u64.to_le_bytes());
+        data.extend_from_slice(&[8; WINTER_AUTHORITY_SIGNATURE_BYTES]);
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::AdvanceWinterAuthority(
+                AdvanceWinterAuthorityArgs {
+                    statement: WinterAuthorityAdvanceStatement {
+                        action_hash: [5; 32],
+                        current_root: [6; 32],
+                        next_root: [7; 32],
+                        sequence: 13,
+                        expiry_slot: 14,
+                    },
+                    signature: WinterAuthoritySignature {
+                        scalars: [8; WINTER_AUTHORITY_SIGNATURE_BYTES],
+                    },
                 }
             ))
         );

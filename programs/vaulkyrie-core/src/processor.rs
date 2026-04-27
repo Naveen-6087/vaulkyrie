@@ -352,6 +352,33 @@ pub fn process(
                 current_slot,
             )
         }
+        CoreInstruction::AdvanceWinterAuthority(args) => {
+            let current_slot = current_slot()?;
+            let vault_account = get_account_info!(accounts, 0);
+            require_program_owner(program_id, vault_account)?;
+            {
+                let vault_data = vault_account.try_borrow_data()?;
+                let vault = decode_vault_state(&vault_data)?;
+                transition::validate_vault_recovery_mode(&vault).map_err(map_transition_error)?;
+                let wallet_signer = get_account_info!(accounts, 2);
+                require_wallet_authority(&vault, wallet_signer)?;
+            }
+            require_writable(vault_account)?;
+            let mut vault_data = vault_account.try_borrow_mut_data()?;
+
+            let authority_account = get_account_info!(accounts, 1);
+            require_writable(authority_account)?;
+            require_program_owner(program_id, authority_account)?;
+            let mut authority_data = authority_account.try_borrow_mut_data()?;
+
+            process_advance_winter_authority_data(
+                &mut vault_data,
+                &mut authority_data,
+                &args.statement,
+                &args.signature,
+                current_slot,
+            )
+        }
         CoreInstruction::SplitQuantumVault(args) => {
             let vault_account = get_account_info!(accounts, 0);
             require_writable(vault_account)?;
@@ -1202,6 +1229,41 @@ fn validate_and_rotate_with_proof(
     Ok(())
 }
 
+pub fn process_advance_winter_authority_data(
+    vault_dst: &mut [u8],
+    authority_dst: &mut [u8],
+    statement: &vaulkyrie_protocol::WinterAuthorityAdvanceStatement,
+    signature: &vaulkyrie_protocol::WinterAuthoritySignature,
+    current_slot: u64,
+) -> ProgramResult {
+    if vault_dst.len() != VaultRegistry::LEN || authority_dst.len() != QuantumAuthorityState::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let mut vault = VaultRegistry::decode(vault_dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&vault.discriminator, &VAULT_REGISTRY_DISCRIMINATOR)?;
+    transition::validate_vault_recovery_mode(&vault).map_err(map_transition_error)?;
+
+    let mut authority =
+        QuantumAuthorityState::decode(authority_dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&authority.discriminator, &QUANTUM_STATE_DISCRIMINATOR)?;
+
+    transition::advance_winter_authority(
+        &mut vault,
+        &mut authority,
+        statement,
+        signature,
+        current_slot,
+    )
+    .map_err(map_transition_error)?;
+
+    if !vault.encode(vault_dst) || !authority.encode(authority_dst) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Ok(())
+}
+
 fn require_writable(account: &AccountInfo) -> ProgramResult {
     if account.is_writable() {
         Ok(())
@@ -1567,18 +1629,19 @@ mod tests {
     use solana_winternitz::privkey::WinternitzPrivkey;
     use vaulkyrie_protocol::{
         quantum_close_message, quantum_split_message, ActionDescriptor, ActionKind, PolicyReceipt,
-        ThresholdRequirement, WotsAuthProof, WotsSecretKey, AUTHORITY_PROOF_CHUNK_MAX_BYTES,
-        WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES, XMSS_LEAF_COUNT,
+        ThresholdRequirement, WinterAuthorityAdvanceStatement, WinterAuthoritySecretKey,
+        WotsAuthProof, WotsSecretKey, AUTHORITY_PROOF_CHUNK_MAX_BYTES,
+        WINTER_AUTHORITY_SIGNATURE_BYTES, WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES, XMSS_LEAF_COUNT,
     };
 
     use super::{
         ensure_wallet_authority, process_activate_session_data,
-        process_advance_policy_version_data, process_close_quantum_vault,
-        process_commit_spend_orchestration_data, process_complete_recovery_data,
-        process_complete_spend_orchestration_data, process_consume_receipt_data,
-        process_consume_session_data, process_fail_spend_orchestration_data,
-        process_finalize_session_data, process_init_authority_data,
-        process_init_authority_proof_data, process_init_recovery_data,
+        process_advance_policy_version_data, process_advance_winter_authority_data,
+        process_close_quantum_vault, process_commit_spend_orchestration_data,
+        process_complete_recovery_data, process_complete_spend_orchestration_data,
+        process_consume_receipt_data, process_consume_session_data,
+        process_fail_spend_orchestration_data, process_finalize_session_data,
+        process_init_authority_data, process_init_authority_proof_data, process_init_recovery_data,
         process_init_spend_orchestration_data, process_init_vault_data,
         process_migrate_authority_data, process_open_session_data, process_rotate_authority_data,
         process_rotate_authority_staged_data, process_set_vault_status_data,
@@ -1645,6 +1708,14 @@ mod tests {
             *byte = seed.wrapping_add(index as u8);
         }
         WotsSecretKey { elements }
+    }
+
+    fn sample_winter_secret(seed: u8) -> WinterAuthoritySecretKey {
+        let mut scalars = [0u8; WINTER_AUTHORITY_SIGNATURE_BYTES];
+        for (index, byte) in scalars.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(index as u8);
+        }
+        WinterAuthoritySecretKey { scalars }
     }
 
     fn sample_auth_path(seed: u8) -> [u8; XMSS_AUTH_PATH_BYTES] {
@@ -2089,6 +2160,51 @@ mod tests {
         assert_eq!(state.current_authority_hash, [8; 32]);
         assert_eq!(state.next_sequence, 1);
         assert_eq!(state.next_leaf_index, 1);
+    }
+
+    #[test]
+    fn advance_winter_authority_updates_current_root() {
+        let mut vault_bytes = [0; VaultRegistry::LEN];
+        let mut authority_bytes = [0; QuantumAuthorityState::LEN];
+        let current = sample_winter_secret(51);
+        let next = sample_winter_secret(52);
+        let vault = VaultRegistry::new(
+            [5; 32],
+            current.root(),
+            3,
+            crate::state::VaultStatus::Recovery,
+            8,
+            [0; 32],
+        );
+        let mut statement = WinterAuthorityAdvanceStatement {
+            action_hash: [0; 32],
+            current_root: current.root(),
+            next_root: next.root(),
+            sequence: 0,
+            expiry_slot: 200,
+        };
+        statement.action_hash = statement.expected_action_hash(vault.wallet_pubkey, 3);
+        let signature = current.sign_statement(&statement);
+        let initial = QuantumAuthorityState::new(current.root(), current.root(), 1);
+        assert!(vault.encode(&mut vault_bytes));
+        assert!(initial.encode(&mut authority_bytes));
+
+        process_advance_winter_authority_data(
+            &mut vault_bytes,
+            &mut authority_bytes,
+            &statement,
+            &signature,
+            10,
+        )
+        .expect("winter authority advance should succeed");
+
+        let vault = VaultRegistry::decode(&vault_bytes).expect("vault should decode");
+        let state = QuantumAuthorityState::decode(&authority_bytes).expect("state should decode");
+        assert_eq!(vault.current_authority_hash, next.root());
+        assert_eq!(state.current_authority_hash, next.root());
+        assert_eq!(state.current_authority_root, next.root());
+        assert_eq!(state.next_sequence, 1);
+        assert_eq!(state.next_leaf_index, 0);
     }
 
     #[test]
