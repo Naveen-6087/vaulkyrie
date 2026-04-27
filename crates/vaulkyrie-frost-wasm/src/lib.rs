@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 
 use ed25519_dalek::{Signature as DalekSignature, Verifier, VerifyingKey as DalekVerifyingKey};
-use frost_ed25519 as frost;
 use frost::{
     keys::{
         dkg::{self, round1 as dkg_round1, round2 as dkg_round2},
@@ -15,6 +14,7 @@ use frost::{
     },
     round1, round2, Identifier, SigningPackage,
 };
+use frost_ed25519 as frost;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use serde::{Deserialize, Serialize};
@@ -115,9 +115,8 @@ fn entropy_rng() -> ChaCha20Rng {
 #[wasm_bindgen]
 pub fn dkg_round1(participant_id: u16, max_signers: u16, min_signers: u16) -> String {
     let mut rng = entropy_rng();
-    let (secret, package) =
-        dkg::part1(id(participant_id), max_signers, min_signers, &mut rng)
-            .expect("DKG round 1 failed");
+    let (secret, package) = dkg::part1(id(participant_id), max_signers, min_signers, &mut rng)
+        .expect("DKG round 1 failed");
 
     let result = DkgRound1Result {
         participant_id,
@@ -140,9 +139,8 @@ pub fn dkg_round1_deterministic(
     seed_arr[..copy_len].copy_from_slice(&seed[..copy_len]);
     let mut rng = ChaCha20Rng::from_seed(seed_arr);
 
-    let (secret, package) =
-        dkg::part1(id(participant_id), max_signers, min_signers, &mut rng)
-            .expect("DKG round 1 failed");
+    let (secret, package) = dkg::part1(id(participant_id), max_signers, min_signers, &mut rng)
+        .expect("DKG round 1 failed");
 
     let result = DkgRound1Result {
         participant_id,
@@ -166,11 +164,13 @@ pub fn dkg_round2(
     secret_package_json: &str,
     round1_packages_json: &str,
 ) -> String {
-    let secret: dkg_round1::SecretPackage =
-        postcard_de(serde_json::from_str::<Vec<u8>>(secret_package_json).unwrap().as_slice());
+    let secret: dkg_round1::SecretPackage = postcard_de(
+        serde_json::from_str::<Vec<u8>>(secret_package_json)
+            .unwrap()
+            .as_slice(),
+    );
 
-    let round1_map: BTreeMap<u16, Vec<u8>> =
-        serde_json::from_str(round1_packages_json).unwrap();
+    let round1_map: BTreeMap<u16, Vec<u8>> = serde_json::from_str(round1_packages_json).unwrap();
 
     let mut round1_packages = BTreeMap::new();
     for (pid, bytes) in &round1_map {
@@ -178,8 +178,7 @@ pub fn dkg_round2(
         round1_packages.insert(id(*pid), pkg);
     }
 
-    let (secret2, packages) =
-        dkg::part2(secret, &round1_packages).expect("DKG round 2 failed");
+    let (secret2, packages) = dkg::part2(secret, &round1_packages).expect("DKG round 2 failed");
 
     let mut pkg_map = BTreeMap::new();
     for (pid, pkg) in &packages {
@@ -214,19 +213,20 @@ pub fn dkg_round3(
     round1_packages_json: &str,
     round2_packages_json: &str,
 ) -> String {
-    let secret2: dkg_round2::SecretPackage =
-        postcard_de(serde_json::from_str::<Vec<u8>>(secret_package_json).unwrap().as_slice());
+    let secret2: dkg_round2::SecretPackage = postcard_de(
+        serde_json::from_str::<Vec<u8>>(secret_package_json)
+            .unwrap()
+            .as_slice(),
+    );
 
-    let round1_map: BTreeMap<u16, Vec<u8>> =
-        serde_json::from_str(round1_packages_json).unwrap();
+    let round1_map: BTreeMap<u16, Vec<u8>> = serde_json::from_str(round1_packages_json).unwrap();
     let mut round1_packages = BTreeMap::new();
     for (pid, bytes) in &round1_map {
         let pkg: dkg_round1::Package = postcard_de(bytes);
         round1_packages.insert(id(*pid), pkg);
     }
 
-    let round2_map: BTreeMap<u16, Vec<u8>> =
-        serde_json::from_str(round2_packages_json).unwrap();
+    let round2_map: BTreeMap<u16, Vec<u8>> = serde_json::from_str(round2_packages_json).unwrap();
     let mut round2_packages = BTreeMap::new();
     for (pid, bytes) in &round2_map {
         let pkg: dkg_round2::Package = postcard_de(bytes);
@@ -234,8 +234,7 @@ pub fn dkg_round3(
     }
 
     let (key_package, pubkey_package) =
-        dkg::part3(&secret2, &round1_packages, &round2_packages)
-            .expect("DKG round 3 failed");
+        dkg::part3(&secret2, &round1_packages, &round2_packages).expect("DKG round 3 failed");
 
     let group_key_bytes = pubkey_package
         .verifying_key()
@@ -261,8 +260,11 @@ pub fn dkg_round3(
 /// Returns JSON-serialized `SigningRound1Result`.
 #[wasm_bindgen]
 pub fn signing_round1(participant_id: u16, key_package_json: &str) -> String {
-    let key_package: KeyPackage =
-        postcard_de(serde_json::from_str::<Vec<u8>>(key_package_json).unwrap().as_slice());
+    let key_package: KeyPackage = postcard_de(
+        serde_json::from_str::<Vec<u8>>(key_package_json)
+            .unwrap()
+            .as_slice(),
+    );
 
     let mut rng = entropy_rng();
     let (nonces, commitments) = frost::round1::commit(key_package.signing_share(), &mut rng);
@@ -293,13 +295,18 @@ pub fn signing_round2(
     message: &[u8],
     commitments_json: &str,
 ) -> String {
-    let nonces: round1::SigningNonces =
-        postcard_de(serde_json::from_str::<Vec<u8>>(nonces_json).unwrap().as_slice());
-    let key_package: KeyPackage =
-        postcard_de(serde_json::from_str::<Vec<u8>>(key_package_json).unwrap().as_slice());
+    let nonces: round1::SigningNonces = postcard_de(
+        serde_json::from_str::<Vec<u8>>(nonces_json)
+            .unwrap()
+            .as_slice(),
+    );
+    let key_package: KeyPackage = postcard_de(
+        serde_json::from_str::<Vec<u8>>(key_package_json)
+            .unwrap()
+            .as_slice(),
+    );
 
-    let commitments_map: BTreeMap<u16, Vec<u8>> =
-        serde_json::from_str(commitments_json).unwrap();
+    let commitments_map: BTreeMap<u16, Vec<u8>> = serde_json::from_str(commitments_json).unwrap();
     let mut signing_commitments = BTreeMap::new();
     for (pid, bytes) in &commitments_map {
         let c: round1::SigningCommitments = postcard_de(bytes);
@@ -335,24 +342,25 @@ pub fn aggregate_signature(
     signature_shares_json: &str,
     public_key_package_json: &str,
 ) -> String {
-    let commitments_map: BTreeMap<u16, Vec<u8>> =
-        serde_json::from_str(commitments_json).unwrap();
+    let commitments_map: BTreeMap<u16, Vec<u8>> = serde_json::from_str(commitments_json).unwrap();
     let mut signing_commitments = BTreeMap::new();
     for (pid, bytes) in &commitments_map {
         let c: round1::SigningCommitments = postcard_de(bytes);
         signing_commitments.insert(id(*pid), c);
     }
 
-    let shares_map: BTreeMap<u16, Vec<u8>> =
-        serde_json::from_str(signature_shares_json).unwrap();
+    let shares_map: BTreeMap<u16, Vec<u8>> = serde_json::from_str(signature_shares_json).unwrap();
     let mut signature_shares = BTreeMap::new();
     for (pid, bytes) in &shares_map {
         let s: round2::SignatureShare = postcard_de(bytes);
         signature_shares.insert(id(*pid), s);
     }
 
-    let pubkey_package: PublicKeyPackage =
-        postcard_de(serde_json::from_str::<Vec<u8>>(public_key_package_json).unwrap().as_slice());
+    let pubkey_package: PublicKeyPackage = postcard_de(
+        serde_json::from_str::<Vec<u8>>(public_key_package_json)
+            .unwrap()
+            .as_slice(),
+    );
 
     let signing_package = SigningPackage::new(signing_commitments, message);
 
@@ -407,8 +415,7 @@ pub fn run_full_dkg(min_signers: u16, max_signers: u16) -> String {
 
     for i in 1..=max_signers {
         let (secret, package) =
-            dkg::part1(id(i), max_signers, min_signers, &mut rng)
-                .expect("DKG round 1 failed");
+            dkg::part1(id(i), max_signers, min_signers, &mut rng).expect("DKG round 1 failed");
         r1_secrets.insert(id(i), secret);
         r1_packages.insert(id(i), package);
     }
@@ -427,14 +434,10 @@ pub fn run_full_dkg(min_signers: u16, max_signers: u16) -> String {
             .map(|(k, v)| (*k, v.clone()))
             .collect();
 
-        let (secret2, packages) =
-            dkg::part2(my_secret, &others).expect("DKG round 2 failed");
+        let (secret2, packages) = dkg::part2(my_secret, &others).expect("DKG round 2 failed");
         r2_secrets.insert(pid, secret2);
         for (recipient, pkg) in packages {
-            r2_packages
-                .entry(recipient)
-                .or_default()
-                .insert(pid, pkg);
+            r2_packages.entry(recipient).or_default().insert(pid, pkg);
         }
     }
 
@@ -453,15 +456,17 @@ pub fn run_full_dkg(min_signers: u16, max_signers: u16) -> String {
         let my_r2_packages = r2_packages.remove(&pid).unwrap();
 
         let (kp, pkp) =
-            dkg::part3(&my_secret2, &others_r1, &my_r2_packages)
-                .expect("DKG round 3 failed");
+            dkg::part3(&my_secret2, &others_r1, &my_r2_packages).expect("DKG round 3 failed");
         key_packages.insert(pid, kp);
         pubkey_package = Some(pkp);
     }
 
     let pkp = pubkey_package.unwrap();
-    let group_key = pkp.verifying_key().serialize()
-        .expect("verifying key serialization").to_vec();
+    let group_key = pkp
+        .verifying_key()
+        .serialize()
+        .expect("verifying key serialization")
+        .to_vec();
 
     // Serialize all key packages for each participant
     let mut participants = BTreeMap::new();
@@ -490,7 +495,8 @@ mod tests {
     fn full_dkg_produces_valid_group_key() {
         let result_json = run_full_dkg(2, 3);
         let result: serde_json::Value = serde_json::from_str(&result_json).unwrap();
-        let group_key: Vec<u8> = serde_json::from_value(result["group_public_key"].clone()).unwrap();
+        let group_key: Vec<u8> =
+            serde_json::from_value(result["group_public_key"].clone()).unwrap();
         assert_eq!(group_key.len(), 32, "group public key should be 32 bytes");
     }
 
@@ -623,7 +629,8 @@ mod tests {
     fn verify_rejects_wrong_message() {
         let result_json = run_full_dkg(2, 3);
         let result: serde_json::Value = serde_json::from_str(&result_json).unwrap();
-        let group_key: Vec<u8> = serde_json::from_value(result["group_public_key"].clone()).unwrap();
+        let group_key: Vec<u8> =
+            serde_json::from_value(result["group_public_key"].clone()).unwrap();
 
         // A random 64-byte "signature" should not verify
         let fake_sig = [0u8; 64];

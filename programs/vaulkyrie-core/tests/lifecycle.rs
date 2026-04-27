@@ -21,9 +21,9 @@ use vaulkyrie_core::{
         process_finalize_session_data, process_init_authority_data,
         process_init_authority_proof_data, process_init_recovery_data,
         process_init_spend_orchestration_data, process_init_vault_data,
-        process_migrate_authority_data, process_open_session_data,
-        process_set_vault_status_data, process_stage_bridged_receipt_data,
-        process_stage_receipt_data, process_write_authority_proof_chunk_data,
+        process_migrate_authority_data, process_open_session_data, process_set_vault_status_data,
+        process_stage_bridged_receipt_data, process_stage_receipt_data,
+        process_write_authority_proof_chunk_data,
     },
     state::{
         ActionSessionState, AuthorityProofState, PolicyReceiptState, QuantumAuthorityState,
@@ -132,19 +132,27 @@ fn vault_init_rejects_already_initialized() {
 fn vault_policy_version_must_advance_monotonically() {
     let mut vault_buf = init_vault_buf();
     let err = process_advance_policy_version_data(&mut vault_buf, 1).unwrap_err();
-    assert!(is_program_error_custom(err, error::POLICY_VERSION_NOT_MONOTONIC));
+    assert!(is_program_error_custom(
+        err,
+        error::POLICY_VERSION_NOT_MONOTONIC
+    ));
 
     let err = process_advance_policy_version_data(&mut vault_buf, 3).unwrap_err();
-    assert!(is_program_error_custom(err, error::POLICY_VERSION_NOT_MONOTONIC));
+    assert!(is_program_error_custom(
+        err,
+        error::POLICY_VERSION_NOT_MONOTONIC
+    ));
 }
 
 #[test]
 fn vault_status_invalid_transition_rejected() {
     let mut vault_buf = init_vault_buf();
     process_set_vault_status_data(&mut vault_buf, VaultStatus::Locked as u8).unwrap();
-    let err =
-        process_set_vault_status_data(&mut vault_buf, VaultStatus::Active as u8).unwrap_err();
-    assert!(is_program_error_custom(err, error::VAULT_STATUS_BAD_TRANSITION));
+    let err = process_set_vault_status_data(&mut vault_buf, VaultStatus::Active as u8).unwrap_err();
+    assert!(is_program_error_custom(
+        err,
+        error::VAULT_STATUS_BAD_TRANSITION
+    ));
 }
 
 // ── 2. Receipt + Session lifecycle ─────────────────────────────────────────
@@ -204,8 +212,7 @@ fn receipt_consume_rejects_replay() {
 
     process_consume_receipt_data(&mut vault_buf, &mut receipt_buf, &receipt).unwrap();
 
-    let err =
-        process_consume_receipt_data(&mut vault_buf, &mut receipt_buf, &receipt).unwrap_err();
+    let err = process_consume_receipt_data(&mut vault_buf, &mut receipt_buf, &receipt).unwrap_err();
     assert!(is_program_error_custom(err, error::RECEIPT_NONCE_REPLAY));
 }
 
@@ -361,10 +368,12 @@ fn spend_orchestration_rejects_wrong_action_hash() {
         action_hash: [0xFF; 32],
         signing_package_hash: [0x55; 32],
     };
-    let err =
-        process_commit_spend_orchestration_data(&mut orch_buf, commit_args, CURRENT_SLOT)
-            .unwrap_err();
-    assert!(is_program_error_custom(err, error::ORCHESTRATION_ACTION_MISMATCH));
+    let err = process_commit_spend_orchestration_data(&mut orch_buf, commit_args, CURRENT_SLOT)
+        .unwrap_err();
+    assert!(is_program_error_custom(
+        err,
+        error::ORCHESTRATION_ACTION_MISMATCH
+    ));
 }
 
 #[test]
@@ -386,8 +395,7 @@ fn spend_orchestration_rejects_expired() {
         action_hash: ACTION_HASH,
         signing_package_hash: [0x55; 32],
     };
-    let err =
-        process_commit_spend_orchestration_data(&mut orch_buf, commit_args, 300).unwrap_err();
+    let err = process_commit_spend_orchestration_data(&mut orch_buf, commit_args, 300).unwrap_err();
     assert!(is_program_error_custom(err, error::ORCHESTRATION_EXPIRED));
 }
 
@@ -415,9 +423,8 @@ fn spend_orchestration_complete_rejects_zero_tx_binding() {
         action_hash: ACTION_HASH,
         tx_binding: [0; 32],
     };
-    let err =
-        process_complete_spend_orchestration_data(&mut orch_buf, complete_args, CURRENT_SLOT)
-            .unwrap_err();
+    let err = process_complete_spend_orchestration_data(&mut orch_buf, complete_args, CURRENT_SLOT)
+        .unwrap_err();
     assert_eq!(
         err,
         pinocchio::program_error::ProgramError::InvalidInstructionData
@@ -620,7 +627,10 @@ fn authority_migrate_rejects_no_op() {
     process_init_authority_data(&mut authority_buf, args).unwrap();
 
     let err = process_migrate_authority_data(&mut authority_buf, [0xEE; 32]).unwrap_err();
-    assert!(is_program_error_custom(err, error::AUTHORITY_MIGRATION_NO_OP));
+    assert!(is_program_error_custom(
+        err,
+        error::AUTHORITY_MIGRATION_NO_OP
+    ));
 }
 
 // ── 6. Authority proof lifecycle ───────────────────────────────────────────
@@ -684,7 +694,10 @@ fn authority_proof_rejects_offset_mismatch() {
         chunk: [0u8; AUTHORITY_PROOF_CHUNK_MAX_BYTES],
     };
     let err = process_write_authority_proof_chunk_data(&mut proof_buf, write_args).unwrap_err();
-    assert!(is_program_error_custom(err, error::PROOF_CHUNK_OFFSET_MISMATCH));
+    assert!(is_program_error_custom(
+        err,
+        error::PROOF_CHUNK_OFFSET_MISMATCH
+    ));
 }
 
 // ── 7. Bridged receipt lifecycle ───────────────────────────────────────────
