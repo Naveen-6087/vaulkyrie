@@ -1,7 +1,7 @@
-#![cfg_attr(feature = "bpf-entrypoint", no_std)]
+#![cfg_attr(any(feature = "bpf-entrypoint", target_os = "solana"), no_std)]
 
 use pinocchio::{account_info::AccountInfo, pubkey::Pubkey, ProgramResult};
-#[cfg(feature = "bpf-entrypoint")]
+#[cfg(any(feature = "bpf-entrypoint", target_os = "solana"))]
 use pinocchio::{default_allocator, default_panic_handler, program_entrypoint};
 
 pub mod error;
@@ -11,11 +11,11 @@ pub mod processor;
 pub mod state;
 pub mod transition;
 
-#[cfg(feature = "bpf-entrypoint")]
+#[cfg(any(feature = "bpf-entrypoint", target_os = "solana"))]
 program_entrypoint!(process_instruction);
-#[cfg(feature = "bpf-entrypoint")]
+#[cfg(any(feature = "bpf-entrypoint", target_os = "solana"))]
 default_allocator!();
-#[cfg(feature = "bpf-entrypoint")]
+#[cfg(any(feature = "bpf-entrypoint", target_os = "solana"))]
 default_panic_handler!();
 
 pub fn process_instruction(

@@ -1,4 +1,4 @@
-#[cfg(feature = "bpf-entrypoint")]
+#[cfg(any(feature = "bpf-entrypoint", target_os = "solana"))]
 use pinocchio::pubkey::create_program_address;
 use pinocchio::{program_error::ProgramError, pubkey::Pubkey};
 use vaulkyrie_protocol::{
@@ -7,12 +7,12 @@ use vaulkyrie_protocol::{
 };
 
 fn create_pda_address(seeds: &[&[u8]], program_id: &Pubkey) -> Result<Pubkey, ProgramError> {
-    #[cfg(feature = "bpf-entrypoint")]
+    #[cfg(any(feature = "bpf-entrypoint", target_os = "solana"))]
     {
         create_program_address(seeds, program_id)
     }
 
-    #[cfg(not(feature = "bpf-entrypoint"))]
+    #[cfg(all(not(feature = "bpf-entrypoint"), not(target_os = "solana")))]
     {
         host_pda::create_program_address(seeds, program_id).ok_or(ProgramError::InvalidSeeds)
     }
@@ -220,7 +220,7 @@ pub fn verify_spend_orchestration(
 // derivation in pure Rust using `solana-nostd-sha256` and
 // `curve25519-dalek`.
 
-#[cfg(not(feature = "bpf-entrypoint"))]
+#[cfg(all(not(feature = "bpf-entrypoint"), not(target_os = "solana")))]
 mod host_pda {
     use solana_nostd_sha256::hashv;
 
