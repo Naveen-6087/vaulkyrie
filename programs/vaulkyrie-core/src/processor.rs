@@ -1,6 +1,6 @@
-#[cfg(not(feature = "bpf-entrypoint"))]
+#[cfg(all(not(feature = "bpf-entrypoint"), not(target_os = "solana")))]
 use core::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "bpf-entrypoint")]
+#[cfg(any(feature = "bpf-entrypoint", target_os = "solana"))]
 use pinocchio::sysvars::clock::Clock;
 use pinocchio::{
     account_info::AccountInfo,
@@ -36,10 +36,10 @@ use crate::{
 };
 
 const SYSTEM_PROGRAM_ID: pinocchio::pubkey::Pubkey = [0; 32];
-#[cfg(not(feature = "bpf-entrypoint"))]
+#[cfg(all(not(feature = "bpf-entrypoint"), not(target_os = "solana")))]
 static HOST_TEST_SLOT: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(not(feature = "bpf-entrypoint"))]
+#[cfg(all(not(feature = "bpf-entrypoint"), not(target_os = "solana")))]
 pub fn set_host_test_slot(slot: u64) {
     HOST_TEST_SLOT.store(slot, Ordering::Relaxed);
 }
@@ -1322,12 +1322,12 @@ fn require_wallet_authority(vault: &VaultRegistry, signer: &AccountInfo) -> Prog
 }
 
 fn current_slot() -> Result<u64, ProgramError> {
-    #[cfg(feature = "bpf-entrypoint")]
+    #[cfg(any(feature = "bpf-entrypoint", target_os = "solana"))]
     {
         Ok(Clock::get()?.slot)
     }
 
-    #[cfg(not(feature = "bpf-entrypoint"))]
+    #[cfg(all(not(feature = "bpf-entrypoint"), not(target_os = "solana")))]
     {
         Ok(HOST_TEST_SLOT.load(Ordering::Relaxed))
     }
