@@ -4,18 +4,19 @@
 //! for Vaulkyrie's private policy evaluation plane. Arcis circuits run inside
 //! Arcium's confidential Multi-party Execution Environment (MXE): inputs are
 //! encrypted before they leave the client, the computation runs over encrypted
-//! data, and only the commitment to the output is exposed on-chain.
+//! data, and only compact decision material is exposed on-chain.
 //!
 //! ## Flow
 //!
 //! ```text
 //! Client                     Arcium MXE            vaulkyrie-policy-mxe   vaulkyrie-core
 //! ──────                     ──────────            ────────────────────   ──────────────
-//! encrypt(policy_inputs)
+//! pack(private_policy_signals)
+//! encrypt(signal_lanes)
 //!   → encrypted_commitment ─────────────────────► init_policy_evaluation
 //!                                                  queue_policy_evaluate
 //!                            run(policy_evaluate)
-//!                              → receipt_commitment ► policy_evaluate_callback
+//!                              → decision summary ► policy_evaluate_callback
 //!                                                                        stage_bridged_receipt
 //! ```
 //!
@@ -37,6 +38,13 @@
 //!
 //! The compiled artifacts (`.arcis`, `.idarc`, `.weight`) are consumed by
 //! `vaulkyrie-policy-mxe` when calling `init_comp_def` and `queue_computation`.
+//!
+//! ## Arcium packing model
+//!
+//! Arcium recommends packing many small values into fewer field elements. The
+//! Vaulkyrie policy engine mirrors that approach by packing all private policy
+//! buckets into two `u128` lanes before encryption. The wallet SDK mirrors the
+//! same packing logic in `vaulkyrie_protocol::PolicySignals::pack_lanes()`.
 
 // ── Policy evaluation circuit ──────────────────────────────────────────────
 
@@ -44,39 +52,50 @@
 // They are shown here as documentation of the intended circuit interface.
 // Standard Rust compilation will not recognise these attributes.
 
-/// Arcis circuit: evaluate Vaulkyrie spend policy over encrypted inputs.
+/// Arcis circuit: evaluate Vaulkyrie spend/admin policy over packed encrypted
+/// signal lanes.
 ///
 /// # Inputs (encrypted)
 ///
-/// The circuit receives a 75-byte encrypted input packed as:
+/// The circuit receives two packed `u128` lanes. The host-side wallet SDK packs
+/// the following fields into those lanes before encrypting them for the MXE:
 ///
-/// | Offset | Size | Field             |
-/// |--------|------|-------------------|
-/// | 0      | 32   | `vault_id`        |
-/// | 32     | 32   | `action_hash`     |
-/// | 64     | 1    | `threshold`       |
-/// | 65     | 8    | `policy_version`  |
-/// | 73     | 1    | `nonce` (u8 slot) |
-/// | 74     | 1    | `reserved`        |
+/// - policy template
+/// - scope (spend/admin/recovery)
+/// - amount bucket
+/// - balance bucket
+/// - limit headroom bucket
+/// - velocity bucket
+/// - recipient class
+/// - protocol risk
+/// - device trust
+/// - history bucket
+/// - guardian posture
+/// - private policy flags
 ///
-/// These fields match the `PolicyEvaluationState` stored by
-/// `vaulkyrie-policy-mxe::init_policy_evaluation`.
+/// The public request state (`action_hash`, `policy_version`, `request_nonce`,
+/// `expiry_slot`) remains in `PolicyEvaluationState`; the private signal lanes
+/// are bound into that request via `encrypted_input_commitment`.
 ///
 /// # Output
 ///
-/// A 32-byte `receipt_commitment` = SHA-256(vault_id || action_hash ||
-/// threshold || policy_version || nonce || decision_flags). This commitment
-/// is written to the MXE output slot and delivered to the on-chain callback
-/// `policy_evaluate_callback` in `vaulkyrie-policy-mxe`.
+/// The MXE returns:
+///
+/// - `receipt_commitment`
+/// - `decision_commitment`
+/// - `delay_until_slot`
+/// - `reason_code`
+/// - `decision_flags`
+/// - `approved`
 ///
 /// # Security properties
 ///
 /// - Policy inputs never leave the client in plaintext.
-/// - The MXE output is a deterministic commitment; replaying the circuit
-///   with different inputs produces a different commitment.
-/// - `vaulkyrie-policy-mxe` only observes the commitment, not the
-///   underlying policy parameters.
-/// - The commitment is cross-validated by `vaulkyrie-core` via
+/// - The MXE output is a deterministic decision summary; replaying the circuit
+///   with different buckets or flags changes the commitments and flags.
+/// - `vaulkyrie-policy-mxe` only observes compact commitments and decision
+///   flags, not the underlying policy parameters.
+/// - The receipt commitment is cross-validated by `vaulkyrie-core` via
 ///   `StageBridgedReceipt` before any vault state transition occurs.
 ///
 /// # Arcis pseudo-code
@@ -87,81 +106,75 @@
 ///     use arcis::prelude::*;
 ///
 ///     #[instruction]
-///     pub fn policy_evaluate(encrypted_input: [u8; 75]) -> [u8; 32] {
-///         let vault_id: [u8; 32] = encrypted_input[0..32];
-///         let action_hash: [u8; 32] = encrypted_input[32..64];
-///         let threshold: u8 = encrypted_input[64];
-///         let policy_version: u64 = u64::from_le_bytes(encrypted_input[65..73]);
-///         let nonce: u8 = encrypted_input[73];
+///     pub fn policy_evaluate(
+///         lane_0: Enc<Shared, u128>,
+///         lane_1: Enc<Shared, u128>,
+///     ) -> (
+///         Enc<Shared, [u8; 32]>,
+///         Enc<Shared, [u8; 32]>,
+///         u64,
+///         u16,
+///         u16,
+///         u8,
+///     ) {
+///         let lane_0 = lane_0.to_arcis();
+///         let lane_1 = lane_1.to_arcis();
+///         let signals = unpack_policy_signals(lane_0, lane_1);
 ///
-///         // Evaluate risk policy: check threshold config, spending limits,
-///         // velocity constraints, and multi-sig requirements.
-///         let decision_flags: u8 = evaluate_policy(
-///             vault_id, action_hash, threshold, policy_version,
-///         );
+///         // Evaluate template-driven risk policy over encrypted buckets.
+///         let decision = evaluate_policy(signals);
 ///
-///         // Commit to the full decision.
-///         sha256(vault_id || action_hash || threshold
-///                || policy_version || nonce || decision_flags)
+///         (
+///             receipt_commitment(decision),
+///             decision_commitment(decision),
+///             decision.delay_until_slot,
+///             decision.reason_code,
+///             decision.decision_flags,
+///             decision.approved,
+///         )
 ///     }
 /// }
 /// ```
 pub mod circuits {
-    /// Size of the encrypted input payload in bytes.
-    pub const POLICY_INPUT_SIZE: usize = 75;
+    pub const POLICY_SIGNAL_LANES: usize = 2;
 
     /// Representation of the `policy_evaluate` circuit output.
-    ///
-    /// When Arcis compilation is available, replace this with the actual
-    /// `#[instruction]` return type.
+    /// When Arcis compilation is available, replace this with the generated
+    /// output type.
     pub struct PolicyEvaluateOutput {
-        /// SHA-256 commitment over the full policy decision fields.
         pub receipt_commitment: [u8; 32],
+        pub decision_commitment: [u8; 32],
+        pub delay_until_slot: u64,
+        pub reason_code: u16,
+        pub decision_flags: u16,
+        pub approved: u8,
     }
 
-    /// Packed representation of policy evaluation input fields.
-    ///
-    /// This mirrors the encrypted input layout that the Arcis circuit
-    /// decrypts inside the MXE. Clients encrypt this struct before
-    /// submitting to `init_policy_evaluation`.
+    /// Packed representation of the private signal lanes that the wallet will
+    /// encrypt before submitting to `queue_policy_evaluate`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct PolicyEvaluateInput {
-        pub vault_id: [u8; 32],
-        pub action_hash: [u8; 32],
-        pub threshold: u8,
-        pub policy_version: u64,
-        pub nonce: u8,
-        pub reserved: u8,
+        pub signal_lane_0: u128,
+        pub signal_lane_1: u128,
     }
 
     impl PolicyEvaluateInput {
-        /// Encode into a 75-byte buffer for encryption.
-        pub fn encode(&self) -> [u8; POLICY_INPUT_SIZE] {
-            let mut buf = [0u8; POLICY_INPUT_SIZE];
-            buf[0..32].copy_from_slice(&self.vault_id);
-            buf[32..64].copy_from_slice(&self.action_hash);
-            buf[64] = self.threshold;
-            buf[65..73].copy_from_slice(&self.policy_version.to_le_bytes());
-            buf[73] = self.nonce;
-            buf[74] = self.reserved;
+        pub fn encode(&self) -> [u8; 32] {
+            let mut buf = [0u8; 32];
+            buf[0..16].copy_from_slice(&self.signal_lane_0.to_le_bytes());
+            buf[16..32].copy_from_slice(&self.signal_lane_1.to_le_bytes());
             buf
         }
 
-        /// Decode from a 75-byte buffer.
-        pub fn decode(src: &[u8; POLICY_INPUT_SIZE]) -> Self {
-            let mut vault_id = [0u8; 32];
-            vault_id.copy_from_slice(&src[0..32]);
-            let mut action_hash = [0u8; 32];
-            action_hash.copy_from_slice(&src[32..64]);
-            let mut pv = [0u8; 8];
-            pv.copy_from_slice(&src[65..73]);
+        pub fn decode(src: &[u8; 32]) -> Self {
+            let mut lane_0 = [0u8; 16];
+            lane_0.copy_from_slice(&src[0..16]);
+            let mut lane_1 = [0u8; 16];
+            lane_1.copy_from_slice(&src[16..32]);
+
             Self {
-                vault_id,
-                action_hash,
-                threshold: src[64],
-                policy_version: u64::from_le_bytes(pv),
-                nonce: src[73],
-                reserved: src[74],
+                signal_lane_0: u128::from_le_bytes(lane_0),
+                signal_lane_1: u128::from_le_bytes(lane_1),
             }
         }
     }
@@ -169,27 +182,22 @@ pub mod circuits {
 
 #[cfg(test)]
 mod tests {
-    use super::circuits::{PolicyEvaluateInput, POLICY_INPUT_SIZE};
+    use super::circuits::{PolicyEvaluateInput, POLICY_SIGNAL_LANES};
 
     #[test]
     fn policy_input_roundtrip() {
         let input = PolicyEvaluateInput {
-            vault_id: [0xAA; 32],
-            action_hash: [0xBB; 32],
-            threshold: 2,
-            policy_version: 42,
-            nonce: 7,
-            reserved: 0,
+            signal_lane_0: 0xAABBCCDDEEFFu128,
+            signal_lane_1: 0x1122334455667788u128,
         };
         let encoded = input.encode();
-        assert_eq!(encoded.len(), POLICY_INPUT_SIZE);
+        assert_eq!(encoded.len(), 32);
         let decoded = PolicyEvaluateInput::decode(&encoded);
         assert_eq!(decoded, input);
     }
 
     #[test]
-    fn policy_input_size_matches_mxe_has_size() {
-        // Must stay in sync with HasSize::SIZE = 75 in vaulkyrie-policy-mxe.
-        assert_eq!(POLICY_INPUT_SIZE, 75);
+    fn policy_input_keeps_two_fixed_signal_lanes() {
+        assert_eq!(POLICY_SIGNAL_LANES, 2);
     }
 }

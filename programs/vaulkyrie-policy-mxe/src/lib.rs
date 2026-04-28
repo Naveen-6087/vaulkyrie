@@ -35,12 +35,14 @@ pub struct PolicyEvaluateOutput {
     pub delay_until_slot: u64,
     /// Machine-readable reason code (0 = approved without conditions).
     pub reason_code: u16,
+    /// Decision bit flags that summarize which private signals escalated the action.
+    pub decision_flags: u16,
     /// 1 = approved, 0 = denied.
     pub approved: u8,
 }
 
 impl arcium_anchor::HasSize for PolicyEvaluateOutput {
-    const SIZE: usize = 75; // 32 + 32 + 8 + 2 + 1
+    const SIZE: usize = 77; // 32 + 32 + 8 + 2 + 2 + 1
 }
 
 // `#[arcium_program]` wraps Anchor's `#[program]` and generates:
@@ -150,20 +152,22 @@ pub mod vaulkyrie_policy_mxe {
 
     /// Queue the encrypted policy evaluation via Arcium MXE CPI.
     ///
-    /// Sends encrypted policy inputs to the MXE cluster for private
-    /// evaluation and registers a callback that will finalize the
+    /// Sends encrypted packed policy signal lanes to the MXE cluster for
+    /// private evaluation and registers a callback that will finalize the
     /// evaluation state when the computation completes.
     pub fn queue_policy_evaluate(
         ctx: Context<QueuePolicyEvaluate>,
         computation_offset: u64,
-        encrypted_input: [u8; 32],
+        encrypted_input_lane_0: [u8; 32],
+        encrypted_input_lane_1: [u8; 32],
         x25519_pubkey: [u8; 32],
         nonce: u128,
     ) -> Result<()> {
         handlers::process_queue_policy_evaluate(
             ctx,
             computation_offset,
-            encrypted_input,
+            encrypted_input_lane_0,
+            encrypted_input_lane_1,
             x25519_pubkey,
             nonce,
         )
@@ -278,8 +282,8 @@ pub struct InitPolicyEvaluateCompDef<'info> {
 /// would generate.
 ///
 /// The `params()` and `outputs()` define the computation signature:
-///   - 3 inputs: x25519 pubkey, u128 nonce, encrypted policy payload
-///   - 5 outputs: 2×ciphertext (commitments), u64, u16, u8
+///   - 4 inputs: x25519 pubkey, u128 nonce, 2 encrypted policy signal lanes
+///   - 6 outputs: 2×ciphertext (commitments), u64, u16, u16, u8
 impl<'info> InitCompDefAccs<'info> for InitPolicyEvaluateCompDef<'info> {
     fn arcium_program(&self) -> AccountInfo<'info> {
         self.arcium_program.to_account_info()
@@ -318,6 +322,7 @@ impl<'info> InitCompDefAccs<'info> for InitPolicyEvaluateCompDef<'info> {
             Parameter::ArcisX25519Pubkey,
             Parameter::PlaintextU128,
             Parameter::Ciphertext,
+            Parameter::Ciphertext,
         ]
     }
 
@@ -327,6 +332,7 @@ impl<'info> InitCompDefAccs<'info> for InitPolicyEvaluateCompDef<'info> {
             Output::Ciphertext,   // decision_commitment (32 bytes)
             Output::PlaintextU64, // delay_until_slot
             Output::PlaintextU16, // reason_code
+            Output::PlaintextU16, // decision_flags
             Output::PlaintextU8,  // approved flag
         ]
     }
@@ -751,7 +757,8 @@ mod handlers {
     pub fn process_queue_policy_evaluate(
         ctx: Context<QueuePolicyEvaluate>,
         computation_offset: u64,
-        encrypted_input: [u8; 32],
+        encrypted_input_lane_0: [u8; 32],
+        encrypted_input_lane_1: [u8; 32],
         x25519_pubkey: [u8; 32],
         nonce: u128,
     ) -> Result<()> {
@@ -778,11 +785,13 @@ mod handlers {
         // Build Arcium encrypted arguments:
         //   arg0: x25519 public key (for shared encryption envelope)
         //   arg1: nonce (128-bit plaintext)
-        //   arg2: encrypted policy input (32-byte ciphertext)
+        //   arg2: encrypted packed policy lane 0 (32-byte ciphertext)
+        //   arg3: encrypted packed policy lane 1 (32-byte ciphertext)
         let args = ArgBuilder::new()
             .x25519_pubkey(x25519_pubkey)
             .plaintext_u128(nonce)
-            .encrypted_u8(encrypted_input)
+            .encrypted_u128(encrypted_input_lane_0)
+            .encrypted_u128(encrypted_input_lane_1)
             .build();
 
         // Build callback instruction so the MXE routes the result back to us.
@@ -855,6 +864,7 @@ mod handlers {
             verified_output.decision_commitment,
             verified_output.delay_until_slot,
             verified_output.reason_code,
+            verified_output.decision_flags,
             verified_output.approved == 1,
         )
         .map_err(PolicyMxeError::from)?;
