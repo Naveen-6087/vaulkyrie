@@ -14,7 +14,7 @@ use pinocchio::{
 use solana_winternitz::signature::WinternitzSignature;
 use vaulkyrie_protocol::{
     AuthorityRotationStatement, PolicyReceipt, WotsAuthProof, QUANTUM_AUTHORITY_SEED,
-    SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
+    QUANTUM_VAULT_SEED, SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
 };
 
 use crate::{
@@ -706,7 +706,13 @@ pub fn process_open_quantum_vault(
 
     let lamports = Rent::get()?.minimum_balance(0);
     let bump_seed = [args.bump];
-    let seeds = [Seed::from(&args.hash), Seed::from(&bump_seed)];
+    pda::verify_quantum_vault(vault.key(), &args.hash, args.bump, program_id)?;
+    let signer_seed_bytes = quantum_vault_signer_seed_slices(&args.hash, &bump_seed);
+    let seeds = [
+        Seed::from(signer_seed_bytes[0]),
+        Seed::from(signer_seed_bytes[1]),
+        Seed::from(signer_seed_bytes[2]),
+    ];
     let signers = [Signer::from(&seeds)];
     create_program_owned_account(
         program_id,
@@ -717,6 +723,13 @@ pub fn process_open_quantum_vault(
         lamports,
         0,
     )
+}
+
+fn quantum_vault_signer_seed_slices<'a>(
+    hash: &'a [u8; 32],
+    bump_seed: &'a [u8; 1],
+) -> [&'a [u8]; 3] {
+    [QUANTUM_VAULT_SEED, hash, bump_seed]
 }
 
 fn create_program_owned_account(
@@ -1630,7 +1643,7 @@ mod tests {
     use vaulkyrie_protocol::{
         quantum_close_message, quantum_split_message, ActionDescriptor, ActionKind, PolicyReceipt,
         ThresholdRequirement, WinterAuthorityAdvanceStatement, WinterAuthoritySecretKey,
-        WotsAuthProof, WotsSecretKey, AUTHORITY_PROOF_CHUNK_MAX_BYTES,
+        WotsAuthProof, WotsSecretKey, AUTHORITY_PROOF_CHUNK_MAX_BYTES, QUANTUM_VAULT_SEED,
         WINTER_AUTHORITY_SIGNATURE_BYTES, WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES, XMSS_LEAF_COUNT,
     };
 
@@ -1645,6 +1658,7 @@ mod tests {
         process_init_spend_orchestration_data, process_init_vault_data,
         process_migrate_authority_data, process_open_session_data, process_rotate_authority_data,
         process_rotate_authority_staged_data, process_set_vault_status_data,
+        quantum_vault_signer_seed_slices,
         process_split_quantum_vault, process_stage_bridged_receipt_data,
         process_stage_receipt_data, process_write_authority_proof_chunk_data,
     };
@@ -1656,6 +1670,7 @@ mod tests {
             InitRecoveryArgs, InitSpendOrchestrationArgs, InitVaultArgs,
             WriteAuthorityProofChunkArgs,
         },
+        pda,
         state::{
             ActionSessionState, AuthorityProofState, OrchestrationStatus, PolicyReceiptState,
             QuantumAuthorityState, RecoveryState, RecoveryStatus, SessionStatus,
@@ -1700,6 +1715,20 @@ mod tests {
         statement.action_hash =
             statement.expected_action_hash(vault.wallet_pubkey, vault.policy_version);
         statement
+    }
+
+    #[test]
+    fn quantum_vault_signer_seeds_include_domain_prefix() {
+        let hash = [0x55; 32];
+        let bump_seed = [42u8];
+        let seed_bytes = quantum_vault_signer_seed_slices(&hash, &bump_seed);
+
+        assert_eq!(seed_bytes[0], QUANTUM_VAULT_SEED);
+        assert_eq!(seed_bytes[1], &hash);
+        assert_eq!(seed_bytes[2], &bump_seed);
+
+        let derived = pda::derive_quantum_vault(&hash, bump_seed[0], &[9; 32]).unwrap();
+        pda::verify_quantum_vault(&derived, &hash, bump_seed[0], &[9; 32]).unwrap();
     }
 
     fn sample_wots_secret(seed: u8) -> WotsSecretKey {
