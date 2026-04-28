@@ -813,6 +813,19 @@ fn pqc_wallet_signer_seed_slices<'a>(
     [PQC_WALLET_SEED, wallet_id, bump_seed]
 }
 
+fn rent_minimum_balance(data_len: usize) -> Result<u64, ProgramError> {
+    #[cfg(any(feature = "bpf-entrypoint", target_os = "solana"))]
+    {
+        Rent::get().map(|rent| rent.minimum_balance(data_len))
+    }
+
+    #[cfg(all(not(feature = "bpf-entrypoint"), not(target_os = "solana")))]
+    {
+        let _ = data_len;
+        Ok(0)
+    }
+}
+
 fn create_program_owned_account(
     program_id: &pinocchio::pubkey::Pubkey,
     payer: &AccountInfo,
@@ -1003,7 +1016,7 @@ pub fn process_advance_pqc_wallet_data(
     let mut state = PqcWalletState::decode(wallet_dst).ok_or(ProgramError::InvalidAccountData)?;
     require_discriminator(&state.discriminator, &PQC_WALLET_DISCRIMINATOR)?;
 
-    let rent_reserve = Rent::get()?.minimum_balance(PqcWalletState::LEN);
+    let rent_reserve = rent_minimum_balance(PqcWalletState::LEN)?;
     let spendable = wallet_lamports.saturating_sub(rent_reserve);
     if amount > spendable {
         return Err(ProgramError::InsufficientFunds);
@@ -1771,20 +1784,22 @@ mod tests {
     use solana_nostd_sha256::hashv;
     use solana_winternitz::privkey::WinternitzPrivkey;
     use vaulkyrie_protocol::{
-        quantum_close_message, quantum_split_message, ActionDescriptor, ActionKind, PolicyReceipt,
-        ThresholdRequirement, WinterAuthorityAdvanceStatement, WinterAuthoritySecretKey,
-        WotsAuthProof, WotsSecretKey, AUTHORITY_PROOF_CHUNK_MAX_BYTES, QUANTUM_VAULT_SEED,
-        WINTER_AUTHORITY_SIGNATURE_BYTES, WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES, XMSS_LEAF_COUNT,
+        pqc_wallet_advance_message, quantum_close_message, quantum_split_message, ActionDescriptor,
+        ActionKind, PolicyReceipt, ThresholdRequirement, WinterAuthorityAdvanceStatement,
+        WinterAuthoritySecretKey, WotsAuthProof, WotsSecretKey, AUTHORITY_PROOF_CHUNK_MAX_BYTES,
+        QUANTUM_VAULT_SEED, WINTER_AUTHORITY_SIGNATURE_BYTES, WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES,
+        XMSS_LEAF_COUNT,
     };
 
     use super::{
         ensure_wallet_authority, process_activate_session_data,
-        process_advance_policy_version_data, process_advance_winter_authority_data,
-        process_close_quantum_vault, process_commit_spend_orchestration_data,
-        process_complete_recovery_data, process_complete_spend_orchestration_data,
-        process_consume_receipt_data, process_consume_session_data,
-        process_fail_spend_orchestration_data, process_finalize_session_data,
-        process_init_authority_data, process_init_authority_proof_data, process_init_recovery_data,
+        process_advance_policy_version_data, process_advance_pqc_wallet_data,
+        process_advance_winter_authority_data, process_close_quantum_vault,
+        process_commit_spend_orchestration_data, process_complete_recovery_data,
+        process_complete_spend_orchestration_data, process_consume_receipt_data,
+        process_consume_session_data, process_fail_spend_orchestration_data,
+        process_finalize_session_data, process_init_authority_data,
+        process_init_authority_proof_data, process_init_recovery_data,
         process_init_spend_orchestration_data, process_init_vault_data,
         process_migrate_authority_data, process_open_session_data, process_rotate_authority_data,
         process_rotate_authority_staged_data, process_set_vault_status_data,
@@ -1803,7 +1818,7 @@ mod tests {
         pda,
         state::{
             ActionSessionState, AuthorityProofState, OrchestrationStatus, PolicyReceiptState,
-            QuantumAuthorityState, RecoveryState, RecoveryStatus, SessionStatus,
+            PqcWalletState, QuantumAuthorityState, RecoveryState, RecoveryStatus, SessionStatus,
             SpendOrchestrationState, VaultRegistry, VaultStatus, ACTION_SESSION_DISCRIMINATOR,
             QUANTUM_STATE_DISCRIMINATOR, RECOVERY_STATE_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR,
             VAULT_REGISTRY_DISCRIMINATOR,
@@ -3294,6 +3309,42 @@ mod tests {
         .expect_err("overspend must fail");
 
         assert_eq!(error, ProgramError::InsufficientFunds);
+    }
+
+    #[test]
+    fn advance_pqc_wallet_rolls_root_after_bound_send() {
+        let privkey = WinternitzPrivkey::from([54u8; solana_winternitz::HASH_LENGTH * 32]);
+        let wallet_id = [1; 32];
+        let current_root = privkey.pubkey().merklize();
+        let next_root = [9; 32];
+        let destination = [8; 32];
+        let amount = 77;
+        let sequence = 0;
+        let signature = privkey.sign(&pqc_wallet_advance_message(
+            wallet_id,
+            current_root,
+            next_root,
+            destination,
+            amount,
+            sequence,
+        ));
+        let mut wallet_state = PqcWalletState::new(wallet_id, current_root, 3);
+        let mut bytes = [0; PqcWalletState::LEN];
+        assert!(wallet_state.encode(&mut bytes));
+
+        process_advance_pqc_wallet_data(
+            &mut bytes,
+            amount,
+            destination,
+            &signature,
+            next_root,
+            1_000_000_000,
+        )
+        .expect("valid WOTS advance should roll the wallet root");
+
+        wallet_state = PqcWalletState::decode(&bytes).expect("wallet state should decode");
+        assert_eq!(wallet_state.current_root, next_root);
+        assert_eq!(wallet_state.sequence, 1);
     }
 
     #[test]
