@@ -10,8 +10,7 @@ pub mod errors;
 pub mod state;
 pub mod transition;
 
-// Placeholder program ID — replace with actual deployed address.
-declare_id!("6XVfpzDXRDQXLHfvwkLA6So3WTriQfWQphsHzfWSSGr7");
+declare_id!("85DVk7pAZKxJGcqfN9WARt8HYPT89tjpgiQkdnca14sc");
 
 pub const POLICY_CONFIG_SEED: &[u8] = b"policy_config";
 pub const POLICY_EVAL_SEED: &[u8] = b"policy_eval";
