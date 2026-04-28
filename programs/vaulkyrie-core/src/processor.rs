@@ -13,24 +13,26 @@ use pinocchio::{
 };
 use solana_winternitz::signature::WinternitzSignature;
 use vaulkyrie_protocol::{
-    AuthorityRotationStatement, PolicyReceipt, WotsAuthProof, QUANTUM_AUTHORITY_SEED,
-    QUANTUM_VAULT_SEED, SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
+    pqc_wallet_advance_message, AuthorityRotationStatement, PolicyReceipt, WotsAuthProof,
+    PQC_WALLET_SEED, QUANTUM_AUTHORITY_SEED, QUANTUM_VAULT_SEED, SPEND_ORCH_SEED,
+    VAULT_REGISTRY_SEED,
 };
 
 use crate::{
     error,
     instruction::{
         CommitSpendOrchestrationArgs, CompleteSpendOrchestrationArgs, CoreInstruction,
-        FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs,
+        FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs, InitPqcWalletArgs,
         InitQuantumVaultArgs, InitSpendOrchestrationArgs, InitVaultArgs,
         WriteAuthorityProofChunkArgs,
     },
     pda,
     state::{
-        ActionSessionState, AuthorityProofState, PolicyReceiptState, QuantumAuthorityState,
-        SpendOrchestrationState, VaultRegistry, ACTION_SESSION_DISCRIMINATOR,
-        AUTHORITY_PROOF_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR,
-        SPEND_ORCH_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
+        ActionSessionState, AuthorityProofState, PolicyReceiptState, PqcWalletState,
+        QuantumAuthorityState, SpendOrchestrationState, VaultRegistry,
+        ACTION_SESSION_DISCRIMINATOR, AUTHORITY_PROOF_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR,
+        PQC_WALLET_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR,
+        VAULT_REGISTRY_DISCRIMINATOR,
     },
     transition,
 };
@@ -114,6 +116,7 @@ pub fn process(
         CoreInstruction::InitQuantumVault(args) => {
             process_open_quantum_vault(program_id, accounts, args)
         }
+        CoreInstruction::InitPqcWallet(args) => process_open_pqc_wallet(program_id, accounts, args),
         CoreInstruction::StageReceipt(receipt) => {
             let current_slot = current_slot()?;
             let vault_account = get_account_info!(accounts, 0);
@@ -378,6 +381,40 @@ pub fn process(
                 &args.signature,
                 current_slot,
             )
+        }
+        CoreInstruction::AdvancePqcWallet(args) => {
+            let wallet_account = get_account_info!(accounts, 0);
+            require_writable(wallet_account)?;
+            require_program_owner(program_id, wallet_account)?;
+
+            let destination_account = get_account_info!(accounts, 1);
+            require_writable(destination_account)?;
+            if wallet_account.key() == destination_account.key() {
+                return Err(ProgramError::Custom(error::DUPLICATE_ACCOUNT_KEYS));
+            }
+
+            {
+                let mut wallet_data = wallet_account.try_borrow_mut_data()?;
+                process_advance_pqc_wallet_data(
+                    &mut wallet_data,
+                    args.amount,
+                    *destination_account.key(),
+                    &args.signature(),
+                    args.next_root,
+                    wallet_account.lamports(),
+                )?;
+            }
+
+            {
+                let mut wallet_lamports = wallet_account.try_borrow_mut_lamports()?;
+                *wallet_lamports = (*wallet_lamports).saturating_sub(args.amount);
+            }
+            {
+                let mut destination_lamports = destination_account.try_borrow_mut_lamports()?;
+                *destination_lamports += args.amount;
+            }
+
+            Ok(())
         }
         CoreInstruction::SplitQuantumVault(args) => {
             let vault_account = get_account_info!(accounts, 0);
@@ -725,11 +762,55 @@ pub fn process_open_quantum_vault(
     )
 }
 
+pub fn process_open_pqc_wallet(
+    program_id: &pinocchio::pubkey::Pubkey,
+    accounts: &[AccountInfo],
+    args: InitPqcWalletArgs,
+) -> ProgramResult {
+    let [payer, wallet, system_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    pda::verify_pqc_wallet(wallet.key(), &args.wallet_id, args.bump, program_id)?;
+    let bump_seed = [args.bump];
+    let signer_seed_bytes = pqc_wallet_signer_seed_slices(&args.wallet_id, &bump_seed);
+    let seeds = [
+        Seed::from(signer_seed_bytes[0]),
+        Seed::from(signer_seed_bytes[1]),
+        Seed::from(signer_seed_bytes[2]),
+    ];
+    let signers = [Signer::from(&seeds)];
+    let lamports = Rent::get()?.minimum_balance(PqcWalletState::LEN);
+    create_program_owned_account(
+        program_id,
+        payer,
+        wallet,
+        system_program,
+        &signers,
+        lamports,
+        PqcWalletState::LEN as u64,
+    )?;
+
+    let mut data = wallet.try_borrow_mut_data()?;
+    let state = PqcWalletState::new(args.wallet_id, args.current_root, args.bump);
+    if !state.encode(&mut data) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
 fn quantum_vault_signer_seed_slices<'a>(
     hash: &'a [u8; 32],
     bump_seed: &'a [u8; 1],
 ) -> [&'a [u8]; 3] {
     [QUANTUM_VAULT_SEED, hash, bump_seed]
+}
+
+fn pqc_wallet_signer_seed_slices<'a>(
+    wallet_id: &'a [u8; 32],
+    bump_seed: &'a [u8; 1],
+) -> [&'a [u8]; 3] {
+    [PQC_WALLET_SEED, wallet_id, bump_seed]
 }
 
 fn create_program_owned_account(
@@ -898,6 +979,55 @@ pub fn process_write_authority_proof_chunk_data(
     state.bytes_written = end as u32;
 
     if !state.encode(dst) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Ok(())
+}
+
+pub fn process_advance_pqc_wallet_data(
+    wallet_dst: &mut [u8],
+    amount: u64,
+    destination: [u8; 32],
+    signature: &WinternitzSignature,
+    next_root: [u8; 32],
+    wallet_lamports: u64,
+) -> ProgramResult {
+    if wallet_dst.len() != PqcWalletState::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    if amount == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let mut state = PqcWalletState::decode(wallet_dst).ok_or(ProgramError::InvalidAccountData)?;
+    require_discriminator(&state.discriminator, &PQC_WALLET_DISCRIMINATOR)?;
+
+    let rent_reserve = Rent::get()?.minimum_balance(PqcWalletState::LEN);
+    let spendable = wallet_lamports.saturating_sub(rent_reserve);
+    if amount > spendable {
+        return Err(ProgramError::InsufficientFunds);
+    }
+
+    let message = pqc_wallet_advance_message(
+        state.wallet_id,
+        state.current_root,
+        next_root,
+        destination,
+        amount,
+        state.sequence,
+    );
+    let recovered_root = signature.recover_pubkey(&message).merklize();
+    if recovered_root != state.current_root {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    state.current_root = next_root;
+    state.sequence = state
+        .sequence
+        .checked_add(1)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    if !state.encode(wallet_dst) {
         return Err(ProgramError::InvalidAccountData);
     }
 
@@ -1658,9 +1788,9 @@ mod tests {
         process_init_spend_orchestration_data, process_init_vault_data,
         process_migrate_authority_data, process_open_session_data, process_rotate_authority_data,
         process_rotate_authority_staged_data, process_set_vault_status_data,
-        quantum_vault_signer_seed_slices,
         process_split_quantum_vault, process_stage_bridged_receipt_data,
         process_stage_receipt_data, process_write_authority_proof_chunk_data,
+        quantum_vault_signer_seed_slices,
     };
     use crate::{
         error,

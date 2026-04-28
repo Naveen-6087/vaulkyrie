@@ -1,4 +1,4 @@
-//! Instruction builders for all 27 `vaulkyrie-core` instructions.
+//! Instruction builders for all `vaulkyrie-core` instructions.
 //!
 //! Each function returns a `solana_instruction::Instruction` with the correct
 //! wire-format data and `AccountMeta` list matching the on-chain processor
@@ -39,6 +39,8 @@ const DISC_COMPLETE_RECOVERY: u8 = 23;
 const DISC_MIGRATE_AUTHORITY: u8 = 24;
 const DISC_ADVANCE_POLICY_VERSION: u8 = 25;
 const DISC_ADVANCE_WINTER_AUTHORITY: u8 = 26;
+const DISC_INIT_PQC_WALLET: u8 = 27;
+const DISC_ADVANCE_PQC_WALLET: u8 = 28;
 
 // ─── Receipt helpers ─────────────────────────────────────────────────────────
 
@@ -159,6 +161,33 @@ pub fn init_quantum_vault(
     data.push(bump);
 
     Instruction::new_with_bytes(*program_id, &data, vec![AccountMeta::new(*vault, false)])
+}
+
+// ─── 27: InitPqcWallet ──────────────────────────────────────────────────────
+
+pub fn init_pqc_wallet(
+    program_id: &Pubkey,
+    payer: &Pubkey,
+    wallet: &Pubkey,
+    wallet_id: [u8; 32],
+    current_root: [u8; 32],
+    bump: u8,
+) -> Instruction {
+    let mut data = Vec::with_capacity(1 + 65);
+    data.push(DISC_INIT_PQC_WALLET);
+    data.extend_from_slice(&wallet_id);
+    data.extend_from_slice(&current_root);
+    data.push(bump);
+
+    Instruction::new_with_bytes(
+        *program_id,
+        &data,
+        vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(*wallet, false),
+            AccountMeta::new_readonly(Pubkey::from([0u8; 32]), false),
+        ],
+    )
 }
 
 // ─── 4: StageReceipt ─────────────────────────────────────────────────────────
@@ -496,6 +525,32 @@ pub fn close_quantum_vault(
         vec![
             AccountMeta::new(*vault, false),
             AccountMeta::new(*refund_dest, false),
+        ],
+    )
+}
+
+// ─── 28: AdvancePqcWallet ───────────────────────────────────────────────────
+
+pub fn advance_pqc_wallet(
+    program_id: &Pubkey,
+    wallet: &Pubkey,
+    destination: &Pubkey,
+    signature: &[u8],
+    next_root: [u8; 32],
+    amount: u64,
+) -> Instruction {
+    let mut data = Vec::with_capacity(1 + signature.len() + 40);
+    data.push(DISC_ADVANCE_PQC_WALLET);
+    data.extend_from_slice(signature);
+    data.extend_from_slice(&next_root);
+    data.extend_from_slice(&amount.to_le_bytes());
+
+    Instruction::new_with_bytes(
+        *program_id,
+        &data,
+        vec![
+            AccountMeta::new(*wallet, false),
+            AccountMeta::new(*destination, false),
         ],
     )
 }

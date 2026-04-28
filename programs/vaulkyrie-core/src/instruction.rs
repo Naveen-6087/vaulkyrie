@@ -30,6 +30,26 @@ pub struct InitQuantumVaultArgs {
     pub bump: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitPqcWalletArgs {
+    pub wallet_id: [u8; 32],
+    pub current_root: [u8; 32],
+    pub bump: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvancePqcWalletArgs {
+    pub signature: [u8; WINTERNITZ_SIGNATURE_BYTES],
+    pub next_root: [u8; 32],
+    pub amount: u64,
+}
+
+impl AdvancePqcWalletArgs {
+    pub fn signature(&self) -> WinternitzSignature {
+        WinternitzSignature::from(self.signature)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitQuantumVaultArgs {
     pub signature: [u8; WINTERNITZ_SIGNATURE_BYTES],
@@ -181,6 +201,10 @@ pub enum CoreInstruction {
     AdvancePolicyVersion(AdvancePolicyVersionArgs),
     /// WinterWallet-style root-rolling PQC authority advance.
     AdvanceWinterAuthority(AdvanceWinterAuthorityArgs),
+    /// WinterWallet-style root-rolling PDA wallet initialization.
+    InitPqcWallet(InitPqcWalletArgs),
+    /// Advance the PQC wallet root and send SOL from the wallet PDA.
+    AdvancePqcWallet(AdvancePqcWalletArgs),
 }
 
 impl TryFrom<&[u8]> for CoreInstruction {
@@ -231,6 +255,8 @@ impl TryFrom<&[u8]> for CoreInstruction {
             [26, rest @ ..] => Ok(Self::AdvanceWinterAuthority(
                 parse_advance_winter_authority(rest)?,
             )),
+            [27, rest @ ..] => Ok(Self::InitPqcWallet(parse_init_pqc_wallet(rest)?)),
+            [28, rest @ ..] => Ok(Self::AdvancePqcWallet(parse_advance_pqc_wallet(rest)?)),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -311,6 +337,23 @@ fn parse_init_quantum_vault(data: &[u8]) -> Result<InitQuantumVaultArgs, Program
     Ok(InitQuantumVaultArgs {
         hash,
         bump: data[32],
+    })
+}
+
+fn parse_init_pqc_wallet(data: &[u8]) -> Result<InitPqcWalletArgs, ProgramError> {
+    if data.len() != 65 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut wallet_id = [0; 32];
+    wallet_id.copy_from_slice(&data[..32]);
+    let mut current_root = [0; 32];
+    current_root.copy_from_slice(&data[32..64]);
+
+    Ok(InitPqcWalletArgs {
+        wallet_id,
+        current_root,
+        bump: data[64],
     })
 }
 
@@ -508,6 +551,25 @@ fn parse_close_quantum_vault(data: &[u8]) -> Result<CloseQuantumVaultArgs, Progr
     })
 }
 
+fn parse_advance_pqc_wallet(data: &[u8]) -> Result<AdvancePqcWalletArgs, ProgramError> {
+    if data.len() != WINTERNITZ_SIGNATURE_BYTES + 32 + 8 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut signature = [0; WINTERNITZ_SIGNATURE_BYTES];
+    signature.copy_from_slice(&data[..WINTERNITZ_SIGNATURE_BYTES]);
+    let mut next_root = [0; 32];
+    next_root.copy_from_slice(&data[WINTERNITZ_SIGNATURE_BYTES..WINTERNITZ_SIGNATURE_BYTES + 32]);
+    let mut amount = [0; 8];
+    amount.copy_from_slice(&data[WINTERNITZ_SIGNATURE_BYTES + 32..WINTERNITZ_SIGNATURE_BYTES + 40]);
+
+    Ok(AdvancePqcWalletArgs {
+        signature,
+        next_root,
+        amount: u64::from_le_bytes(amount),
+    })
+}
+
 fn parse_init_spend_orchestration(data: &[u8]) -> Result<InitSpendOrchestrationArgs, ProgramError> {
     // 32 + 32 + 32 + 32 + 8 + 1 + 1 + 1 = 139
     if data.len() != 139 {
@@ -662,12 +724,13 @@ fn parse_advance_policy_version(data: &[u8]) -> Result<AdvancePolicyVersionArgs,
 #[cfg(test)]
 mod tests {
     use super::{
-        AdvancePolicyVersionArgs, AdvanceWinterAuthorityArgs, CloseQuantumVaultArgs,
-        CommitSpendOrchestrationArgs, CompleteRecoveryArgs, CompleteSpendOrchestrationArgs,
-        CoreInstruction, FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs,
-        InitQuantumVaultArgs, InitRecoveryArgs, InitSpendOrchestrationArgs, InitVaultArgs,
-        MigrateAuthorityArgs, RotateAuthorityArgs, SplitQuantumVaultArgs,
-        WriteAuthorityProofChunkArgs, WINTERNITZ_SIGNATURE_BYTES,
+        AdvancePolicyVersionArgs, AdvancePqcWalletArgs, AdvanceWinterAuthorityArgs,
+        CloseQuantumVaultArgs, CommitSpendOrchestrationArgs, CompleteRecoveryArgs,
+        CompleteSpendOrchestrationArgs, CoreInstruction, FailSpendOrchestrationArgs,
+        InitAuthorityArgs, InitAuthorityProofArgs, InitPqcWalletArgs, InitQuantumVaultArgs,
+        InitRecoveryArgs, InitSpendOrchestrationArgs, InitVaultArgs, MigrateAuthorityArgs,
+        RotateAuthorityArgs, SplitQuantumVaultArgs, WriteAuthorityProofChunkArgs,
+        WINTERNITZ_SIGNATURE_BYTES,
     };
     use pinocchio::program_error::ProgramError;
     use vaulkyrie_protocol::{
@@ -990,6 +1053,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_init_pqc_wallet_instruction() {
+        let mut data = vec![27];
+        data.extend_from_slice(&[7; 32]);
+        data.extend_from_slice(&[8; 32]);
+        data.push(4);
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::InitPqcWallet(InitPqcWalletArgs {
+                wallet_id: [7; 32],
+                current_root: [8; 32],
+                bump: 4,
+            }))
+        );
+    }
+
+    #[test]
     fn parses_split_quantum_vault_instruction() {
         let signature = [1; WINTERNITZ_SIGNATURE_BYTES];
 
@@ -1004,6 +1084,25 @@ mod tests {
                 signature,
                 amount: 42,
                 bump: 5,
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_advance_pqc_wallet_instruction() {
+        let signature = [2; WINTERNITZ_SIGNATURE_BYTES];
+
+        let mut data = vec![28];
+        data.extend_from_slice(&signature);
+        data.extend_from_slice(&[9; 32]);
+        data.extend_from_slice(&42u64.to_le_bytes());
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::AdvancePqcWallet(AdvancePqcWalletArgs {
+                signature,
+                next_root: [9; 32],
+                amount: 42,
             }))
         );
     }

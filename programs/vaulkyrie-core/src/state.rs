@@ -5,6 +5,7 @@ pub const VAULT_REGISTRY_DISCRIMINATOR: [u8; 8] = *b"VAULKYR1";
 pub const POLICY_RECEIPT_DISCRIMINATOR: [u8; 8] = *b"POLRCPT1";
 pub const ACTION_SESSION_DISCRIMINATOR: [u8; 8] = *b"SESSION1";
 pub const QUANTUM_STATE_DISCRIMINATOR: [u8; 8] = *b"QSTATE01";
+pub const PQC_WALLET_DISCRIMINATOR: [u8; 8] = *b"PQCWALT1";
 pub const AUTHORITY_PROOF_DISCRIMINATOR: [u8; 8] = *b"AUTHPRF1";
 pub const SPEND_ORCH_DISCRIMINATOR: [u8; 8] = *b"SPNDORC1";
 pub const RECOVERY_STATE_DISCRIMINATOR: [u8; 8] = *b"RECOV001";
@@ -23,6 +24,74 @@ pub enum SessionStatus {
     Pending = 1,
     Ready = 2,
     Consumed = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct PqcWalletState {
+    pub discriminator: [u8; 8],
+    pub wallet_id: [u8; 32],
+    pub current_root: [u8; 32],
+    pub sequence: u64,
+    pub bump: u8,
+    pub reserved: [u8; 7],
+}
+
+impl PqcWalletState {
+    pub const LEN: usize = size_of::<Self>();
+
+    pub const fn new(wallet_id: [u8; 32], current_root: [u8; 32], bump: u8) -> Self {
+        Self {
+            discriminator: PQC_WALLET_DISCRIMINATOR,
+            wallet_id,
+            current_root,
+            sequence: 0,
+            bump,
+            reserved: [0; 7],
+        }
+    }
+
+    pub fn encode(self, dst: &mut [u8]) -> bool {
+        if dst.len() != Self::LEN {
+            return false;
+        }
+
+        dst[..8].copy_from_slice(&self.discriminator);
+        dst[8..40].copy_from_slice(&self.wallet_id);
+        dst[40..72].copy_from_slice(&self.current_root);
+        dst[72..80].copy_from_slice(&self.sequence.to_le_bytes());
+        dst[80] = self.bump;
+        dst[81..88].copy_from_slice(&self.reserved);
+        true
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::LEN {
+            return None;
+        }
+        let mut discriminator = [0; 8];
+        discriminator.copy_from_slice(&src[..8]);
+        if discriminator != PQC_WALLET_DISCRIMINATOR {
+            return None;
+        }
+        let mut wallet_id = [0; 32];
+        wallet_id.copy_from_slice(&src[8..40]);
+        let mut current_root = [0; 32];
+        current_root.copy_from_slice(&src[40..72]);
+        let mut sequence = [0; 8];
+        sequence.copy_from_slice(&src[72..80]);
+        let mut reserved = [0; 7];
+        reserved.copy_from_slice(&src[81..88]);
+
+        Some(Self {
+            discriminator,
+            wallet_id,
+            current_root,
+            sequence: u64::from_le_bytes(sequence),
+            bump: src[80],
+            reserved,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -726,10 +795,11 @@ impl RecoveryState {
 mod tests {
     use super::{
         ActionSessionState, AuthorityProofState, OrchestrationStatus, PolicyReceiptState,
-        QuantumAuthorityState, RecoveryState, RecoveryStatus, SessionStatus,
+        PqcWalletState, QuantumAuthorityState, RecoveryState, RecoveryStatus, SessionStatus,
         SpendOrchestrationState, VaultRegistry, VaultStatus, ACTION_SESSION_DISCRIMINATOR,
-        AUTHORITY_PROOF_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR,
-        RECOVERY_STATE_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
+        AUTHORITY_PROOF_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR, PQC_WALLET_DISCRIMINATOR,
+        QUANTUM_STATE_DISCRIMINATOR, RECOVERY_STATE_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR,
+        VAULT_REGISTRY_DISCRIMINATOR,
     };
     use vaulkyrie_protocol::WotsAuthProof;
 
@@ -788,6 +858,17 @@ mod tests {
 
         assert!(state.encode(&mut bytes));
         assert_eq!(QuantumAuthorityState::decode(&bytes), Some(state));
+    }
+
+    #[test]
+    fn pqc_wallet_state_roundtrips_through_bytes() {
+        let state = PqcWalletState::new([9; 32], [10; 32], 3);
+        let mut bytes = [0; PqcWalletState::LEN];
+
+        assert!(state.encode(&mut bytes));
+        assert_eq!(PqcWalletState::LEN, 88);
+        assert_eq!(state.discriminator, PQC_WALLET_DISCRIMINATOR);
+        assert_eq!(PqcWalletState::decode(&bytes), Some(state));
     }
 
     #[test]

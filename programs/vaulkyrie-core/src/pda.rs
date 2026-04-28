@@ -2,8 +2,8 @@
 use pinocchio::pubkey::create_program_address;
 use pinocchio::{program_error::ProgramError, pubkey::Pubkey};
 use vaulkyrie_protocol::{
-    ACTION_SESSION_SEED, AUTHORITY_PROOF_SEED, POLICY_RECEIPT_SEED, QUANTUM_AUTHORITY_SEED,
-    QUANTUM_VAULT_SEED, SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
+    ACTION_SESSION_SEED, AUTHORITY_PROOF_SEED, POLICY_RECEIPT_SEED, PQC_WALLET_SEED,
+    QUANTUM_AUTHORITY_SEED, QUANTUM_VAULT_SEED, SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
 };
 
 fn create_pda_address(seeds: &[&[u8]], program_id: &Pubkey) -> Result<Pubkey, ProgramError> {
@@ -184,6 +184,31 @@ pub fn verify_quantum_vault(
     Ok(())
 }
 
+// ── PQC Wallet PDA ─────────────────────────────────────────────────────────
+// Seeds: ["pqc_wallet", wallet_id, bump]
+
+pub fn derive_pqc_wallet(
+    wallet_id: &[u8; 32],
+    bump: u8,
+    program_id: &Pubkey,
+) -> Result<Pubkey, ProgramError> {
+    let bump_slice = [bump];
+    create_pda_address(&[PQC_WALLET_SEED, wallet_id, &bump_slice], program_id)
+}
+
+pub fn verify_pqc_wallet(
+    expected_key: &Pubkey,
+    wallet_id: &[u8; 32],
+    bump: u8,
+    program_id: &Pubkey,
+) -> Result<(), ProgramError> {
+    let derived = derive_pqc_wallet(wallet_id, bump, program_id)?;
+    if &derived != expected_key {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    Ok(())
+}
+
 // ── SpendOrchestrationState PDA ────────────────────────────────────────────
 // Seeds: ["spend_orch", vault_id, action_hash, bump]
 
@@ -275,8 +300,8 @@ mod host_pda {
 mod tests {
     use super::host_pda;
     use vaulkyrie_protocol::{
-        ACTION_SESSION_SEED, AUTHORITY_PROOF_SEED, POLICY_RECEIPT_SEED, QUANTUM_AUTHORITY_SEED,
-        QUANTUM_VAULT_SEED, SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
+        ACTION_SESSION_SEED, AUTHORITY_PROOF_SEED, POLICY_RECEIPT_SEED, PQC_WALLET_SEED,
+        QUANTUM_AUTHORITY_SEED, QUANTUM_VAULT_SEED, SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
     };
 
     const PROGRAM_ID: [u8; 32] = [
@@ -425,6 +450,7 @@ mod tests {
             QUANTUM_AUTHORITY_SEED,
             AUTHORITY_PROOF_SEED,
             QUANTUM_VAULT_SEED,
+            PQC_WALLET_SEED,
             SPEND_ORCH_SEED,
         ];
         for (i, a) in seeds.iter().enumerate() {

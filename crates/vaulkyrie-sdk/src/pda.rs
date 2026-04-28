@@ -11,8 +11,8 @@ use curve25519_dalek::edwards::CompressedEdwardsY;
 use sha2::{Digest, Sha256};
 use solana_pubkey::Pubkey;
 use vaulkyrie_protocol::{
-    ACTION_SESSION_SEED, AUTHORITY_PROOF_SEED, POLICY_RECEIPT_SEED, QUANTUM_AUTHORITY_SEED,
-    QUANTUM_VAULT_SEED, SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
+    ACTION_SESSION_SEED, AUTHORITY_PROOF_SEED, POLICY_RECEIPT_SEED, PQC_WALLET_SEED,
+    QUANTUM_AUTHORITY_SEED, QUANTUM_VAULT_SEED, SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
 };
 
 /// Standard Solana PDA derivation: tries bumps 255..=0 until the hash lands
@@ -93,6 +93,11 @@ pub fn find_authority_proof(
 /// QuantumVaultState PDA — seeds: `["quantum_vault", hash]`
 pub fn find_quantum_vault(hash: &[u8; 32], program_id: &Pubkey) -> (Pubkey, u8) {
     find_program_address(&[QUANTUM_VAULT_SEED, hash], program_id)
+}
+
+/// PqcWalletState PDA — seeds: `["pqc_wallet", wallet_id]`
+pub fn find_pqc_wallet(wallet_id: &[u8; 32], program_id: &Pubkey) -> (Pubkey, u8) {
+    find_program_address(&[PQC_WALLET_SEED, wallet_id], program_id)
 }
 
 /// SpendOrchestrationState PDA — seeds: `["spend_orch", vault_id, action_hash]`

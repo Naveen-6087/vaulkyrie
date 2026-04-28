@@ -86,6 +86,8 @@ pub const WINTER_AUTHORITY_ADVANCE_DOMAIN: &[u8] = b"VAULKYRIE_WINTER_AUTHORITY_
 pub const AUTHORITY_PROOF_CHUNK_MAX_BYTES: usize = 256;
 pub const QUANTUM_SPLIT_MESSAGE_BYTES: usize = 72;
 pub const QUANTUM_CLOSE_MESSAGE_BYTES: usize = 32;
+pub const PQC_WALLET_ADVANCE_DOMAIN: &[u8] = b"VAULKYRIE_PQC_WALLET_ADVANCE_V1";
+pub const PQC_WALLET_ADVANCE_MESSAGE_BYTES: usize = 32 + 32 + 32 + 32 + 32 + 8 + 8;
 
 pub const VAULT_REGISTRY_SEED: &[u8] = b"vault_registry";
 pub const POLICY_RECEIPT_SEED: &[u8] = b"policy_receipt";
@@ -93,6 +95,7 @@ pub const ACTION_SESSION_SEED: &[u8] = b"action_session";
 pub const QUANTUM_AUTHORITY_SEED: &[u8] = b"quantum_authority";
 pub const AUTHORITY_PROOF_SEED: &[u8] = b"authority_proof";
 pub const QUANTUM_VAULT_SEED: &[u8] = b"quantum_vault";
+pub const PQC_WALLET_SEED: &[u8] = b"pqc_wallet";
 pub const POLICY_CONFIG_SEED: &[u8] = b"policy_config";
 pub const POLICY_EVAL_SEED: &[u8] = b"policy_eval";
 pub const SPEND_ORCH_SEED: &[u8] = b"spend_orch";
@@ -874,6 +877,26 @@ pub fn quantum_close_message(refund_pubkey: [u8; 32]) -> [u8; QUANTUM_CLOSE_MESS
     refund_pubkey
 }
 
+pub fn pqc_wallet_advance_message(
+    wallet_id: [u8; 32],
+    current_root: [u8; 32],
+    next_root: [u8; 32],
+    destination: [u8; 32],
+    amount: u64,
+    sequence: u64,
+) -> [u8; PQC_WALLET_ADVANCE_MESSAGE_BYTES] {
+    let mut message = [0u8; PQC_WALLET_ADVANCE_MESSAGE_BYTES];
+    let domain_hash: [u8; 32] = Sha256::digest(PQC_WALLET_ADVANCE_DOMAIN).into();
+    message[..32].copy_from_slice(&domain_hash);
+    message[32..64].copy_from_slice(&wallet_id);
+    message[64..96].copy_from_slice(&current_root);
+    message[96..128].copy_from_slice(&next_root);
+    message[128..160].copy_from_slice(&destination);
+    message[160..168].copy_from_slice(&amount.to_le_bytes());
+    message[168..176].copy_from_slice(&sequence.to_le_bytes());
+    message
+}
+
 pub fn quantum_split_digest(
     amount: u64,
     split_pubkey: [u8; 32],
@@ -893,12 +916,12 @@ pub fn quantum_close_digest(refund_pubkey: [u8; 32]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::{
-        quantum_close_digest, quantum_close_message, quantum_split_digest, quantum_split_message,
-        ActionDescriptor, ActionKind, AuthorityRotationStatement, PolicyDecisionEnvelope,
-        PolicyEvaluationRequest, PolicyReceipt, ThresholdRequirement,
-        WinterAuthorityAdvanceStatement, WinterAuthoritySecretKey, WinterAuthoritySignature,
-        WotsAuthProof, WotsSecretKey, WINTER_AUTHORITY_SIGNATURE_BYTES, WOTS_KEY_BYTES,
-        XMSS_AUTH_PATH_BYTES,
+        pqc_wallet_advance_message, quantum_close_digest, quantum_close_message,
+        quantum_split_digest, quantum_split_message, ActionDescriptor, ActionKind,
+        AuthorityRotationStatement, PolicyDecisionEnvelope, PolicyEvaluationRequest, PolicyReceipt,
+        ThresholdRequirement, WinterAuthorityAdvanceStatement, WinterAuthoritySecretKey,
+        WinterAuthoritySignature, WotsAuthProof, WotsSecretKey, WINTER_AUTHORITY_SIGNATURE_BYTES,
+        WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES,
     };
 
     fn descriptor(kind: ActionKind) -> ActionDescriptor {
@@ -1282,6 +1305,20 @@ mod tests {
         assert_eq!(&message[..8], &55u64.to_le_bytes());
         assert_eq!(&message[8..40], &[7; 32]);
         assert_eq!(&message[40..72], &[8; 32]);
+    }
+
+    #[test]
+    fn pqc_wallet_advance_message_is_bound_to_root_and_sequence() {
+        let first = pqc_wallet_advance_message([1; 32], [2; 32], [3; 32], [4; 32], 5, 6);
+        let second = pqc_wallet_advance_message([1; 32], [2; 32], [3; 32], [4; 32], 5, 7);
+        let third = pqc_wallet_advance_message([1; 32], [9; 32], [3; 32], [4; 32], 5, 6);
+
+        assert_ne!(first, second);
+        assert_ne!(first, third);
+        assert_eq!(&first[32..64], &[1; 32]);
+        assert_eq!(&first[64..96], &[2; 32]);
+        assert_eq!(&first[160..168], &5u64.to_le_bytes());
+        assert_eq!(&first[168..176], &6u64.to_le_bytes());
     }
 
     #[test]
