@@ -1,8 +1,7 @@
 //! Wallet-facing helpers for Vaulkyrie privacy intents.
 //!
-//! These helpers mirror the protocol-level privacy model that the Arcium MXE
-//! circuit is expected to compute over: compact encrypted signal lanes, an
-//! action-bound intent commitment, and a sealed receipt commitment.
+//! These helpers mirror the protocol-level privacy model for compact private
+//! intent signals, action-bound commitments, and sealed receipt commitments.
 
 use vaulkyrie_protocol::{
     build_privacy_request, evaluate_privacy, PrivacyComputationRequest, PrivacyDecision,

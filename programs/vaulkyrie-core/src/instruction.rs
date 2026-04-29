@@ -185,8 +185,8 @@ pub enum CoreInstruction {
     CommitSpendOrchestration(CommitSpendOrchestrationArgs),
     CompleteSpendOrchestration(CompleteSpendOrchestrationArgs),
     FailSpendOrchestration(FailSpendOrchestrationArgs),
-    /// Stage a policy receipt that has been cross-validated against a
-    /// finalized `PolicyEvaluationState` account owned by vaulkyrie-policy-mxe.
+    /// Stage a receipt that has been cross-validated against an external
+    /// finalized receipt account owned by the configured bridge program.
     StageBridgedReceipt(PolicyReceipt),
     /// PQC-authorized recovery initiation when the threshold signing group
     /// is lost. Requires a valid WOTS+ proof on the authority account.

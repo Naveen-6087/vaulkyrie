@@ -708,7 +708,7 @@ fn bridged_receipt_stages_from_finalized_eval() {
     let mut receipt_buf = vec![0u8; PolicyReceiptState::LEN];
     let receipt = make_receipt(1);
 
-    // Mock PolicyEvaluationState from policy-mxe (must match the layout
+    // Mock finalized bridged receipt account (must match the legacy layout
     // that validate_bridged_receipt_claim reads):
     //   [0..8]     = discriminator "POLEVAL1"
     //   [72..104]  = action_hash

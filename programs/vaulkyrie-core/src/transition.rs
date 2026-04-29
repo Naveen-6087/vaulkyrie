@@ -148,13 +148,12 @@ pub fn validate_vault_for_receipt(
     Ok(())
 }
 
-/// Cross-validates a receipt against a `PolicyEvaluationState` byte slice owned
-/// by `vaulkyrie-policy-mxe`.
+/// Cross-validates a receipt against an external finalized receipt byte slice.
 ///
-/// Layout invariants (see `PolicyEvaluationState::encode`):
+/// Layout invariants:
 /// - `bytes[0..8]`   == `b"POLEVAL1"` (discriminator)
-/// Validates that the policy evaluation account is owned by the expected
-/// policy-MXE program stored in the vault registry.
+/// Validates that the bridge account is owned by the expected program stored
+/// in the vault registry.
 pub fn validate_eval_account_owner(
     eval_account_owner: &[u8; 32],
     vault: &VaultRegistry,
@@ -165,7 +164,7 @@ pub fn validate_eval_account_owner(
     Ok(())
 }
 
-/// Validates a cross-program PolicyEvaluationState against a staged receipt.
+/// Validates a cross-program finalized receipt claim against a staged receipt.
 /// Checks:
 /// - Minimum length (256 bytes)
 /// - `bytes[0..8]`    == `POLEVAL1` (discriminator)

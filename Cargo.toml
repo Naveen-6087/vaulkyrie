@@ -6,10 +6,6 @@ members = [
     "crates/vaulkyrie-protocol",
     "crates/vaulkyrie-sdk",
     "programs/vaulkyrie-core",
-    "programs/vaulkyrie-policy-mxe",
-]
-exclude = [
-    "crates/encrypted-ixs",
 ]
 resolver = "2"
 
@@ -40,4 +36,3 @@ blake3 = "=1.5.5"
 
 [profile.release]
 overflow-checks = true
-

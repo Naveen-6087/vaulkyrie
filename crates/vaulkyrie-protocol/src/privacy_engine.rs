@@ -40,11 +40,11 @@ tiny_enum!(PrivacyAsset {
     Usdc = 2,
 });
 
-tiny_enum!(PrivacyProvider {
-    NativeArcium = 1,
-    Houdini = 2,
-    Encifher = 3,
-    Umbra = 4,
+tiny_enum!(PrivacyExecutionModel {
+    ShieldedState = 1,
+    ExternalPrivateSwap = 2,
+    ConfidentialIntent = 3,
+    OneTimeWallet = 4,
 });
 
 tiny_enum!(PrivacyAmountBucket {
@@ -104,7 +104,7 @@ pub struct PrivacyIntent {
     pub asset: PrivacyAsset,
     pub amount_atoms: u64,
     pub counterparty_commitment: [u8; 32],
-    pub provider: PrivacyProvider,
+    pub execution_model: PrivacyExecutionModel,
     pub nonce: u64,
     pub expiry_slot: u64,
     pub flags: u16,
@@ -123,7 +123,7 @@ impl PrivacyIntent {
         dst[33] = self.asset.as_byte();
         dst[34..42].copy_from_slice(&self.amount_atoms.to_le_bytes());
         dst[42..74].copy_from_slice(&self.counterparty_commitment);
-        dst[74] = self.provider.as_byte();
+        dst[74] = self.execution_model.as_byte();
         dst[75..83].copy_from_slice(&self.nonce.to_le_bytes());
         dst[83..91].copy_from_slice(&self.expiry_slot.to_le_bytes());
         dst[91..93].copy_from_slice(&self.flags.to_le_bytes());
@@ -160,7 +160,7 @@ impl PrivacyIntent {
             asset: PrivacyAsset::try_from(src[33]).ok()?,
             amount_atoms: u64::from_le_bytes(amount_atoms),
             counterparty_commitment,
-            provider: PrivacyProvider::try_from(src[74]).ok()?,
+            execution_model: PrivacyExecutionModel::try_from(src[74]).ok()?,
             nonce: u64::from_le_bytes(nonce),
             expiry_slot: u64::from_le_bytes(expiry_slot),
             flags: u16::from_le_bytes(flags),
@@ -186,7 +186,7 @@ pub struct PrivacySignals {
     pub pool_bucket: PrivacyPoolBucket,
     pub route_risk: PrivacyRouteRisk,
     pub disclosure_mode: PrivacyDisclosureMode,
-    pub provider: PrivacyProvider,
+    pub execution_model: PrivacyExecutionModel,
     pub flags: u16,
 }
 
@@ -200,7 +200,7 @@ impl PrivacySignals {
             | ((self.pool_bucket.as_byte() as u128) << 24)
             | ((self.route_risk.as_byte() as u128) << 32)
             | ((self.disclosure_mode.as_byte() as u128) << 40)
-            | ((self.provider.as_byte() as u128) << 48)
+            | ((self.execution_model.as_byte() as u128) << 48)
             | ((self.flags as u128) << 56);
 
         [lane_0, 0]
@@ -217,7 +217,7 @@ impl PrivacySignals {
             pool_bucket: PrivacyPoolBucket::try_from(code(24)).ok()?,
             route_risk: PrivacyRouteRisk::try_from(code(32)).ok()?,
             disclosure_mode: PrivacyDisclosureMode::try_from(code(40)).ok()?,
-            provider: PrivacyProvider::try_from(code(48)).ok()?,
+            execution_model: PrivacyExecutionModel::try_from(code(48)).ok()?,
             flags: ((lane_0 >> 56) & 0xffff) as u16,
         })
     }
@@ -256,7 +256,7 @@ impl PrivacyComputationRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrivacyDecision {
     pub approved: bool,
-    pub provider: PrivacyProvider,
+    pub execution_model: PrivacyExecutionModel,
     pub decision_flags: u16,
     pub privacy_score: u8,
     pub min_confirmations: u8,
@@ -272,7 +272,7 @@ impl PrivacyDecision {
         hasher.update(PRIVACY_DOMAIN_RECEIPT);
         hasher.update(request.commitment());
         hasher.update([self.approved as u8]);
-        hasher.update([self.provider.as_byte()]);
+        hasher.update([self.execution_model.as_byte()]);
         hasher.update(self.decision_flags.to_le_bytes());
         hasher.update([self.privacy_score]);
         hasher.update([self.min_confirmations]);
@@ -345,7 +345,7 @@ pub fn evaluate_privacy(signals: &PrivacySignals) -> PrivacyDecision {
         flags |= PRIVACY_DECISION_DISCLOSURE_AVAILABLE;
     }
 
-    if signals.provider == PrivacyProvider::NativeArcium {
+    if signals.execution_model == PrivacyExecutionModel::ShieldedState {
         flags |= PRIVACY_DECISION_ROUTE_NATIVE;
     } else {
         flags |= PRIVACY_DECISION_ROUTE_PROVIDER;
@@ -362,7 +362,7 @@ pub fn evaluate_privacy(signals: &PrivacySignals) -> PrivacyDecision {
 
     PrivacyDecision {
         approved,
-        provider: signals.provider,
+        execution_model: signals.execution_model,
         decision_flags: flags,
         privacy_score: if !approved {
             0
@@ -384,11 +384,11 @@ pub fn evaluate_privacy(signals: &PrivacySignals) -> PrivacyDecision {
 mod tests {
     use super::{
         build_privacy_request, evaluate_privacy, PrivacyAction, PrivacyAmountBucket, PrivacyAsset,
-        PrivacyDisclosureMode, PrivacyIntent, PrivacyPoolBucket, PrivacyProvider, PrivacyRouteRisk,
-        PrivacySignals, PRIVACY_DECISION_BLOCKED, PRIVACY_DECISION_DISCLOSURE_AVAILABLE,
-        PRIVACY_DECISION_LINKABILITY_WARNING, PRIVACY_FLAG_ONE_TIME_ADDRESS,
-        PRIVACY_FLAG_SELECTIVE_DISCLOSURE, PRIVACY_FLAG_STEALTH_RECIPIENT,
-        PRIVACY_FLAG_WITHDRAW_LINKABLE,
+        PrivacyDisclosureMode, PrivacyExecutionModel, PrivacyIntent, PrivacyPoolBucket,
+        PrivacyRouteRisk, PrivacySignals, PRIVACY_DECISION_BLOCKED,
+        PRIVACY_DECISION_DISCLOSURE_AVAILABLE, PRIVACY_DECISION_LINKABILITY_WARNING,
+        PRIVACY_FLAG_ONE_TIME_ADDRESS, PRIVACY_FLAG_SELECTIVE_DISCLOSURE,
+        PRIVACY_FLAG_STEALTH_RECIPIENT, PRIVACY_FLAG_WITHDRAW_LINKABLE,
     };
 
     fn sample_intent() -> PrivacyIntent {
@@ -398,7 +398,7 @@ mod tests {
             asset: PrivacyAsset::Usdc,
             amount_atoms: 25_000_000,
             counterparty_commitment: [2; 32],
-            provider: PrivacyProvider::NativeArcium,
+            execution_model: PrivacyExecutionModel::ShieldedState,
             nonce: 9,
             expiry_slot: 1_000,
             flags: PRIVACY_FLAG_STEALTH_RECIPIENT | PRIVACY_FLAG_ONE_TIME_ADDRESS,
@@ -413,7 +413,7 @@ mod tests {
             pool_bucket: PrivacyPoolBucket::Healthy,
             route_risk: PrivacyRouteRisk::Low,
             disclosure_mode: PrivacyDisclosureMode::SelectiveAudit,
-            provider: PrivacyProvider::NativeArcium,
+            execution_model: PrivacyExecutionModel::ShieldedState,
             flags: PRIVACY_FLAG_STEALTH_RECIPIENT
                 | PRIVACY_FLAG_ONE_TIME_ADDRESS
                 | PRIVACY_FLAG_SELECTIVE_DISCLOSURE,
