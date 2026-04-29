@@ -14,8 +14,8 @@ use pinocchio::{
 use solana_winternitz::signature::WinternitzSignature;
 use vaulkyrie_protocol::{
     pqc_wallet_advance_message, AuthorityRotationStatement, PolicyReceipt, WotsAuthProof,
-    PQC_WALLET_SEED, QUANTUM_AUTHORITY_SEED, QUANTUM_VAULT_SEED, SPEND_ORCH_SEED,
-    VAULT_REGISTRY_SEED,
+    POLICY_RECEIPT_SEED, PQC_WALLET_SEED, QUANTUM_AUTHORITY_SEED, QUANTUM_VAULT_SEED,
+    SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
 };
 
 use crate::{
@@ -121,11 +121,11 @@ pub fn process(
             let current_slot = current_slot()?;
             let vault_account = get_account_info!(accounts, 0);
             require_program_owner(program_id, vault_account)?;
+            let wallet_signer = get_account_info!(accounts, 2);
 
             {
                 let vault_data = vault_account.try_borrow_data()?;
                 let vault = decode_vault_state(&vault_data)?;
-                let wallet_signer = get_account_info!(accounts, 2);
                 require_wallet_authority(&vault, wallet_signer)?;
             }
 
@@ -133,6 +133,17 @@ pub fn process(
 
             let receipt_account = get_account_info!(accounts, 1);
             require_writable(receipt_account)?;
+            if receipt_account.owner() != program_id {
+                let system_program = get_account_info!(accounts, 3);
+                create_policy_receipt_account(
+                    program_id,
+                    vault_account,
+                    receipt_account,
+                    wallet_signer,
+                    system_program,
+                    &receipt,
+                )?;
+            }
             require_program_owner(program_id, receipt_account)?;
             let mut receipt_data = receipt_account.try_borrow_mut_data()?;
 
@@ -584,17 +595,28 @@ pub fn process(
             let current_slot = current_slot()?;
             let vault_account = get_account_info!(accounts, 0);
             require_program_owner(program_id, vault_account)?;
+            let wallet_signer = get_account_info!(accounts, 2);
 
             let receipt_account = get_account_info!(accounts, 1);
             require_writable(receipt_account)?;
-            require_program_owner(program_id, receipt_account)?;
-
-            let wallet_signer = get_account_info!(accounts, 2);
             {
                 let vault_data = vault_account.try_borrow_data()?;
                 let vault = decode_vault_state(&vault_data)?;
                 require_wallet_authority(&vault, wallet_signer)?;
             }
+
+            if receipt_account.owner() != program_id {
+                let system_program = get_account_info!(accounts, 4);
+                create_policy_receipt_account(
+                    program_id,
+                    vault_account,
+                    receipt_account,
+                    wallet_signer,
+                    system_program,
+                    &receipt,
+                )?;
+            }
+            require_program_owner(program_id, receipt_account)?;
 
             // [3] = policy_eval account (readonly, owner validated against vault)
             let policy_eval_account = get_account_info!(accounts, 3);
@@ -813,6 +835,14 @@ fn pqc_wallet_signer_seed_slices<'a>(
     [PQC_WALLET_SEED, wallet_id, bump_seed]
 }
 
+fn policy_receipt_signer_seed_slices<'a>(
+    vault_id: &'a [u8; 32],
+    action_hash: &'a [u8; 32],
+    bump_seed: &'a [u8; 1],
+) -> [&'a [u8]; 4] {
+    [POLICY_RECEIPT_SEED, vault_id, action_hash, bump_seed]
+}
+
 fn rent_minimum_balance(data_len: usize) -> Result<u64, ProgramError> {
     #[cfg(any(feature = "bpf-entrypoint", target_os = "solana"))]
     {
@@ -859,6 +889,42 @@ fn create_program_owned_account(
     };
 
     invoke_signed(&instruction, &[payer, new_account], signers)
+}
+
+fn create_policy_receipt_account(
+    program_id: &pinocchio::pubkey::Pubkey,
+    vault_account: &AccountInfo,
+    receipt_account: &AccountInfo,
+    payer: &AccountInfo,
+    system_program: &AccountInfo,
+    receipt: &PolicyReceipt,
+) -> ProgramResult {
+    let bump = pda::find_policy_receipt_bump(
+        receipt_account.key(),
+        vault_account.key(),
+        &receipt.action_hash,
+        program_id,
+    )?;
+    let bump_seed = [bump];
+    let signer_seed_bytes =
+        policy_receipt_signer_seed_slices(vault_account.key(), &receipt.action_hash, &bump_seed);
+    let seeds = [
+        Seed::from(signer_seed_bytes[0]),
+        Seed::from(signer_seed_bytes[1]),
+        Seed::from(signer_seed_bytes[2]),
+        Seed::from(signer_seed_bytes[3]),
+    ];
+    let signers = [Signer::from(&seeds)];
+    let lamports = Rent::get()?.minimum_balance(PolicyReceiptState::LEN);
+    create_program_owned_account(
+        program_id,
+        payer,
+        receipt_account,
+        system_program,
+        &signers,
+        lamports,
+        PolicyReceiptState::LEN as u64,
+    )
 }
 
 fn process_open_vault_registry(

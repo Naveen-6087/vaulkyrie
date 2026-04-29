@@ -76,6 +76,27 @@ pub fn verify_policy_receipt(
     Ok(())
 }
 
+pub fn find_policy_receipt_bump(
+    expected_key: &Pubkey,
+    vault_id: &[u8; 32],
+    action_hash: &[u8; 32],
+    program_id: &Pubkey,
+) -> Result<u8, ProgramError> {
+    let mut bump = u8::MAX;
+    loop {
+        if let Ok(derived) = derive_policy_receipt(vault_id, action_hash, bump, program_id) {
+            if &derived == expected_key {
+                return Ok(bump);
+            }
+        }
+        if bump == 0 {
+            break;
+        }
+        bump = bump.saturating_sub(1);
+    }
+    Err(ProgramError::InvalidSeeds)
+}
+
 // ── ActionSessionState PDA ─────────────────────────────────────────────────
 // Seeds: ["action_session", vault_id, action_hash, bump]
 

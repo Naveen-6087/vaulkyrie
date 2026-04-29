@@ -11,6 +11,10 @@ use vaulkyrie_protocol::{
     WinterAuthoritySignature, WotsAuthProof, AUTHORITY_PROOF_CHUNK_MAX_BYTES,
 };
 
+fn system_program_id() -> Pubkey {
+    Pubkey::from([0u8; 32])
+}
+
 // ─── Discriminators ──────────────────────────────────────────────────────────
 const DISC_PING: u8 = 0;
 const DISC_INIT_VAULT: u8 = 1;
@@ -206,7 +210,8 @@ pub fn stage_receipt(
         vec![
             AccountMeta::new_readonly(*vault, false),
             AccountMeta::new(*receipt_account, false),
-            AccountMeta::new_readonly(*wallet_signer, true),
+            AccountMeta::new(*wallet_signer, true),
+            AccountMeta::new_readonly(system_program_id(), false),
         ],
     )
 }
@@ -690,8 +695,9 @@ pub fn stage_bridged_receipt(
         vec![
             AccountMeta::new_readonly(*vault, false),
             AccountMeta::new(*receipt_account, false),
-            AccountMeta::new_readonly(*wallet_signer, true),
+            AccountMeta::new(*wallet_signer, true),
             AccountMeta::new_readonly(*policy_eval_account, false),
+            AccountMeta::new_readonly(system_program_id(), false),
         ],
     )
 }
@@ -835,6 +841,10 @@ mod tests {
         let ix = stage_receipt(&pid(), &key(2), &key(3), &key(4), &receipt);
         assert_eq!(ix.data[0], 4);
         assert_eq!(ix.data.len(), 1 + 57);
+        assert_eq!(ix.accounts.len(), 4);
+        assert!(ix.accounts[2].is_signer);
+        assert!(ix.accounts[2].is_writable);
+        assert_eq!(ix.accounts[3].pubkey, system_program_id());
     }
 
     #[test]
@@ -921,7 +931,10 @@ mod tests {
         let ix = stage_bridged_receipt(&pid(), &key(2), &key(3), &key(4), &key(5), &receipt);
         assert_eq!(ix.data[0], 21);
         assert_eq!(ix.data.len(), 1 + 57);
-        assert_eq!(ix.accounts.len(), 4);
+        assert_eq!(ix.accounts.len(), 5);
+        assert!(ix.accounts[2].is_signer);
+        assert!(ix.accounts[2].is_writable);
+        assert_eq!(ix.accounts[4].pubkey, system_program_id());
     }
 
     #[test]
