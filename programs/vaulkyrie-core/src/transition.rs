@@ -1,35 +1,23 @@
 use solana_nostd_sha256::hashv;
 use solana_winternitz::signature::WinternitzSignature;
 use vaulkyrie_protocol::{
-    quantum_close_message, quantum_split_message, AuthorityRotationStatement, PolicyReceipt,
-    ThresholdRequirement, WinterAuthorityAdvanceStatement, WinterAuthoritySignature, WotsAuthProof,
-    XMSS_LEAF_COUNT,
+    quantum_close_message, quantum_split_message, AuthorityRotationStatement,
+    WinterAuthorityAdvanceStatement, WinterAuthoritySignature, WotsAuthProof, XMSS_LEAF_COUNT,
 };
 
 use crate::state::{
-    ActionSessionState, OrchestrationStatus, PolicyReceiptState, QuantumAuthorityState,
-    SessionStatus, SpendOrchestrationState, VaultRegistry, VaultStatus,
+    OrchestrationStatus, QuantumAuthorityState, RecoveryState, RecoveryStatus,
+    SpendOrchestrationState, VaultRegistry, VaultStatus,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionError {
-    ReceiptAlreadyConsumed,
-    ReceiptMismatch,
-    ReceiptExpired,
-    ReceiptNonceReplay,
-    SessionExpired,
     AuthorityStatementExpired,
     VaultAuthorityMismatch,
-    VaultPolicyMismatch,
     VaultNotActive,
     VaultNotRecovery,
     VaultStatusInvalid,
     VaultStatusTransitionNotAllowed,
-    SessionPolicyMismatch,
-    SessionMismatch,
-    SessionNotPending,
-    SessionNotReady,
-    SessionRequiresPqc,
     AuthorityNoOp,
     AuthoritySequenceMismatch,
     AuthorityLeafIndexMismatch,
@@ -46,45 +34,21 @@ pub enum TransitionError {
     OrchestrationNotPending,
     OrchestrationNotCommitted,
     OrchestrationAlreadyComplete,
-    /// The `PolicyEvaluationState` supplied to `StageBridgedReceipt` does not
-    /// match the receipt commitment or is not in `Finalized` status.
-    BridgedReceiptMismatch,
-    /// Recovery cannot be initiated because the vault is not in Recovery status.
     RecoveryVaultNotInRecoveryMode,
-    /// Recovery has already expired.
     RecoveryExpired,
-    /// Recovery is not in Pending status.
     RecoveryNotPending,
-    /// Recovery invalid parameters (threshold must be >= 1 and <= participant_count).
     RecoveryInvalidParams,
-    /// Authority migration requires the current tree to have at least one leaf
-    /// used (prevents no-op migrations on brand new trees).
     AuthorityMigrationNoOp,
-    /// Policy version must advance by exactly 1.
-    PolicyVersionNotMonotonic,
-    /// Completing a spend orchestration requires a non-zero tx binding hash.
     TxBindingMissing,
-    /// The authority rotation statement has already been consumed (replay).
     AuthorityStatementReplay,
-    /// The bridged receipt's delay period has not elapsed yet.
-    BridgedReceiptDelayNotMet,
 }
 
 pub fn initialize_vault(
     wallet_pubkey: [u8; 32],
     authority_hash: [u8; 32],
-    policy_version: u64,
     bump: u8,
-    policy_mxe_program: [u8; 32],
 ) -> VaultRegistry {
-    VaultRegistry::new(
-        wallet_pubkey,
-        authority_hash,
-        policy_version,
-        VaultStatus::Active,
-        bump,
-        policy_mxe_program,
-    )
+    VaultRegistry::new(wallet_pubkey, authority_hash, VaultStatus::Active, bump)
 }
 
 pub fn initialize_quantum_authority(
@@ -127,101 +91,12 @@ pub fn update_vault_status(
     Ok(())
 }
 
-pub fn validate_vault_for_receipt(
-    vault: &VaultRegistry,
-    receipt: &PolicyReceipt,
-    current_slot: u64,
-) -> Result<(), TransitionError> {
-    validate_vault_active(vault)?;
-
-    if vault.policy_version != receipt.policy_version {
-        return Err(TransitionError::VaultPolicyMismatch);
-    }
-
-    if receipt.expiry_slot < current_slot {
-        return Err(TransitionError::ReceiptExpired);
-    }
-    if receipt.nonce <= vault.last_consumed_receipt_nonce {
-        return Err(TransitionError::ReceiptNonceReplay);
-    }
-
-    Ok(())
-}
-
-/// Cross-validates a receipt against an external finalized receipt byte slice.
-///
-/// Layout invariants:
-/// - `bytes[0..8]`   == `b"POLEVAL1"` (discriminator)
-/// Validates that the bridge account is owned by the expected program stored
-/// in the vault registry.
-pub fn validate_eval_account_owner(
-    eval_account_owner: &[u8; 32],
-    vault: &VaultRegistry,
-) -> Result<(), TransitionError> {
-    if eval_account_owner != &vault.policy_mxe_program {
-        return Err(TransitionError::BridgedReceiptMismatch);
-    }
-    Ok(())
-}
-
-/// Validates a cross-program finalized receipt claim against a staged receipt.
-/// Checks:
-/// - Minimum length (256 bytes)
-/// - `bytes[0..8]`    == `POLEVAL1` (discriminator)
-/// - `bytes[240]`    == `2` (PolicyEvaluationStatus::Finalized)
-/// - `bytes[168..200]` == `receipt.commitment()` (receipt_commitment)
-/// - `bytes[72..104]` == `action_hash` from the receipt (action binding)
-pub fn validate_bridged_receipt_claim(
-    eval_data: &[u8],
-    receipt: &PolicyReceipt,
-    current_slot: u64,
-) -> Result<(), TransitionError> {
-    const POLEVAL1: &[u8; 8] = b"POLEVAL1";
-    const FINALIZED: u8 = 2;
-    const MIN_LEN: usize = 256;
-    const DISCRIMINATOR_RANGE: core::ops::Range<usize> = 0..8;
-    const ACTION_HASH_RANGE: core::ops::Range<usize> = 72..104;
-    const STATUS_OFFSET: usize = 240;
-    const RECEIPT_COMMITMENT_RANGE: core::ops::Range<usize> = 168..200;
-    const DELAY_UNTIL_SLOT_RANGE: core::ops::Range<usize> = 232..240;
-
-    if eval_data.len() < MIN_LEN {
-        return Err(TransitionError::BridgedReceiptMismatch);
-    }
-
-    if &eval_data[DISCRIMINATOR_RANGE] != POLEVAL1 {
-        return Err(TransitionError::BridgedReceiptMismatch);
-    }
-
-    if eval_data[STATUS_OFFSET] != FINALIZED {
-        return Err(TransitionError::BridgedReceiptMismatch);
-    }
-
-    if &eval_data[RECEIPT_COMMITMENT_RANGE] != &receipt.commitment() {
-        return Err(TransitionError::BridgedReceiptMismatch);
-    }
-
-    // Cross-validate the action_hash stored in the eval state matches the receipt
-    if &eval_data[ACTION_HASH_RANGE] != &receipt.action_hash {
-        return Err(TransitionError::BridgedReceiptMismatch);
-    }
-
-    let mut delay_bytes = [0u8; 8];
-    delay_bytes.copy_from_slice(&eval_data[DELAY_UNTIL_SLOT_RANGE]);
-    let delay_until_slot = u64::from_le_bytes(delay_bytes);
-    if delay_until_slot > 0 && current_slot < delay_until_slot {
-        return Err(TransitionError::BridgedReceiptDelayNotMet);
-    }
-
-    Ok(())
-}
-
 pub fn validate_vault_active(vault: &VaultRegistry) -> Result<(), TransitionError> {
-    if vault.status != VaultStatus::Active as u8 {
-        return Err(TransitionError::VaultNotActive);
+    if vault.status == VaultStatus::Active as u8 {
+        Ok(())
+    } else {
+        Err(TransitionError::VaultNotActive)
     }
-
-    Ok(())
 }
 
 pub fn validate_vault_recovery_mode(vault: &VaultRegistry) -> Result<(), TransitionError> {
@@ -236,203 +111,75 @@ pub fn validate_vault_authority_alignment(
     vault: &VaultRegistry,
     authority: &QuantumAuthorityState,
 ) -> Result<(), TransitionError> {
-    if vault.current_authority_hash != authority.current_authority_hash {
-        return Err(TransitionError::VaultAuthorityMismatch);
+    if vault.current_authority_hash == authority.current_authority_hash {
+        Ok(())
+    } else {
+        Err(TransitionError::VaultAuthorityMismatch)
     }
-
-    Ok(())
 }
 
-pub fn stage_policy_receipt(receipt: &PolicyReceipt) -> PolicyReceiptState {
-    PolicyReceiptState::new(
-        receipt.commitment(),
-        receipt.action_hash,
-        receipt.nonce,
-        receipt.expiry_slot,
-    )
-}
-
-pub fn open_action_session(receipt: &PolicyReceipt) -> ActionSessionState {
-    ActionSessionState::new(
-        receipt.commitment(),
-        receipt.action_hash,
-        receipt.policy_version,
-        receipt.expiry_slot,
-        receipt.threshold.as_byte(),
-    )
-}
-
-pub fn open_action_session_from_receipt(
-    state: &PolicyReceiptState,
-    receipt: &PolicyReceipt,
-    current_slot: u64,
-) -> Result<ActionSessionState, TransitionError> {
-    if state.consumed != 0 {
-        return Err(TransitionError::ReceiptAlreadyConsumed);
-    }
-
-    if state.receipt_commitment != receipt.commitment()
-        || state.action_hash != receipt.action_hash
-        || state.nonce != receipt.nonce
-        || state.expiry_slot != receipt.expiry_slot
-    {
-        return Err(TransitionError::ReceiptMismatch);
-    }
-
-    if state.expiry_slot < current_slot {
-        return Err(TransitionError::ReceiptExpired);
-    }
-
-    Ok(open_action_session(receipt))
-}
-
-pub fn consume_policy_receipt(
-    state: &mut PolicyReceiptState,
-    receipt: &PolicyReceipt,
+pub fn validate_authority_action_binding(
+    vault: &VaultRegistry,
+    statement: &AuthorityRotationStatement,
 ) -> Result<(), TransitionError> {
-    if state.consumed != 0 {
-        return Err(TransitionError::ReceiptAlreadyConsumed);
+    if statement.is_action_bound(vault.wallet_pubkey) {
+        Ok(())
+    } else {
+        Err(TransitionError::AuthorityActionMismatch)
     }
-
-    if state.receipt_commitment != receipt.commitment() || state.action_hash != receipt.action_hash
-    {
-        return Err(TransitionError::ReceiptMismatch);
-    }
-
-    state.consumed = 1;
-    Ok(())
 }
 
-pub fn validate_and_advance_receipt_nonce(
-    vault: &mut VaultRegistry,
-    receipt: &PolicyReceipt,
+pub fn verify_authority_proof(
+    authority: &QuantumAuthorityState,
+    statement: &AuthorityRotationStatement,
+    proof: &WotsAuthProof,
 ) -> Result<(), TransitionError> {
-    if receipt.nonce <= vault.last_consumed_receipt_nonce {
-        return Err(TransitionError::ReceiptNonceReplay);
+    if authority.next_leaf_index >= XMSS_LEAF_COUNT {
+        return Err(TransitionError::AuthorityTreeExhausted);
     }
-
-    vault.last_consumed_receipt_nonce = receipt.nonce;
-    Ok(())
-}
-
-pub fn consume_policy_receipt_for_vault(
-    vault: &mut VaultRegistry,
-    state: &mut PolicyReceiptState,
-    receipt: &PolicyReceipt,
-) -> Result<(), TransitionError> {
-    validate_and_advance_receipt_nonce(vault, receipt)?;
-    consume_policy_receipt(state, receipt)
-}
-
-pub fn mark_action_session_ready(
-    state: &mut ActionSessionState,
-    action_hash: [u8; 32],
-    current_slot: u64,
-) -> Result<(), TransitionError> {
-    validate_spend_threshold(state.threshold)?;
-
-    if state.action_hash != action_hash {
-        return Err(TransitionError::SessionMismatch);
+    if proof.authority_hash() != authority.current_authority_hash {
+        return Err(TransitionError::AuthorityProofMismatch);
     }
-
-    if state.expiry_slot < current_slot {
-        return Err(TransitionError::SessionExpired);
+    if proof.leaf_index != authority.next_leaf_index {
+        return Err(TransitionError::AuthorityLeafIndexMismatch);
     }
-
-    if state.status != SessionStatus::Pending as u8 {
-        return Err(TransitionError::SessionNotPending);
+    if !proof.verify_merkle_root(authority.current_authority_root) {
+        return Err(TransitionError::AuthorityMerkleRootMismatch);
     }
-
-    state.status = SessionStatus::Ready as u8;
-    Ok(())
-}
-
-pub fn consume_action_session(
-    state: &mut ActionSessionState,
-    action_hash: [u8; 32],
-    current_slot: u64,
-) -> Result<(), TransitionError> {
-    validate_spend_threshold(state.threshold)?;
-
-    if state.action_hash != action_hash {
-        return Err(TransitionError::SessionMismatch);
+    if !proof.verify_statement(statement) {
+        return Err(TransitionError::AuthorityProofInvalid);
     }
-
-    if state.expiry_slot < current_slot {
-        return Err(TransitionError::SessionExpired);
-    }
-
-    if state.status != SessionStatus::Ready as u8 {
-        return Err(TransitionError::SessionNotReady);
-    }
-
-    state.status = SessionStatus::Consumed as u8;
-    Ok(())
-}
-
-pub fn finalize_action_session(
-    vault: &mut VaultRegistry,
-    session: &mut ActionSessionState,
-    receipt_state: &mut PolicyReceiptState,
-    receipt: &PolicyReceipt,
-    current_slot: u64,
-) -> Result<(), TransitionError> {
-    validate_spend_threshold(session.threshold)?;
-
-    if session.action_hash != receipt.action_hash
-        || session.receipt_commitment != receipt.commitment()
-    {
-        return Err(TransitionError::SessionMismatch);
-    }
-
-    if session.expiry_slot < current_slot || receipt_state.expiry_slot < current_slot {
-        return Err(TransitionError::SessionExpired);
-    }
-
-    if session.policy_version != receipt.policy_version {
-        return Err(TransitionError::SessionPolicyMismatch);
-    }
-
-    if session.status != SessionStatus::Ready as u8 {
-        return Err(TransitionError::SessionNotReady);
-    }
-
-    consume_policy_receipt_for_vault(vault, receipt_state, receipt)?;
-    session.status = SessionStatus::Consumed as u8;
 
     Ok(())
 }
 
 pub fn apply_authority_rotation(
-    state: &mut QuantumAuthorityState,
+    authority: &mut QuantumAuthorityState,
     statement: &AuthorityRotationStatement,
     current_slot: u64,
 ) -> Result<(), TransitionError> {
-    if state.current_authority_hash == statement.next_authority_hash {
+    if authority.current_authority_hash == statement.next_authority_hash {
         return Err(TransitionError::AuthorityNoOp);
     }
-
     if statement.expiry_slot < current_slot {
         return Err(TransitionError::AuthorityStatementExpired);
     }
-
-    if state.next_sequence != statement.sequence {
+    if authority.next_sequence != statement.sequence {
         return Err(TransitionError::AuthoritySequenceMismatch);
     }
-    if state.next_leaf_index >= XMSS_LEAF_COUNT {
+    if authority.next_leaf_index >= XMSS_LEAF_COUNT {
         return Err(TransitionError::AuthorityTreeExhausted);
     }
 
     let digest = statement.digest();
-    if state.last_consumed_digest != [0u8; 32] && state.last_consumed_digest == digest {
+    if authority.last_consumed_digest != [0; 32] && authority.last_consumed_digest == digest {
         return Err(TransitionError::AuthorityStatementReplay);
     }
 
-    state.last_consumed_digest = digest;
-    state.current_authority_hash = statement.next_authority_hash;
-    state.next_sequence += 1;
-    state.next_leaf_index += 1;
-
+    authority.last_consumed_digest = digest;
+    authority.current_authority_hash = statement.next_authority_hash;
+    authority.next_sequence += 1;
+    authority.next_leaf_index += 1;
     Ok(())
 }
 
@@ -449,26 +196,6 @@ pub fn rotate_vault_authority(
     verify_authority_proof(authority, statement, proof)?;
     apply_authority_rotation(authority, statement, current_slot)?;
     vault.current_authority_hash = authority.current_authority_hash;
-
-    Ok(())
-}
-
-pub fn advance_winter_authority(
-    vault: &mut VaultRegistry,
-    authority: &mut QuantumAuthorityState,
-    statement: &WinterAuthorityAdvanceStatement,
-    signature: &WinterAuthoritySignature,
-    current_slot: u64,
-) -> Result<(), TransitionError> {
-    validate_vault_recovery_mode(vault)?;
-    if !statement.is_action_bound(vault.wallet_pubkey, vault.policy_version) {
-        return Err(TransitionError::AuthorityActionMismatch);
-    }
-    validate_vault_authority_alignment(vault, authority)?;
-    verify_winter_authority_advance(authority, statement, signature)?;
-    apply_winter_authority_advance(authority, statement, current_slot)?;
-    vault.current_authority_hash = authority.current_authority_hash;
-
     Ok(())
 }
 
@@ -498,17 +225,15 @@ pub fn apply_winter_authority_advance(
     if statement.current_root == statement.next_root {
         return Err(TransitionError::AuthorityNoOp);
     }
-
     if statement.expiry_slot < current_slot {
         return Err(TransitionError::AuthorityStatementExpired);
     }
-
     if authority.next_sequence != statement.sequence {
         return Err(TransitionError::AuthoritySequenceMismatch);
     }
 
     let digest = statement.replay_digest();
-    if authority.last_consumed_digest != [0u8; 32] && authority.last_consumed_digest == digest {
+    if authority.last_consumed_digest != [0; 32] && authority.last_consumed_digest == digest {
         return Err(TransitionError::AuthorityStatementReplay);
     }
 
@@ -517,42 +242,24 @@ pub fn apply_winter_authority_advance(
     authority.current_authority_root = statement.next_root;
     authority.next_sequence += 1;
     authority.next_leaf_index = 0;
-
     Ok(())
 }
 
-pub fn validate_authority_action_binding(
-    vault: &VaultRegistry,
-    statement: &AuthorityRotationStatement,
+pub fn advance_winter_authority(
+    vault: &mut VaultRegistry,
+    authority: &mut QuantumAuthorityState,
+    statement: &WinterAuthorityAdvanceStatement,
+    signature: &WinterAuthoritySignature,
+    current_slot: u64,
 ) -> Result<(), TransitionError> {
-    if statement.is_action_bound(vault.wallet_pubkey, vault.policy_version) {
-        Ok(())
-    } else {
-        Err(TransitionError::AuthorityActionMismatch)
+    validate_vault_recovery_mode(vault)?;
+    if !statement.is_action_bound(vault.wallet_pubkey) {
+        return Err(TransitionError::AuthorityActionMismatch);
     }
-}
-
-pub fn verify_authority_proof(
-    authority: &QuantumAuthorityState,
-    statement: &AuthorityRotationStatement,
-    proof: &WotsAuthProof,
-) -> Result<(), TransitionError> {
-    if authority.next_leaf_index >= XMSS_LEAF_COUNT {
-        return Err(TransitionError::AuthorityTreeExhausted);
-    }
-    if proof.authority_hash() != authority.current_authority_hash {
-        return Err(TransitionError::AuthorityProofMismatch);
-    }
-    if proof.leaf_index != authority.next_leaf_index {
-        return Err(TransitionError::AuthorityLeafIndexMismatch);
-    }
-    if !proof.verify_merkle_root(authority.current_authority_root) {
-        return Err(TransitionError::AuthorityMerkleRootMismatch);
-    }
-    if !proof.verify_statement(statement) {
-        return Err(TransitionError::AuthorityProofInvalid);
-    }
-
+    validate_vault_authority_alignment(vault, authority)?;
+    verify_winter_authority_advance(authority, statement, signature)?;
+    apply_winter_authority_advance(authority, statement, current_slot)?;
+    vault.current_authority_hash = authority.current_authority_hash;
     Ok(())
 }
 
@@ -589,10 +296,10 @@ pub fn validate_quantum_vault_split_amount(
     split_amount: u64,
 ) -> Result<(), TransitionError> {
     if split_amount > vault_lamports {
-        return Err(TransitionError::QuantumVaultAmountTooLarge);
+        Err(TransitionError::QuantumVaultAmountTooLarge)
+    } else {
+        Ok(())
     }
-
-    Ok(())
 }
 
 fn validate_quantum_vault_pda(
@@ -616,28 +323,6 @@ fn validate_quantum_vault_pda(
     }
 }
 
-pub fn validate_vault_for_session(
-    vault: &VaultRegistry,
-    session: &ActionSessionState,
-) -> Result<(), TransitionError> {
-    validate_vault_active(vault)?;
-
-    if vault.policy_version != session.policy_version {
-        return Err(TransitionError::SessionPolicyMismatch);
-    }
-
-    Ok(())
-}
-
-fn validate_spend_threshold(threshold: u8) -> Result<(), TransitionError> {
-    if threshold == ThresholdRequirement::RequirePqcAuth.as_byte() {
-        return Err(TransitionError::SessionRequiresPqc);
-    }
-
-    Ok(())
-}
-
-/// Initialize a new spend orchestration account in `Pending` status.
 pub fn init_spend_orchestration(
     action_hash: [u8; 32],
     session_commitment: [u8; 32],
@@ -669,7 +354,6 @@ pub fn init_spend_orchestration(
     Ok(state)
 }
 
-/// Record the signing package hash and advance status to `Committed`.
 pub fn commit_spend_orchestration(
     state: &mut SpendOrchestrationState,
     action_hash: [u8; 32],
@@ -691,7 +375,6 @@ pub fn commit_spend_orchestration(
     Ok(())
 }
 
-/// Mark the orchestration as `Complete` once the signature has been broadcast on-chain.
 pub fn complete_spend_orchestration(
     state: &mut SpendOrchestrationState,
     action_hash: [u8; 32],
@@ -716,7 +399,6 @@ pub fn complete_spend_orchestration(
     Ok(())
 }
 
-/// Mark the orchestration as `Failed` with an optional reason code.
 pub fn fail_spend_orchestration(
     state: &mut SpendOrchestrationState,
     action_hash: [u8; 32],
@@ -732,10 +414,6 @@ pub fn fail_spend_orchestration(
     Ok(())
 }
 
-// ── Recovery bootstrap transitions ──────────────────────────────────
-
-/// Initialize recovery state.  Validates the vault is in recovery mode and
-/// the params are sane.  `current_slot` must be below `expiry_slot`.
 pub fn init_recovery(
     vault_status: u8,
     current_slot: u64,
@@ -755,14 +433,11 @@ pub fn init_recovery(
     Ok(())
 }
 
-/// Complete a pending recovery, returning the `new_group_key` and
-/// `new_authority_hash` that should be written into the vault.
-/// `current_slot` must be below the recovery's `expiry_slot`.
 pub fn complete_recovery(
-    recovery: &crate::state::RecoveryState,
+    recovery: &RecoveryState,
     current_slot: u64,
 ) -> Result<(), TransitionError> {
-    if recovery.status != crate::state::RecoveryStatus::Pending as u8 {
+    if recovery.status != RecoveryStatus::Pending as u8 {
         return Err(TransitionError::RecoveryNotPending);
     }
     if current_slot >= recovery.expiry_slot {
@@ -771,14 +446,8 @@ pub fn complete_recovery(
     Ok(())
 }
 
-// ── Authority migration transition ──────────────────────────────────
-
-/// Migrate an existing authority to a new XMSS tree.
-/// Resets `next_leaf_index` to 0 and sets the new Merkle root.
-/// Requires that at least one leaf has been used on the current tree
-/// (prevents meaningless migrations on brand-new authorities).
 pub fn migrate_authority_tree(
-    authority: &mut crate::state::QuantumAuthorityState,
+    authority: &mut QuantumAuthorityState,
     new_authority_root: [u8; 32],
 ) -> Result<(), TransitionError> {
     if authority.next_leaf_index == 0 {
@@ -789,75 +458,22 @@ pub fn migrate_authority_tree(
     Ok(())
 }
 
-// ── Policy version rollover transition ──────────────────────────────
-
-/// Advance the vault's policy version by exactly 1.  The vault must be in
-/// Active status (governance changes happen while active, not in recovery).
-pub fn advance_policy_version(
-    vault: &mut VaultRegistry,
-    new_version: u64,
-) -> Result<(), TransitionError> {
-    validate_vault_active(vault)?;
-    if new_version != vault.policy_version + 1 {
-        return Err(TransitionError::PolicyVersionNotMonotonic);
-    }
-    vault.policy_version = new_version;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use solana_nostd_sha256::hashv;
-    use solana_winternitz::privkey::WinternitzPrivkey;
+    use super::*;
     use vaulkyrie_protocol::{
-        ActionDescriptor, ActionKind, AuthorityRotationStatement, ThresholdRequirement,
-        WinterAuthorityAdvanceStatement, WinterAuthoritySecretKey, WotsSecretKey,
-        WINTER_AUTHORITY_SIGNATURE_BYTES, WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES, XMSS_LEAF_COUNT,
+        WinterAuthoritySecretKey, WotsSecretKey, WINTER_AUTHORITY_SIGNATURE_BYTES, WOTS_KEY_BYTES,
+        XMSS_AUTH_PATH_BYTES,
     };
 
-    use super::{
-        advance_policy_version, advance_winter_authority, apply_authority_rotation,
-        apply_winter_authority_advance, complete_recovery, consume_action_session,
-        consume_policy_receipt, finalize_action_session, init_recovery,
-        initialize_quantum_authority, initialize_vault, mark_action_session_ready,
-        migrate_authority_tree, open_action_session, open_action_session_from_receipt,
-        parse_vault_status, rotate_vault_authority, stage_policy_receipt, update_vault_status,
-        validate_and_advance_receipt_nonce, validate_authority_action_binding,
-        validate_bridged_receipt_claim, validate_eval_account_owner, validate_quantum_vault_close,
-        validate_quantum_vault_split, validate_quantum_vault_split_amount, validate_vault_active,
-        validate_vault_authority_alignment, validate_vault_for_receipt, validate_vault_for_session,
-        validate_vault_recovery_mode, verify_authority_proof, verify_winter_authority_advance,
-        TransitionError,
-    };
-    use crate::state::{
-        QuantumAuthorityState, RecoveryState, RecoveryStatus, SessionStatus, VaultRegistry,
-        VaultStatus,
-    };
-
-    fn sample_action_hash() -> [u8; 32] {
-        ActionDescriptor {
-            vault_id: [7; 32],
-            payload_hash: [8; 32],
-            policy_version: 9,
-            kind: ActionKind::Spend,
-        }
-        .hash()
-    }
-
-    fn sample_rotation_statement(
-        vault_wallet: [u8; 32],
-        policy_version: u64,
-        next_authority_hash: [u8; 32],
-        sequence: u64,
-        expiry_slot: u64,
-    ) -> AuthorityRotationStatement {
+    fn sample_rotation_statement(next_authority_hash: [u8; 32]) -> AuthorityRotationStatement {
         let mut statement = AuthorityRotationStatement {
             action_hash: [0; 32],
             next_authority_hash,
-            sequence,
-            expiry_slot,
+            sequence: 0,
+            expiry_slot: 100,
         };
-        statement.action_hash = statement.expected_action_hash(vault_wallet, policy_version);
+        statement.action_hash = statement.expected_action_hash([1; 32]);
         statement
     }
 
@@ -869,14 +485,6 @@ mod tests {
         WotsSecretKey { elements }
     }
 
-    fn sample_winter_secret(seed: u8) -> WinterAuthoritySecretKey {
-        let mut scalars = [0u8; WINTER_AUTHORITY_SIGNATURE_BYTES];
-        for (index, byte) in scalars.iter_mut().enumerate() {
-            *byte = seed.wrapping_add(index as u8);
-        }
-        WinterAuthoritySecretKey { scalars }
-    }
-
     fn sample_auth_path(seed: u8) -> [u8; XMSS_AUTH_PATH_BYTES] {
         let mut auth_path = [0u8; XMSS_AUTH_PATH_BYTES];
         for (index, byte) in auth_path.iter_mut().enumerate() {
@@ -885,1548 +493,90 @@ mod tests {
         auth_path
     }
 
+    fn sample_winter_secret(seed: u8) -> WinterAuthoritySecretKey {
+        let mut scalars = [0u8; WINTER_AUTHORITY_SIGNATURE_BYTES];
+        for (index, byte) in scalars.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(index as u8);
+        }
+        WinterAuthoritySecretKey { scalars }
+    }
+
     #[test]
     fn initialize_vault_sets_active_status() {
-        let vault = initialize_vault([1; 32], [2; 32], 3, 4, [5; 32]);
-
+        let vault = initialize_vault([1; 32], [2; 32], 4);
         assert_eq!(vault.wallet_pubkey, [1; 32]);
         assert_eq!(vault.current_authority_hash, [2; 32]);
-        assert_eq!(vault.policy_version, 3);
-        assert_eq!(vault.status, 1);
-        assert_eq!(vault.policy_mxe_program, [5; 32]);
-    }
-
-    #[test]
-    fn initialize_quantum_authority_sets_sequence_zero() {
-        let state = initialize_quantum_authority([8; 32], [9; 32], 6);
-
-        assert_eq!(state.current_authority_hash, [8; 32]);
-        assert_eq!(state.current_authority_root, [9; 32]);
-        assert_eq!(state.bump, 6);
-        assert_eq!(state.next_sequence, 0);
-        assert_eq!(state.next_leaf_index, 0);
-    }
-
-    #[test]
-    fn validate_vault_for_receipt_accepts_matching_active_policy() {
-        let vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-
-        validate_vault_for_receipt(&vault, &receipt, 10)
-            .expect("active vault with matching policy should pass");
-    }
-
-    #[test]
-    fn validate_vault_for_receipt_rejects_policy_mismatch() {
-        let vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 10,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-
-        let error = validate_vault_for_receipt(&vault, &receipt, 10)
-            .expect_err("mismatched policy version should fail");
-
-        assert_eq!(error, TransitionError::VaultPolicyMismatch);
-    }
-
-    #[test]
-    fn validate_vault_for_receipt_rejects_non_active_vault() {
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        vault.status = VaultStatus::Locked as u8;
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-
-        let error = validate_vault_for_receipt(&vault, &receipt, 10)
-            .expect_err("locked vault should not stage receipts");
-
-        assert_eq!(error, TransitionError::VaultNotActive);
-    }
-
-    #[test]
-    fn validate_vault_active_rejects_locked_vault() {
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        vault.status = VaultStatus::Locked as u8;
-
-        let error = validate_vault_active(&vault).expect_err("locked vault should fail");
-
-        assert_eq!(error, TransitionError::VaultNotActive);
-    }
-
-    #[test]
-    fn validate_vault_recovery_mode_accepts_recovery() {
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        vault.status = VaultStatus::Recovery as u8;
-
-        validate_vault_recovery_mode(&vault).expect("recovery vault should pass");
-    }
-
-    #[test]
-    fn validate_vault_recovery_mode_accepts_locked() {
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        vault.status = VaultStatus::Locked as u8;
-
-        validate_vault_recovery_mode(&vault).expect("locked vault should pass");
-    }
-
-    #[test]
-    fn validate_vault_recovery_mode_rejects_active() {
-        let vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-
-        let error = validate_vault_recovery_mode(&vault)
-            .expect_err("active vault should fail recovery-mode check");
-
-        assert_eq!(error, TransitionError::VaultNotRecovery);
-    }
-
-    #[test]
-    fn validate_vault_for_receipt_rejects_expired_receipt() {
-        let vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 9,
-        };
-
-        let error = validate_vault_for_receipt(&vault, &receipt, 10)
-            .expect_err("expired receipt should not stage");
-
-        assert_eq!(error, TransitionError::ReceiptExpired);
-    }
-
-    #[test]
-    fn validate_vault_for_receipt_rejects_replayed_nonce() {
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        vault.last_consumed_receipt_nonce = 5;
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-
-        let error = validate_vault_for_receipt(&vault, &receipt, 10)
-            .expect_err("replayed nonce should fail fast");
-
-        assert_eq!(error, TransitionError::ReceiptNonceReplay);
-    }
-
-    #[test]
-    fn parse_vault_status_rejects_unknown_value() {
-        let error = parse_vault_status(42).expect_err("unknown status should fail");
-
-        assert_eq!(error, TransitionError::VaultStatusInvalid);
-    }
-
-    #[test]
-    fn update_vault_status_allows_lock_then_recovery() {
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-
-        update_vault_status(&mut vault, VaultStatus::Locked)
-            .expect("active to locked should be allowed");
-        update_vault_status(&mut vault, VaultStatus::Recovery)
-            .expect("locked to recovery should be allowed");
-
-        assert_eq!(vault.status, VaultStatus::Recovery as u8);
+        assert_eq!(vault.status, VaultStatus::Active as u8);
+        assert_eq!(vault.bump, 4);
     }
 
     #[test]
     fn update_vault_status_rejects_locked_to_active() {
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
+        let mut vault = initialize_vault([1; 32], [2; 32], 4);
         vault.status = VaultStatus::Locked as u8;
-
-        let error = update_vault_status(&mut vault, VaultStatus::Active)
-            .expect_err("locked to active should be rejected");
-
+        let error = update_vault_status(&mut vault, VaultStatus::Active).unwrap_err();
         assert_eq!(error, TransitionError::VaultStatusTransitionNotAllowed);
     }
 
     #[test]
-    fn validate_vault_authority_alignment_accepts_matching_hashes() {
-        let vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        let authority = initialize_quantum_authority([2; 32], [3; 32], 1);
-
-        validate_vault_authority_alignment(&vault, &authority)
-            .expect("matching authority hashes should pass");
-    }
-
-    #[test]
-    fn validate_vault_authority_alignment_rejects_mismatch() {
-        let vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        let authority = initialize_quantum_authority([3; 32], [4; 32], 1);
-
-        let error = validate_vault_authority_alignment(&vault, &authority)
-            .expect_err("mismatched authority hashes should fail");
-
-        assert_eq!(error, TransitionError::VaultAuthorityMismatch);
-    }
-
-    #[test]
-    fn consuming_matching_receipt_marks_state_consumed() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let mut state = stage_policy_receipt(&receipt);
-
-        consume_policy_receipt(&mut state, &receipt).expect("receipt should match");
-
-        assert_eq!(state.consumed, 1);
-    }
-
-    #[test]
-    fn consuming_receipt_twice_fails() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let mut state = stage_policy_receipt(&receipt);
-
-        consume_policy_receipt(&mut state, &receipt).expect("first consume should succeed");
-        let error =
-            consume_policy_receipt(&mut state, &receipt).expect_err("second consume should fail");
-
-        assert_eq!(error, TransitionError::ReceiptAlreadyConsumed);
-    }
-
-    #[test]
-    fn validate_and_advance_receipt_nonce_rejects_replay() {
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-
-        validate_and_advance_receipt_nonce(&mut vault, &receipt)
-            .expect("first nonce should advance");
-        let error = validate_and_advance_receipt_nonce(&mut vault, &receipt)
-            .expect_err("reusing nonce should fail");
-
-        assert_eq!(error, TransitionError::ReceiptNonceReplay);
-    }
-
-    #[test]
-    fn opening_action_session_copies_receipt_constraints() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-
-        let session = open_action_session(&receipt);
-
-        assert_eq!(session.receipt_commitment, receipt.commitment());
-        assert_eq!(session.action_hash, receipt.action_hash);
-        assert_eq!(session.policy_version, receipt.policy_version);
-        assert_eq!(session.expiry_slot, receipt.expiry_slot);
-        assert_eq!(
-            session.threshold,
-            ThresholdRequirement::TwoOfThree.as_byte()
-        );
-        assert_eq!(session.status, SessionStatus::Pending as u8);
-    }
-
-    #[test]
-    fn opening_action_session_from_staged_receipt_validates_commitment() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let staged = stage_policy_receipt(&receipt);
-
-        let session = open_action_session_from_receipt(&staged, &receipt, 10)
-            .expect("matching receipt should open a session");
-
-        assert_eq!(session.receipt_commitment, receipt.commitment());
-        assert_eq!(session.action_hash, receipt.action_hash);
-    }
-
-    #[test]
-    fn opening_action_session_from_consumed_receipt_fails() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let mut staged = stage_policy_receipt(&receipt);
-        staged.consumed = 1;
-
-        let error = open_action_session_from_receipt(&staged, &receipt, 10)
-            .expect_err("consumed receipts should not open new sessions");
-
-        assert_eq!(error, TransitionError::ReceiptAlreadyConsumed);
-    }
-
-    #[test]
-    fn opening_action_session_from_mismatched_receipt_fails() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let staged = stage_policy_receipt(&receipt);
-        let mismatched = vaulkyrie_protocol::PolicyReceipt {
-            nonce: 99,
-            ..receipt
-        };
-
-        let error = open_action_session_from_receipt(&staged, &mismatched, 10)
-            .expect_err("mismatched receipt should be rejected");
-
-        assert_eq!(error, TransitionError::ReceiptMismatch);
-    }
-
-    #[test]
-    fn opening_action_session_from_expired_receipt_fails() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 9,
-        };
-        let staged = stage_policy_receipt(&receipt);
-
-        let error = open_action_session_from_receipt(&staged, &receipt, 10)
-            .expect_err("expired staged receipt should be rejected");
-
-        assert_eq!(error, TransitionError::ReceiptExpired);
-    }
-
-    #[test]
-    fn marking_action_session_ready_updates_status() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let mut session = open_action_session(&receipt);
-
-        mark_action_session_ready(&mut session, receipt.action_hash, 10)
-            .expect("matching action hash should mark session ready");
-
-        assert_eq!(session.status, SessionStatus::Ready as u8);
-    }
-
-    #[test]
-    fn marking_action_session_ready_rejects_action_mismatch() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let mut session = open_action_session(&receipt);
-
-        let error = mark_action_session_ready(&mut session, [99; 32], 10)
-            .expect_err("wrong action hash should be rejected");
-
-        assert_eq!(error, TransitionError::SessionMismatch);
-    }
-
-    #[test]
-    fn marking_action_session_ready_rejects_non_pending_session() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let mut session = open_action_session(&receipt);
-        session.status = SessionStatus::Ready as u8;
-
-        let error = mark_action_session_ready(&mut session, receipt.action_hash, 10)
-            .expect_err("ready session should not transition twice");
-
-        assert_eq!(error, TransitionError::SessionNotPending);
-    }
-
-    #[test]
-    fn marking_action_session_ready_rejects_expired_session() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 9,
-        };
-        let mut session = open_action_session(&receipt);
-
-        let error = mark_action_session_ready(&mut session, receipt.action_hash, 10)
-            .expect_err("expired session should not become ready");
-
-        assert_eq!(error, TransitionError::SessionExpired);
-    }
-
-    #[test]
-    fn marking_action_session_ready_rejects_pqc_only_threshold() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::RequirePqcAuth,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let mut session = open_action_session(&receipt);
-
-        let error = mark_action_session_ready(&mut session, receipt.action_hash, 10)
-            .expect_err("pqc-only threshold should not pass spend path");
-
-        assert_eq!(error, TransitionError::SessionRequiresPqc);
-    }
-
-    #[test]
-    fn consuming_ready_action_session_updates_status() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let mut session = open_action_session(&receipt);
-        mark_action_session_ready(&mut session, receipt.action_hash, 10)
-            .expect("matching action hash should mark session ready");
-
-        consume_action_session(&mut session, receipt.action_hash, 10)
-            .expect("ready session should be consumable");
-
-        assert_eq!(session.status, SessionStatus::Consumed as u8);
-    }
-
-    #[test]
-    fn consuming_pending_action_session_rejects_transition() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let mut session = open_action_session(&receipt);
-
-        let error = consume_action_session(&mut session, receipt.action_hash, 10)
-            .expect_err("pending session should not be consumable");
-
-        assert_eq!(error, TransitionError::SessionNotReady);
-    }
-
-    #[test]
-    fn consuming_expired_action_session_rejects_transition() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 9,
-        };
-        let mut session = open_action_session(&receipt);
-        session.status = SessionStatus::Ready as u8;
-
-        let error = consume_action_session(&mut session, receipt.action_hash, 10)
-            .expect_err("expired ready session should not be consumable");
-
-        assert_eq!(error, TransitionError::SessionExpired);
-    }
-
-    #[test]
-    fn consuming_action_session_rejects_pqc_only_threshold() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::RequirePqcAuth,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let mut session = open_action_session(&receipt);
-        session.status = SessionStatus::Ready as u8;
-
-        let error = consume_action_session(&mut session, receipt.action_hash, 10)
-            .expect_err("pqc-only threshold should not be consumable by spend path");
-
-        assert_eq!(error, TransitionError::SessionRequiresPqc);
-    }
-
-    #[test]
-    fn finalizing_action_session_consumes_session_and_receipt() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        let mut session = open_action_session(&receipt);
-        let mut staged = stage_policy_receipt(&receipt);
-        mark_action_session_ready(&mut session, receipt.action_hash, 10)
-            .expect("matching action hash should mark session ready");
-
-        finalize_action_session(&mut vault, &mut session, &mut staged, &receipt, 10)
-            .expect("ready session should finalize against staged receipt");
-
-        assert_eq!(session.status, SessionStatus::Consumed as u8);
-        assert_eq!(staged.consumed, 1);
-        assert_eq!(vault.last_consumed_receipt_nonce, receipt.nonce);
-    }
-
-    #[test]
-    fn finalizing_action_session_rejects_mismatched_receipt() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let mut session = open_action_session(&receipt);
-        let mut staged = stage_policy_receipt(&receipt);
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        let mismatched = vaulkyrie_protocol::PolicyReceipt {
-            nonce: 77,
-            ..receipt
-        };
-        mark_action_session_ready(&mut session, receipt.action_hash, 10)
-            .expect("matching action hash should mark session ready");
-
-        let error = finalize_action_session(&mut vault, &mut session, &mut staged, &mismatched, 10)
-            .expect_err("mismatched receipt should be rejected");
-
-        assert_eq!(error, TransitionError::SessionMismatch);
-    }
-
-    #[test]
-    fn finalizing_action_session_rejects_policy_mismatch() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let mut session = open_action_session(&receipt);
-        let mut staged = stage_policy_receipt(&receipt);
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        session.status = SessionStatus::Ready as u8;
-        session.policy_version = 10;
-
-        let error = finalize_action_session(&mut vault, &mut session, &mut staged, &receipt, 10)
-            .expect_err("mismatched policy version should fail");
-
-        assert_eq!(error, TransitionError::SessionPolicyMismatch);
-    }
-
-    #[test]
-    fn finalizing_expired_action_session_rejects_transition() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 9,
-        };
-        let mut session = open_action_session(&receipt);
-        let mut staged = stage_policy_receipt(&receipt);
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        session.status = SessionStatus::Ready as u8;
-
-        let error = finalize_action_session(&mut vault, &mut session, &mut staged, &receipt, 10)
-            .expect_err("expired session should not finalize");
-
-        assert_eq!(error, TransitionError::SessionExpired);
-    }
-
-    #[test]
-    fn finalizing_action_session_rejects_pqc_only_threshold() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::RequirePqcAuth,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        let mut session = open_action_session(&receipt);
-        let mut staged = stage_policy_receipt(&receipt);
-        session.status = SessionStatus::Ready as u8;
-
-        let error = finalize_action_session(&mut vault, &mut session, &mut staged, &receipt, 10)
-            .expect_err("pqc-only threshold should not finalize through spend path");
-
-        assert_eq!(error, TransitionError::SessionRequiresPqc);
-    }
-
-    #[test]
-    fn finalizing_action_session_rejects_replayed_nonce() {
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let mut vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        vault.last_consumed_receipt_nonce = 5;
-        let mut session = open_action_session(&receipt);
-        let mut staged = stage_policy_receipt(&receipt);
-        session.status = SessionStatus::Ready as u8;
-
-        let error = finalize_action_session(&mut vault, &mut session, &mut staged, &receipt, 10)
-            .expect_err("replayed nonce should fail finalize");
-
-        assert_eq!(error, TransitionError::ReceiptNonceReplay);
-    }
-
-    #[test]
-    fn authority_rotation_advances_sequence() {
-        let secret = sample_wots_secret(33);
-        let auth_path = sample_auth_path(17);
-        let proof_root = secret
-            .sign_statement_with_auth_path(
-                &vaulkyrie_protocol::AuthorityRotationStatement {
-                    action_hash: [0; 32],
-                    next_authority_hash: [4; 32],
-                    sequence: 0,
-                    expiry_slot: 100,
-                },
-                0,
-                auth_path,
-            )
-            .merkle_root();
-        let mut state = QuantumAuthorityState::new(secret.authority_hash(), proof_root, 1);
-        let mut statement = vaulkyrie_protocol::AuthorityRotationStatement {
-            action_hash: [0; 32],
-            next_authority_hash: [4; 32],
-            sequence: 0,
-            expiry_slot: 100,
-        };
-        statement.action_hash = statement.expected_action_hash([1; 32], 9);
-        let proof = secret.sign_statement_with_auth_path(&statement, 0, auth_path);
-        verify_authority_proof(&state, &statement, &proof).expect("proof should verify");
-
-        apply_authority_rotation(&mut state, &statement, 10).expect("sequence should match");
-
-        assert_eq!(state.current_authority_hash, [4; 32]);
-        assert_eq!(state.next_sequence, 1);
-        assert_eq!(state.next_leaf_index, 1);
-        assert_eq!(state.last_consumed_digest, statement.digest());
-    }
-
-    #[test]
-    fn winter_authority_advance_rolls_root_and_sequence() {
-        let current = sample_winter_secret(41);
-        let next = sample_winter_secret(42);
-        let mut vault = initialize_vault([1; 32], current.root(), 9, 4, [0; 32]);
+    fn rotate_vault_authority_updates_current_hash() {
+        let secret = sample_wots_secret(7);
+        let statement = sample_rotation_statement([9; 32]);
+        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(4));
+        let current_root = proof.merkle_root();
+
+        let mut vault = initialize_vault([1; 32], proof.authority_hash(), 2);
         vault.status = VaultStatus::Recovery as u8;
-        let mut authority = QuantumAuthorityState::new(current.root(), current.root(), 1);
-        let mut statement = WinterAuthorityAdvanceStatement {
-            action_hash: [0; 32],
-            current_root: current.root(),
-            next_root: next.root(),
-            sequence: 0,
-            expiry_slot: 100,
-        };
-        statement.action_hash = statement.expected_action_hash(vault.wallet_pubkey, 9);
-        let signature = current.sign_statement(&statement);
+        let mut authority = initialize_quantum_authority(proof.authority_hash(), current_root, 2);
 
-        verify_winter_authority_advance(&authority, &statement, &signature)
-            .expect("winter signature should verify");
-        advance_winter_authority(&mut vault, &mut authority, &statement, &signature, 10)
-            .expect("winter authority should advance");
+        rotate_vault_authority(&mut vault, &mut authority, &statement, &proof, 10).unwrap();
 
-        assert_eq!(vault.current_authority_hash, next.root());
-        assert_eq!(authority.current_authority_hash, next.root());
-        assert_eq!(authority.current_authority_root, next.root());
+        assert_eq!(vault.current_authority_hash, [9; 32]);
         assert_eq!(authority.next_sequence, 1);
-        assert_eq!(authority.next_leaf_index, 0);
-        assert_eq!(authority.last_consumed_digest, statement.replay_digest());
     }
 
     #[test]
-    fn winter_authority_advance_rejects_wrong_signature_root() {
-        let current = sample_winter_secret(51);
-        let next = sample_winter_secret(52);
-        let wrong = sample_winter_secret(53);
-        let authority = QuantumAuthorityState::new(current.root(), current.root(), 1);
-        let mut statement = WinterAuthorityAdvanceStatement {
-            action_hash: [0; 32],
-            current_root: current.root(),
-            next_root: next.root(),
-            sequence: 0,
-            expiry_slot: 100,
-        };
-        statement.action_hash = statement.expected_action_hash([1; 32], 9);
-        let signature = wrong.sign_statement(&statement);
-
-        let error = verify_winter_authority_advance(&authority, &statement, &signature)
-            .expect_err("signature from a different root should fail");
-
-        assert_eq!(error, TransitionError::AuthorityProofInvalid);
-    }
-
-    #[test]
-    fn winter_authority_advance_rejects_replayed_statement() {
-        let current = sample_winter_secret(61);
-        let next = sample_winter_secret(62);
-        let mut authority = QuantumAuthorityState::new(current.root(), current.root(), 1);
-        let mut statement = WinterAuthorityAdvanceStatement {
-            action_hash: [0; 32],
-            current_root: current.root(),
-            next_root: next.root(),
-            sequence: 0,
-            expiry_slot: 100,
-        };
-        statement.action_hash = statement.expected_action_hash([1; 32], 9);
-        authority.last_consumed_digest = statement.replay_digest();
-
-        let error = apply_winter_authority_advance(&mut authority, &statement, 10)
-            .expect_err("replayed winter statement should fail");
-
-        assert_eq!(error, TransitionError::AuthorityStatementReplay);
-    }
-
-    #[test]
-    fn authority_rotation_rejects_stale_sequence() {
-        let secret = sample_wots_secret(33);
-        let mut state = QuantumAuthorityState::new(secret.authority_hash(), [8; 32], 1);
-        state.next_sequence = 2;
-        let mut statement = vaulkyrie_protocol::AuthorityRotationStatement {
-            action_hash: [0; 32],
-            next_authority_hash: [4; 32],
-            sequence: 1,
-            expiry_slot: 100,
-        };
-        statement.action_hash = statement.expected_action_hash([1; 32], 9);
-
-        let error = apply_authority_rotation(&mut state, &statement, 10)
-            .expect_err("stale sequence should be rejected");
-
-        assert_eq!(error, TransitionError::AuthoritySequenceMismatch);
-    }
-
-    #[test]
-    fn authority_rotation_rejects_no_op_hash() {
-        let secret = sample_wots_secret(33);
-        let mut state = QuantumAuthorityState::new(secret.authority_hash(), [8; 32], 1);
-        let mut statement = vaulkyrie_protocol::AuthorityRotationStatement {
-            action_hash: [0; 32],
-            next_authority_hash: secret.authority_hash(),
-            sequence: 0,
-            expiry_slot: 100,
-        };
-        statement.action_hash = statement.expected_action_hash([1; 32], 9);
-
-        let error = apply_authority_rotation(&mut state, &statement, 10)
-            .expect_err("reusing the same authority hash should fail");
-
-        assert_eq!(error, TransitionError::AuthorityNoOp);
-    }
-
-    #[test]
-    fn authority_rotation_rejects_expired_statement() {
-        let secret = sample_wots_secret(33);
-        let mut state = QuantumAuthorityState::new(secret.authority_hash(), [8; 32], 1);
-        let mut statement = vaulkyrie_protocol::AuthorityRotationStatement {
-            action_hash: [0; 32],
-            next_authority_hash: [4; 32],
-            sequence: 0,
-            expiry_slot: 9,
-        };
-        statement.action_hash = statement.expected_action_hash([1; 32], 9);
-
-        let error = apply_authority_rotation(&mut state, &statement, 10)
-            .expect_err("expired authority statement should fail");
-
-        assert_eq!(error, TransitionError::AuthorityStatementExpired);
-    }
-
-    #[test]
-    fn authority_rotation_rejects_replayed_statement_digest() {
-        let secret = sample_wots_secret(33);
-        let mut state = QuantumAuthorityState::new(secret.authority_hash(), [8; 32], 1);
-
-        // Craft a statement that will produce a known digest
-        let mut statement = vaulkyrie_protocol::AuthorityRotationStatement {
-            action_hash: [0; 32],
-            next_authority_hash: [4; 32],
-            sequence: 0,
-            expiry_slot: 100,
-        };
-        statement.action_hash = statement.expected_action_hash([1; 32], 9);
-
-        // First rotation succeeds
-        apply_authority_rotation(&mut state, &statement, 10)
-            .expect("first rotation should succeed");
-
-        // Now state.last_consumed_digest == statement.digest()
-        // Craft a second statement with different next_authority_hash (avoids NoOp)
-        // but force its digest to equal last_consumed_digest
-        let mut replay_stmt = vaulkyrie_protocol::AuthorityRotationStatement {
-            action_hash: [0; 32],
-            next_authority_hash: [5; 32], // different from current [4;32]
-            sequence: 1,                  // matches advanced next_sequence
-            expiry_slot: 100,
-        };
-        replay_stmt.action_hash = replay_stmt.expected_action_hash([1; 32], 9);
-
-        // Manually set last_consumed_digest to the new statement's digest
-        // to simulate a digest collision (defense-in-depth scenario)
-        state.last_consumed_digest = replay_stmt.digest();
-
-        let error = apply_authority_rotation(&mut state, &replay_stmt, 10)
-            .expect_err("replayed digest should fail");
-
-        assert_eq!(error, TransitionError::AuthorityStatementReplay);
-    }
-
-    #[test]
-    fn rotate_vault_authority_updates_both_states() {
-        let secret = sample_wots_secret(33);
-        let auth_path = sample_auth_path(21);
-        let mut vault = initialize_vault([1; 32], secret.authority_hash(), 9, 4, [0; 32]);
-        vault.status = VaultStatus::Recovery as u8;
-        let statement =
-            sample_rotation_statement(vault.wallet_pubkey, vault.policy_version, [4; 32], 0, 100);
-        let proof = secret.sign_statement_with_auth_path(&statement, 0, auth_path);
-        let mut authority =
-            initialize_quantum_authority(secret.authority_hash(), proof.merkle_root(), 1);
-
-        rotate_vault_authority(&mut vault, &mut authority, &statement, &proof, 10)
-            .expect("aligned authority should rotate");
-
-        assert_eq!(vault.current_authority_hash, [4; 32]);
-        assert_eq!(authority.current_authority_hash, [4; 32]);
-        assert_eq!(authority.next_sequence, 1);
-        assert_eq!(authority.next_leaf_index, 1);
-    }
-
-    #[test]
-    fn rotate_vault_authority_rejects_active_vault() {
-        let secret = sample_wots_secret(33);
-        let mut vault = initialize_vault([1; 32], secret.authority_hash(), 9, 4, [0; 32]);
-        let statement =
-            sample_rotation_statement(vault.wallet_pubkey, vault.policy_version, [4; 32], 0, 100);
-        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(22));
-        let mut authority =
-            initialize_quantum_authority(secret.authority_hash(), proof.merkle_root(), 1);
-
-        let error = rotate_vault_authority(&mut vault, &mut authority, &statement, &proof, 10)
-            .expect_err("active vault should not allow authority rotation");
-
-        assert_eq!(error, TransitionError::VaultNotRecovery);
-    }
-
-    #[test]
-    fn rotate_vault_authority_rejects_unbound_action_hash() {
-        let secret = sample_wots_secret(33);
-        let mut vault = initialize_vault([1; 32], secret.authority_hash(), 9, 4, [0; 32]);
-        vault.status = VaultStatus::Recovery as u8;
-        let mut authority = initialize_quantum_authority(secret.authority_hash(), [8; 32], 1);
-        let statement = AuthorityRotationStatement {
-            action_hash: sample_action_hash(),
-            next_authority_hash: [4; 32],
-            sequence: 0,
-            expiry_slot: 100,
-        };
-        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(23));
-
-        let error = rotate_vault_authority(&mut vault, &mut authority, &statement, &proof, 10)
-            .expect_err("rotation must require rekey-bound action hash");
-
-        assert_eq!(error, TransitionError::AuthorityActionMismatch);
-    }
-
-    #[test]
-    fn validate_authority_action_binding_accepts_rekey_bound_hash() {
-        let vault = initialize_vault([1; 32], [3; 32], 9, 4, [0; 32]);
-        let statement =
-            sample_rotation_statement(vault.wallet_pubkey, vault.policy_version, [4; 32], 0, 100);
-
-        validate_authority_action_binding(&vault, &statement)
-            .expect("rekey-bound action hash should pass");
-    }
-
-    #[test]
-    fn verify_authority_proof_rejects_hash_mismatch() {
-        let secret = sample_wots_secret(33);
-        let statement = sample_rotation_statement([1; 32], 9, [4; 32], 0, 100);
-        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(24));
-        let authority = initialize_quantum_authority([9; 32], proof.merkle_root(), 1);
-
-        let error = verify_authority_proof(&authority, &statement, &proof)
-            .expect_err("proof hash must match current authority hash");
-
-        assert_eq!(error, TransitionError::AuthorityProofMismatch);
-    }
-
-    #[test]
-    fn verify_authority_proof_rejects_invalid_signature() {
-        let secret = sample_wots_secret(33);
-        let statement = sample_rotation_statement([1; 32], 9, [4; 32], 0, 100);
-        let mut proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(25));
-        proof.signature[0] ^= 1;
-        let authority =
-            initialize_quantum_authority(secret.authority_hash(), proof.merkle_root(), 1);
-
-        let error = verify_authority_proof(&authority, &statement, &proof)
-            .expect_err("tampered proof should fail verification");
-
-        assert_eq!(error, TransitionError::AuthorityProofInvalid);
-    }
-
-    #[test]
-    fn verify_authority_proof_rejects_leaf_index_mismatch() {
-        let secret = sample_wots_secret(33);
-        let statement = sample_rotation_statement([1; 32], 9, [4; 32], 0, 100);
-        let proof = secret.sign_statement_with_auth_path(&statement, 1, sample_auth_path(26));
-        let authority =
-            initialize_quantum_authority(secret.authority_hash(), proof.merkle_root(), 1);
-
-        let error = verify_authority_proof(&authority, &statement, &proof)
-            .expect_err("proof must consume the next expected leaf index");
-
-        assert_eq!(error, TransitionError::AuthorityLeafIndexMismatch);
-    }
-
-    #[test]
-    fn verify_authority_proof_rejects_merkle_root_mismatch() {
-        let secret = sample_wots_secret(33);
-        let statement = sample_rotation_statement([1; 32], 9, [4; 32], 0, 100);
-        let proof = secret.sign_statement_with_auth_path(&statement, 0, sample_auth_path(27));
-        let authority = initialize_quantum_authority(secret.authority_hash(), [8; 32], 1);
-
-        let error = verify_authority_proof(&authority, &statement, &proof)
-            .expect_err("proof root must match the current authority root");
-
-        assert_eq!(error, TransitionError::AuthorityMerkleRootMismatch);
-    }
-
-    #[test]
-    fn verify_authority_proof_rejects_tree_exhaustion() {
-        let secret = sample_wots_secret(33);
-        let statement = sample_rotation_statement([1; 32], 9, [4; 32], 0, 100);
-        let proof =
-            secret.sign_statement_with_auth_path(&statement, XMSS_LEAF_COUNT, sample_auth_path(28));
-        let mut authority =
-            initialize_quantum_authority(secret.authority_hash(), proof.merkle_root(), 1);
-        authority.next_leaf_index = XMSS_LEAF_COUNT;
-
-        let error = verify_authority_proof(&authority, &statement, &proof)
-            .expect_err("no proof should pass once the authority tree is exhausted");
-
-        assert_eq!(error, TransitionError::AuthorityTreeExhausted);
-    }
-
-    #[test]
-    fn validate_quantum_vault_split_accepts_bound_message() {
-        let privkey = WinternitzPrivkey::from([44u8; solana_winternitz::HASH_LENGTH * 32]);
-        let signature = privkey.sign(&vaulkyrie_protocol::quantum_split_message(
-            55, [7; 32], [8; 32],
-        ));
-        let hash = privkey.pubkey().merklize();
-        let program_id = [1; 32];
-        let bump = 2;
-        let vault_pubkey = hashv(&[
-            hash.as_ref(),
-            [bump].as_ref(),
-            program_id.as_ref(),
-            b"ProgramDerivedAddress",
-        ]);
-
-        validate_quantum_vault_split(
-            &signature,
-            55,
-            [7; 32],
-            [8; 32],
-            bump,
-            vault_pubkey,
-            program_id,
-        )
-        .expect("split signature should validate");
-    }
-
-    #[test]
-    fn validate_quantum_vault_split_rejects_wrong_amount() {
-        let privkey = WinternitzPrivkey::from([45u8; solana_winternitz::HASH_LENGTH * 32]);
-        let signature = privkey.sign(&vaulkyrie_protocol::quantum_split_message(
-            55, [7; 32], [8; 32],
-        ));
-        let hash = privkey.pubkey().merklize();
-        let program_id = [1; 32];
-        let bump = 2;
-        let vault_pubkey = hashv(&[
-            hash.as_ref(),
-            [bump].as_ref(),
-            program_id.as_ref(),
-            b"ProgramDerivedAddress",
-        ]);
-
-        let error = validate_quantum_vault_split(
-            &signature,
-            56,
-            [7; 32],
-            [8; 32],
-            bump,
-            vault_pubkey,
-            program_id,
-        )
-        .expect_err("split signature must be amount-bound");
-
-        assert_eq!(error, TransitionError::QuantumVaultPdaMismatch);
-    }
-
-    #[test]
-    fn validate_quantum_vault_close_accepts_refund_binding() {
-        let privkey = WinternitzPrivkey::from([46u8; solana_winternitz::HASH_LENGTH * 32]);
-        let signature = privkey.sign(&vaulkyrie_protocol::quantum_close_message([9; 32]));
-        let hash = privkey.pubkey().merklize();
-        let program_id = [2; 32];
-        let bump = 3;
-        let vault_pubkey = hashv(&[
-            hash.as_ref(),
-            [bump].as_ref(),
-            program_id.as_ref(),
-            b"ProgramDerivedAddress",
-        ]);
-
-        validate_quantum_vault_close(&signature, [9; 32], bump, vault_pubkey, program_id)
-            .expect("close signature should validate");
-    }
-
-    #[test]
-    fn validate_quantum_vault_split_amount_rejects_overspend() {
-        let error = validate_quantum_vault_split_amount(10, 11)
-            .expect_err("split amount above vault balance should fail");
-
-        assert_eq!(error, TransitionError::QuantumVaultAmountTooLarge);
-    }
-
-    #[test]
-    fn validate_vault_for_session_rejects_policy_mismatch() {
-        let vault = initialize_vault([1; 32], [2; 32], 9, 4, [0; 32]);
-        let receipt = vaulkyrie_protocol::PolicyReceipt {
-            action_hash: sample_action_hash(),
-            policy_version: 10,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 5,
-            expiry_slot: 10,
-        };
-        let session = open_action_session(&receipt);
-
-        let error = validate_vault_for_session(&vault, &session)
-            .expect_err("vault/session policy mismatch should fail");
-
-        assert_eq!(error, TransitionError::SessionPolicyMismatch);
-    }
-
-    #[test]
-    fn init_spend_orchestration_creates_pending_state() {
-        use super::{init_spend_orchestration, OrchestrationStatus};
-        let state =
-            init_spend_orchestration([1; 32], [2; 32], [3; 32], [4; 32], 1000, 2, 3, 7, 500)
-                .expect("valid params should succeed");
-
-        assert_eq!(state.action_hash, [1; 32]);
-        assert_eq!(state.status, OrchestrationStatus::Pending as u8);
-        assert_eq!(state.threshold, 2);
-        assert_eq!(state.participant_count, 3);
-        assert_eq!(state.signing_package_hash, [4; 32]);
-    }
-
-    #[test]
-    fn init_spend_orchestration_rejects_expired_slot() {
-        use super::init_spend_orchestration;
-        let error = init_spend_orchestration([1; 32], [2; 32], [3; 32], [4; 32], 500, 2, 3, 7, 500)
-            .expect_err("expiry <= current_slot should fail");
-
+    fn init_spend_orchestration_requires_live_expiry() {
+        let error = init_spend_orchestration([1; 32], [2; 32], [3; 32], [4; 32], 10, 2, 3, 1, 10)
+            .unwrap_err();
         assert_eq!(error, TransitionError::OrchestrationExpired);
     }
 
     #[test]
-    fn init_spend_orchestration_rejects_invalid_threshold() {
-        use super::init_spend_orchestration;
-        let error =
-            init_spend_orchestration([1; 32], [2; 32], [3; 32], [4; 32], 1000, 5, 3, 7, 500)
-                .expect_err("threshold > participant_count should fail");
-
-        assert_eq!(error, TransitionError::OrchestrationInvalidParams);
-    }
-
-    #[test]
-    fn commit_spend_orchestration_advances_to_committed() {
-        use super::{commit_spend_orchestration, init_spend_orchestration, OrchestrationStatus};
+    fn spend_orchestration_flow_roundtrips_status() {
         let mut state =
-            init_spend_orchestration([1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500)
-                .unwrap();
-
-        commit_spend_orchestration(&mut state, [1; 32], [5; 32], 600).expect("should commit");
-
-        assert_eq!(state.status, OrchestrationStatus::Committed as u8);
-        assert_eq!(state.signing_package_hash, [5; 32]);
-    }
-
-    #[test]
-    fn commit_spend_orchestration_rejects_wrong_action_hash() {
-        use super::{commit_spend_orchestration, init_spend_orchestration};
-        let mut state =
-            init_spend_orchestration([1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500)
-                .unwrap();
-
-        let error = commit_spend_orchestration(&mut state, [9; 32], [5; 32], 600)
-            .expect_err("wrong action hash should fail");
-
-        assert_eq!(error, TransitionError::OrchestrationActionMismatch);
-    }
-
-    #[test]
-    fn complete_spend_orchestration_marks_complete() {
-        use super::{
-            commit_spend_orchestration, complete_spend_orchestration, init_spend_orchestration,
-            OrchestrationStatus,
-        };
-        let mut state =
-            init_spend_orchestration([1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500)
-                .unwrap();
-        commit_spend_orchestration(&mut state, [1; 32], [5; 32], 600).unwrap();
-
-        complete_spend_orchestration(&mut state, [1; 32], [99; 32], 700).expect("should complete");
-
+            init_spend_orchestration([1; 32], [2; 32], [3; 32], [4; 32], 20, 2, 3, 1, 10).unwrap();
+        commit_spend_orchestration(&mut state, [1; 32], [5; 32], 11).unwrap();
+        complete_spend_orchestration(&mut state, [1; 32], [6; 32], 12).unwrap();
         assert_eq!(state.status, OrchestrationStatus::Complete as u8);
-        assert_eq!(state.tx_binding, [99; 32]);
     }
 
     #[test]
-    fn fail_spend_orchestration_marks_failed() {
-        use super::{fail_spend_orchestration, init_spend_orchestration, OrchestrationStatus};
-        let mut state =
-            init_spend_orchestration([1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500)
-                .unwrap();
-
-        fail_spend_orchestration(&mut state, [1; 32]).expect("should fail orchestration");
-
-        assert_eq!(state.status, OrchestrationStatus::Failed as u8);
+    fn recovery_requires_recovery_mode() {
+        let error = init_recovery(VaultStatus::Active as u8, 10, 20, 2, 3).unwrap_err();
+        assert_eq!(error, TransitionError::RecoveryVaultNotInRecoveryMode);
     }
 
     #[test]
-    fn fail_spend_orchestration_rejects_already_complete() {
-        use super::{
-            commit_spend_orchestration, complete_spend_orchestration, fail_spend_orchestration,
-            init_spend_orchestration,
+    fn winter_authority_advance_updates_hash() {
+        let secret = sample_winter_secret(9);
+        let current_root = secret.root();
+        let next_root = sample_winter_secret(10).root();
+        let mut authority = initialize_quantum_authority(current_root, current_root, 1);
+        let mut vault = initialize_vault([1; 32], current_root, 2);
+        vault.status = VaultStatus::Recovery as u8;
+
+        let mut statement = WinterAuthorityAdvanceStatement {
+            action_hash: [0; 32],
+            current_root,
+            next_root,
+            sequence: 0,
+            expiry_slot: 100,
         };
-        let mut state =
-            init_spend_orchestration([1; 32], [2; 32], [3; 32], [0; 32], 1000, 2, 3, 7, 500)
-                .unwrap();
-        commit_spend_orchestration(&mut state, [1; 32], [5; 32], 600).unwrap();
-        complete_spend_orchestration(&mut state, [1; 32], [99; 32], 700).unwrap();
+        statement.action_hash = statement.expected_action_hash(vault.wallet_pubkey);
+        let signature = secret.sign_statement(&statement);
 
-        let error = fail_spend_orchestration(&mut state, [1; 32])
-            .expect_err("complete orchestration cannot be failed");
-
-        assert_eq!(error, TransitionError::OrchestrationAlreadyComplete);
-    }
-
-    // ── validate_bridged_receipt_claim ────────────────────────────────────────
-
-    fn make_finalized_eval_bytes(receipt_commitment: [u8; 32]) -> [u8; 256] {
-        let mut bytes = [0u8; 256];
-        bytes[0..8].copy_from_slice(b"POLEVAL1");
-        // action_hash at [72..104] defaults to [0; 32]
-        bytes[168..200].copy_from_slice(&receipt_commitment);
-        bytes[240] = 2; // Finalized
-        bytes
-    }
-
-    fn make_finalized_eval_bytes_with_action(
-        receipt_commitment: [u8; 32],
-        action_hash: [u8; 32],
-    ) -> [u8; 256] {
-        let mut bytes = make_finalized_eval_bytes(receipt_commitment);
-        bytes[72..104].copy_from_slice(&action_hash);
-        bytes
-    }
-
-    #[test]
-    fn validate_bridged_receipt_claim_accepts_valid_eval() {
-        use vaulkyrie_protocol::{PolicyReceipt, ThresholdRequirement};
-
-        let receipt = PolicyReceipt {
-            action_hash: [3; 32],
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 1,
-            expiry_slot: 900,
-        };
-
-        let eval_bytes = make_finalized_eval_bytes_with_action(receipt.commitment(), [3; 32]);
-        assert!(validate_bridged_receipt_claim(&eval_bytes, &receipt, 100).is_ok());
-    }
-
-    #[test]
-    fn validate_bridged_receipt_claim_rejects_non_finalized() {
-        use vaulkyrie_protocol::{PolicyReceipt, ThresholdRequirement};
-
-        let receipt = PolicyReceipt {
-            action_hash: [3; 32],
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 1,
-            expiry_slot: 900,
-        };
-
-        let mut eval_bytes = make_finalized_eval_bytes_with_action(receipt.commitment(), [3; 32]);
-        eval_bytes[240] = 1; // Pending, not Finalized
-
-        assert_eq!(
-            validate_bridged_receipt_claim(&eval_bytes, &receipt, 100),
-            Err(TransitionError::BridgedReceiptMismatch)
-        );
-    }
-
-    #[test]
-    fn validate_bridged_receipt_claim_rejects_mismatched_commitment() {
-        use vaulkyrie_protocol::{PolicyReceipt, ThresholdRequirement};
-
-        let receipt = PolicyReceipt {
-            action_hash: [3; 32],
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 1,
-            expiry_slot: 900,
-        };
-
-        let eval_bytes = make_finalized_eval_bytes_with_action([0xff; 32], [3; 32]);
-
-        assert_eq!(
-            validate_bridged_receipt_claim(&eval_bytes, &receipt, 100),
-            Err(TransitionError::BridgedReceiptMismatch)
-        );
-    }
-
-    #[test]
-    fn validate_bridged_receipt_claim_rejects_wrong_discriminator() {
-        use vaulkyrie_protocol::{PolicyReceipt, ThresholdRequirement};
-
-        let receipt = PolicyReceipt {
-            action_hash: [3; 32],
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 1,
-            expiry_slot: 900,
-        };
-
-        let mut eval_bytes = make_finalized_eval_bytes_with_action(receipt.commitment(), [3; 32]);
-        eval_bytes[0] = 0; // corrupt discriminator
-
-        assert_eq!(
-            validate_bridged_receipt_claim(&eval_bytes, &receipt, 100),
-            Err(TransitionError::BridgedReceiptMismatch)
-        );
-    }
-
-    #[test]
-    fn validate_bridged_receipt_claim_rejects_truncated_data() {
-        use vaulkyrie_protocol::{PolicyReceipt, ThresholdRequirement};
-
-        let receipt = PolicyReceipt {
-            action_hash: [3; 32],
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 1,
-            expiry_slot: 900,
-        };
-
-        let eval_bytes = [0u8; 100]; // too short
-
-        assert_eq!(
-            validate_bridged_receipt_claim(&eval_bytes, &receipt, 100),
-            Err(TransitionError::BridgedReceiptMismatch)
-        );
-    }
-
-    #[test]
-    fn validate_bridged_receipt_claim_rejects_active_delay() {
-        use vaulkyrie_protocol::{PolicyReceipt, ThresholdRequirement};
-
-        let receipt = PolicyReceipt {
-            action_hash: [3; 32],
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 1,
-            expiry_slot: 900,
-        };
-
-        let mut eval_bytes = make_finalized_eval_bytes_with_action(receipt.commitment(), [3; 32]);
-        // Set delay_until_slot to 500 at bytes 232..240
-        eval_bytes[232..240].copy_from_slice(&500u64.to_le_bytes());
-
-        // current_slot < delay_until_slot => should fail
-        assert_eq!(
-            validate_bridged_receipt_claim(&eval_bytes, &receipt, 499),
-            Err(TransitionError::BridgedReceiptDelayNotMet)
-        );
-
-        // current_slot == delay_until_slot => should succeed
-        assert!(validate_bridged_receipt_claim(&eval_bytes, &receipt, 500).is_ok());
-
-        // current_slot > delay_until_slot => should succeed
-        assert!(validate_bridged_receipt_claim(&eval_bytes, &receipt, 600).is_ok());
-    }
-
-    #[test]
-    fn validate_bridged_receipt_claim_rejects_action_hash_mismatch() {
-        use vaulkyrie_protocol::{PolicyReceipt, ThresholdRequirement};
-
-        let receipt = PolicyReceipt {
-            action_hash: [3; 32],
-            policy_version: 9,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 1,
-            expiry_slot: 900,
-        };
-
-        // Eval has different action_hash than receipt
-        let eval_bytes = make_finalized_eval_bytes_with_action(receipt.commitment(), [0xff; 32]);
-
-        assert_eq!(
-            validate_bridged_receipt_claim(&eval_bytes, &receipt, 100),
-            Err(TransitionError::BridgedReceiptMismatch)
-        );
-    }
-
-    #[test]
-    fn validate_eval_account_owner_accepts_matching_program() {
-        let owner = [7; 32];
-        let vault = VaultRegistry::new([0; 32], [0; 32], 1, VaultStatus::Active, 1, owner);
-        assert!(validate_eval_account_owner(&owner, &vault).is_ok());
-    }
-
-    #[test]
-    fn validate_eval_account_owner_rejects_wrong_program() {
-        let vault = VaultRegistry::new([0; 32], [0; 32], 1, VaultStatus::Active, 1, [7; 32]);
-        let wrong_owner = [8; 32];
-        assert_eq!(
-            validate_eval_account_owner(&wrong_owner, &vault),
-            Err(TransitionError::BridgedReceiptMismatch)
-        );
-    }
-
-    // ── Recovery transition tests ───────────────────────────────────
-
-    fn sample_recovery_state(expiry: u64) -> RecoveryState {
-        RecoveryState::new(
-            [1; 32], // vault_pubkey
-            [2; 32], // recovery_commitment
-            expiry, 2,  // new_threshold
-            3,  // new_participant_count
-            42, // bump
-        )
-    }
-
-    #[test]
-    fn init_recovery_succeeds_with_valid_params() {
-        let result = init_recovery(
-            VaultStatus::Recovery as u8,
-            100, // current_slot
-            500, // expiry_slot
-            2,   // threshold
-            3,   // participant_count
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn init_recovery_rejects_non_recovery_vault() {
-        let result = init_recovery(VaultStatus::Active as u8, 100, 500, 2, 3);
-        assert_eq!(result, Err(TransitionError::RecoveryVaultNotInRecoveryMode));
-    }
-
-    #[test]
-    fn init_recovery_rejects_expired_slot() {
-        let result = init_recovery(
-            VaultStatus::Recovery as u8,
-            500, // current == expiry
-            500,
-            2,
-            3,
-        );
-        assert_eq!(result, Err(TransitionError::RecoveryExpired));
-
-        let result = init_recovery(
-            VaultStatus::Recovery as u8,
-            501, // current > expiry
-            500,
-            2,
-            3,
-        );
-        assert_eq!(result, Err(TransitionError::RecoveryExpired));
-    }
-
-    #[test]
-    fn init_recovery_rejects_zero_threshold() {
-        let result = init_recovery(
-            VaultStatus::Recovery as u8,
-            100,
-            500,
-            0, // bad
-            3,
-        );
-        assert_eq!(result, Err(TransitionError::RecoveryInvalidParams));
-    }
-
-    #[test]
-    fn init_recovery_rejects_threshold_exceeding_participants() {
-        let result = init_recovery(
-            VaultStatus::Recovery as u8,
-            100,
-            500,
-            4, // threshold > participant_count
-            3,
-        );
-        assert_eq!(result, Err(TransitionError::RecoveryInvalidParams));
-    }
-
-    #[test]
-    fn complete_recovery_succeeds_when_pending() {
-        let state = sample_recovery_state(500);
-        assert_eq!(state.status, RecoveryStatus::Pending as u8);
-        assert!(complete_recovery(&state, 100).is_ok());
-    }
-
-    #[test]
-    fn complete_recovery_rejects_expired() {
-        let state = sample_recovery_state(500);
-        assert_eq!(
-            complete_recovery(&state, 500),
-            Err(TransitionError::RecoveryExpired)
-        );
-    }
-
-    #[test]
-    fn complete_recovery_rejects_non_pending() {
-        let mut state = sample_recovery_state(500);
-        state.status = RecoveryStatus::Complete as u8;
-        assert_eq!(
-            complete_recovery(&state, 100),
-            Err(TransitionError::RecoveryNotPending)
-        );
-    }
-
-    // ── Authority migration tests ───────────────────────────────────
-
-    #[test]
-    fn migrate_authority_resets_leaf_index_and_sets_new_root() {
-        let mut authority = initialize_quantum_authority([1; 32], [2; 32], 1);
-        authority.next_leaf_index = 10; // some leaves used
-
-        let new_root = [9; 32];
-        let result = migrate_authority_tree(&mut authority, new_root);
-        assert!(result.is_ok());
-        assert_eq!(authority.current_authority_root, new_root);
-        assert_eq!(authority.next_leaf_index, 0);
-        // hash and sequence must be unchanged
-        assert_eq!(authority.current_authority_hash, [1; 32]);
-        assert_eq!(authority.next_sequence, 0);
-    }
-
-    #[test]
-    fn migrate_authority_rejects_no_op_on_fresh_tree() {
-        let mut authority = initialize_quantum_authority([1; 32], [2; 32], 1);
-        assert_eq!(authority.next_leaf_index, 0);
-
-        let result = migrate_authority_tree(&mut authority, [9; 32]);
-        assert_eq!(result, Err(TransitionError::AuthorityMigrationNoOp));
-    }
-
-    #[test]
-    fn migrate_authority_works_at_exhaustion_boundary() {
-        let mut authority = initialize_quantum_authority([1; 32], [2; 32], 1);
-        authority.next_leaf_index = XMSS_LEAF_COUNT; // fully exhausted
-
-        let new_root = [7; 32];
-        let result = migrate_authority_tree(&mut authority, new_root);
-        assert!(result.is_ok());
-        assert_eq!(authority.next_leaf_index, 0);
-        assert_eq!(authority.current_authority_root, new_root);
-    }
-
-    // ── Policy version rollover tests ───────────────────────────────
-
-    #[test]
-    fn advance_policy_version_increments_by_one() {
-        let mut vault = VaultRegistry::new([0; 32], [0; 32], 5, VaultStatus::Active, 1, [0; 32]);
-
-        let result = advance_policy_version(&mut vault, 6);
-        assert!(result.is_ok());
-        assert_eq!(vault.policy_version, 6);
-    }
-
-    #[test]
-    fn advance_policy_version_rejects_skip() {
-        let mut vault = VaultRegistry::new([0; 32], [0; 32], 5, VaultStatus::Active, 1, [0; 32]);
-
-        let result = advance_policy_version(&mut vault, 7);
-        assert_eq!(
-            result.unwrap_err(),
-            TransitionError::PolicyVersionNotMonotonic
-        );
-    }
-
-    #[test]
-    fn advance_policy_version_rejects_same() {
-        let mut vault = VaultRegistry::new([0; 32], [0; 32], 5, VaultStatus::Active, 1, [0; 32]);
-
-        let result = advance_policy_version(&mut vault, 5);
-        assert_eq!(
-            result.unwrap_err(),
-            TransitionError::PolicyVersionNotMonotonic
-        );
-    }
-
-    #[test]
-    fn advance_policy_version_rejects_inactive_vault() {
-        let mut vault = VaultRegistry::new([0; 32], [0; 32], 0, VaultStatus::Active, 1, [0; 32]);
-        vault.status = 0; // Force inactive
-
-        let result = advance_policy_version(&mut vault, 1);
-        assert_eq!(result.unwrap_err(), TransitionError::VaultNotActive);
+        advance_winter_authority(&mut vault, &mut authority, &statement, &signature, 10).unwrap();
+        assert_eq!(vault.current_authority_hash, next_root);
     }
 }

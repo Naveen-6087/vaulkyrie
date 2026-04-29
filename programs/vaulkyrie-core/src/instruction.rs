@@ -1,9 +1,8 @@
 use pinocchio::program_error::ProgramError;
 use solana_winternitz::signature::WinternitzSignature;
 use vaulkyrie_protocol::{
-    AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement,
-    WinterAuthorityAdvanceStatement, WinterAuthoritySignature, WotsAuthProof,
-    AUTHORITY_PROOF_CHUNK_MAX_BYTES,
+    AuthorityRotationStatement, WinterAuthorityAdvanceStatement, WinterAuthoritySignature,
+    WotsAuthProof, AUTHORITY_PROOF_CHUNK_MAX_BYTES,
 };
 
 pub const WINTERNITZ_SIGNATURE_BYTES: usize = core::mem::size_of::<WinternitzSignature>();
@@ -12,9 +11,7 @@ pub const WINTERNITZ_SIGNATURE_BYTES: usize = core::mem::size_of::<WinternitzSig
 pub struct InitVaultArgs {
     pub wallet_pubkey: [u8; 32],
     pub authority_hash: [u8; 32],
-    pub policy_version: u64,
     pub bump: u8,
-    pub policy_mxe_program: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,11 +123,6 @@ pub struct MigrateAuthorityArgs {
     pub new_authority_root: [u8; 32],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AdvancePolicyVersionArgs {
-    pub new_version: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotateAuthorityArgs {
     pub statement: AuthorityRotationStatement,
@@ -168,12 +160,6 @@ pub enum CoreInstruction {
     InitVault(InitVaultArgs),
     InitAuthority(InitAuthorityArgs),
     InitQuantumVault(InitQuantumVaultArgs),
-    StageReceipt(PolicyReceipt),
-    ConsumeReceipt(PolicyReceipt),
-    OpenSession(PolicyReceipt),
-    ActivateSession([u8; 32]),
-    ConsumeSession([u8; 32]),
-    FinalizeSession(PolicyReceipt),
     SetVaultStatus(u8),
     RotateAuthority(RotateAuthorityArgs),
     InitAuthorityProof(InitAuthorityProofArgs),
@@ -185,9 +171,6 @@ pub enum CoreInstruction {
     CommitSpendOrchestration(CommitSpendOrchestrationArgs),
     CompleteSpendOrchestration(CompleteSpendOrchestrationArgs),
     FailSpendOrchestration(FailSpendOrchestrationArgs),
-    /// Stage a receipt that has been cross-validated against an external
-    /// finalized receipt account owned by the configured bridge program.
-    StageBridgedReceipt(PolicyReceipt),
     /// PQC-authorized recovery initiation when the threshold signing group
     /// is lost. Requires a valid WOTS+ proof on the authority account.
     InitRecovery(InitRecoveryArgs),
@@ -197,8 +180,6 @@ pub enum CoreInstruction {
     /// Migrate to a new XMSS tree when the current authority tree is nearing
     /// exhaustion.  Requires a valid WOTS+ proof on the current tree.
     MigrateAuthority(MigrateAuthorityArgs),
-    /// Advance the vault's policy version by exactly 1 (monotonic).
-    AdvancePolicyVersion(AdvancePolicyVersionArgs),
     /// WinterWallet-style root-rolling PQC authority advance.
     AdvanceWinterAuthority(AdvanceWinterAuthorityArgs),
     /// WinterWallet-style root-rolling PDA wallet initialization.
@@ -211,55 +192,177 @@ impl TryFrom<&[u8]> for CoreInstruction {
     type Error = ProgramError;
 
     fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
-        match data {
-            [0] => Ok(Self::Ping),
-            [1, rest @ ..] => Ok(Self::InitVault(parse_init_vault(rest)?)),
-            [2, rest @ ..] => Ok(Self::InitAuthority(parse_init_authority(rest)?)),
-            [3, rest @ ..] => Ok(Self::InitQuantumVault(parse_init_quantum_vault(rest)?)),
-            [4, rest @ ..] => Ok(Self::StageReceipt(parse_policy_receipt(rest)?)),
-            [5, rest @ ..] => Ok(Self::ConsumeReceipt(parse_policy_receipt(rest)?)),
-            [6, rest @ ..] => Ok(Self::OpenSession(parse_policy_receipt(rest)?)),
-            [7, rest @ ..] => Ok(Self::ActivateSession(parse_action_hash(rest)?)),
-            [8, rest @ ..] => Ok(Self::ConsumeSession(parse_action_hash(rest)?)),
-            [9, rest @ ..] => Ok(Self::FinalizeSession(parse_policy_receipt(rest)?)),
-            [10, rest @ ..] => Ok(Self::SetVaultStatus(parse_vault_status(rest)?)),
-            [11, rest @ ..] => Ok(Self::RotateAuthority(parse_rotate_authority_args(rest)?)),
-            [12, rest @ ..] => Ok(Self::InitAuthorityProof(parse_init_authority_proof(rest)?)),
-            [13, rest @ ..] => Ok(Self::WriteAuthorityProofChunk(
-                parse_write_authority_proof_chunk(rest)?,
-            )),
-            [14, rest @ ..] => Ok(Self::RotateAuthorityStaged(
-                parse_authority_rotation_statement(rest)?,
-            )),
-            [15, rest @ ..] => Ok(Self::SplitQuantumVault(parse_split_quantum_vault(rest)?)),
-            [16, rest @ ..] => Ok(Self::CloseQuantumVault(parse_close_quantum_vault(rest)?)),
-            [17, rest @ ..] => Ok(Self::InitSpendOrchestration(
-                parse_init_spend_orchestration(rest)?,
-            )),
-            [18, rest @ ..] => Ok(Self::CommitSpendOrchestration(
-                parse_commit_spend_orchestration(rest)?,
-            )),
-            [19, rest @ ..] => Ok(Self::CompleteSpendOrchestration(
-                parse_complete_spend_orchestration(rest)?,
-            )),
-            [20, rest @ ..] => Ok(Self::FailSpendOrchestration(
-                parse_fail_spend_orchestration(rest)?,
-            )),
-            [21, rest @ ..] => Ok(Self::StageBridgedReceipt(parse_policy_receipt(rest)?)),
-            [22, rest @ ..] => Ok(Self::InitRecovery(parse_init_recovery(rest)?)),
-            [23, rest @ ..] => Ok(Self::CompleteRecovery(parse_complete_recovery(rest)?)),
-            [24, rest @ ..] => Ok(Self::MigrateAuthority(parse_migrate_authority(rest)?)),
-            [25, rest @ ..] => Ok(Self::AdvancePolicyVersion(parse_advance_policy_version(
-                rest,
-            )?)),
-            [26, rest @ ..] => Ok(Self::AdvanceWinterAuthority(
-                parse_advance_winter_authority(rest)?,
-            )),
-            [27, rest @ ..] => Ok(Self::InitPqcWallet(parse_init_pqc_wallet(rest)?)),
-            [28, rest @ ..] => Ok(Self::AdvancePqcWallet(parse_advance_pqc_wallet(rest)?)),
+        let (tag, rest) = data
+            .split_first()
+            .ok_or(ProgramError::InvalidInstructionData)?;
+
+        match *tag {
+            0 => Ok(Self::Ping),
+            1 => parse_init_vault_instruction(rest),
+            2 => parse_init_authority_instruction(rest),
+            3 => parse_init_quantum_vault_instruction(rest),
+            10 => parse_set_vault_status_instruction(rest),
+            11 => parse_rotate_authority_instruction(rest),
+            12 => parse_init_authority_proof_instruction(rest),
+            13 => parse_write_authority_proof_chunk_instruction(rest),
+            14 => parse_rotate_authority_staged_instruction(rest),
+            15 => parse_split_quantum_vault_instruction(rest),
+            16 => parse_close_quantum_vault_instruction(rest),
+            17 => parse_init_spend_orchestration_instruction(rest),
+            18 => parse_commit_spend_orchestration_instruction(rest),
+            19 => parse_complete_spend_orchestration_instruction(rest),
+            20 => parse_fail_spend_orchestration_instruction(rest),
+            22 => parse_init_recovery_instruction(rest),
+            23 => parse_complete_recovery_instruction(rest),
+            24 => parse_migrate_authority_instruction(rest),
+            26 => parse_advance_winter_authority_instruction(rest),
+            27 => parse_init_pqc_wallet_instruction(rest),
+            28 => parse_advance_pqc_wallet_instruction(rest),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
+}
+
+#[inline(never)]
+fn parse_init_vault_instruction(data: &[u8]) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::InitVault(parse_init_vault(data)?))
+}
+
+#[inline(never)]
+fn parse_init_authority_instruction(data: &[u8]) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::InitAuthority(parse_init_authority(data)?))
+}
+
+#[inline(never)]
+fn parse_init_quantum_vault_instruction(data: &[u8]) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::InitQuantumVault(parse_init_quantum_vault(
+        data,
+    )?))
+}
+
+#[inline(never)]
+fn parse_set_vault_status_instruction(data: &[u8]) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::SetVaultStatus(parse_vault_status(data)?))
+}
+
+#[inline(never)]
+fn parse_rotate_authority_instruction(data: &[u8]) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::RotateAuthority(
+        parse_rotate_authority_args(data)?,
+    ))
+}
+
+#[inline(never)]
+fn parse_init_authority_proof_instruction(data: &[u8]) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::InitAuthorityProof(
+        parse_init_authority_proof(data)?,
+    ))
+}
+
+#[inline(never)]
+fn parse_write_authority_proof_chunk_instruction(
+    data: &[u8],
+) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::WriteAuthorityProofChunk(
+        parse_write_authority_proof_chunk(data)?,
+    ))
+}
+
+#[inline(never)]
+fn parse_rotate_authority_staged_instruction(data: &[u8]) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::RotateAuthorityStaged(
+        parse_authority_rotation_statement(data)?,
+    ))
+}
+
+#[inline(never)]
+fn parse_split_quantum_vault_instruction(data: &[u8]) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::SplitQuantumVault(
+        parse_split_quantum_vault(data)?,
+    ))
+}
+
+#[inline(never)]
+fn parse_close_quantum_vault_instruction(data: &[u8]) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::CloseQuantumVault(
+        parse_close_quantum_vault(data)?,
+    ))
+}
+
+#[inline(never)]
+fn parse_init_spend_orchestration_instruction(
+    data: &[u8],
+) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::InitSpendOrchestration(
+        parse_init_spend_orchestration(data)?,
+    ))
+}
+
+#[inline(never)]
+fn parse_commit_spend_orchestration_instruction(
+    data: &[u8],
+) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::CommitSpendOrchestration(
+        parse_commit_spend_orchestration(data)?,
+    ))
+}
+
+#[inline(never)]
+fn parse_complete_spend_orchestration_instruction(
+    data: &[u8],
+) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::CompleteSpendOrchestration(
+        parse_complete_spend_orchestration(data)?,
+    ))
+}
+
+#[inline(never)]
+fn parse_fail_spend_orchestration_instruction(
+    data: &[u8],
+) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::FailSpendOrchestration(
+        parse_fail_spend_orchestration(data)?,
+    ))
+}
+
+#[inline(never)]
+fn parse_init_recovery_instruction(data: &[u8]) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::InitRecovery(parse_init_recovery(data)?))
+}
+
+#[inline(never)]
+fn parse_complete_recovery_instruction(data: &[u8]) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::CompleteRecovery(parse_complete_recovery(
+        data,
+    )?))
+}
+
+#[inline(never)]
+fn parse_migrate_authority_instruction(data: &[u8]) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::MigrateAuthority(parse_migrate_authority(
+        data,
+    )?))
+}
+
+#[inline(never)]
+fn parse_advance_winter_authority_instruction(
+    data: &[u8],
+) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::AdvanceWinterAuthority(
+        parse_advance_winter_authority(data)?,
+    ))
+}
+
+#[inline(never)]
+fn parse_init_pqc_wallet_instruction(data: &[u8]) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::InitPqcWallet(parse_init_pqc_wallet(data)?))
+}
+
+#[inline(never)]
+fn parse_advance_pqc_wallet_instruction(data: &[u8]) -> Result<CoreInstruction, ProgramError> {
+    Ok(CoreInstruction::AdvancePqcWallet(parse_advance_pqc_wallet(
+        data,
+    )?))
 }
 
 fn parse_vault_status(data: &[u8]) -> Result<u8, ProgramError> {
@@ -270,18 +373,8 @@ fn parse_vault_status(data: &[u8]) -> Result<u8, ProgramError> {
     Ok(data[0])
 }
 
-fn parse_action_hash(data: &[u8]) -> Result<[u8; 32], ProgramError> {
-    if data.len() != 32 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-
-    let mut action_hash = [0; 32];
-    action_hash.copy_from_slice(data);
-    Ok(action_hash)
-}
-
 fn parse_init_vault(data: &[u8]) -> Result<InitVaultArgs, ProgramError> {
-    if data.len() != 105 {
+    if data.len() != 65 {
         return Err(ProgramError::InvalidInstructionData);
     }
 
@@ -291,20 +384,12 @@ fn parse_init_vault(data: &[u8]) -> Result<InitVaultArgs, ProgramError> {
     let mut authority_hash = [0; 32];
     authority_hash.copy_from_slice(&data[32..64]);
 
-    let mut policy_version = [0; 8];
-    policy_version.copy_from_slice(&data[64..72]);
-
-    let bump = data[72];
-
-    let mut policy_mxe_program = [0; 32];
-    policy_mxe_program.copy_from_slice(&data[73..105]);
+    let bump = data[64];
 
     Ok(InitVaultArgs {
         wallet_pubkey,
         authority_hash,
-        policy_version: u64::from_le_bytes(policy_version),
         bump,
-        policy_mxe_program,
     })
 }
 
@@ -354,35 +439,6 @@ fn parse_init_pqc_wallet(data: &[u8]) -> Result<InitPqcWalletArgs, ProgramError>
         wallet_id,
         current_root,
         bump: data[64],
-    })
-}
-
-fn parse_policy_receipt(data: &[u8]) -> Result<PolicyReceipt, ProgramError> {
-    if data.len() != 57 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-
-    let mut action_hash = [0; 32];
-    action_hash.copy_from_slice(&data[..32]);
-
-    let mut policy_version = [0; 8];
-    policy_version.copy_from_slice(&data[32..40]);
-
-    let threshold = ThresholdRequirement::try_from(data[40])
-        .map_err(|_| ProgramError::InvalidInstructionData)?;
-
-    let mut nonce = [0; 8];
-    nonce.copy_from_slice(&data[41..49]);
-
-    let mut expiry_slot = [0; 8];
-    expiry_slot.copy_from_slice(&data[49..57]);
-
-    Ok(PolicyReceipt {
-        action_hash,
-        policy_version: u64::from_le_bytes(policy_version),
-        threshold,
-        nonce: u64::from_le_bytes(nonce),
-        expiry_slot: u64::from_le_bytes(expiry_slot),
     })
 }
 
@@ -710,34 +766,21 @@ fn parse_migrate_authority(data: &[u8]) -> Result<MigrateAuthorityArgs, ProgramE
     Ok(MigrateAuthorityArgs { new_authority_root })
 }
 
-fn parse_advance_policy_version(data: &[u8]) -> Result<AdvancePolicyVersionArgs, ProgramError> {
-    if data.len() != 8 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let mut buf = [0; 8];
-    buf.copy_from_slice(data);
-    Ok(AdvancePolicyVersionArgs {
-        new_version: u64::from_le_bytes(buf),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        AdvancePolicyVersionArgs, AdvancePqcWalletArgs, AdvanceWinterAuthorityArgs,
-        CloseQuantumVaultArgs, CommitSpendOrchestrationArgs, CompleteRecoveryArgs,
-        CompleteSpendOrchestrationArgs, CoreInstruction, FailSpendOrchestrationArgs,
-        InitAuthorityArgs, InitAuthorityProofArgs, InitPqcWalletArgs, InitQuantumVaultArgs,
-        InitRecoveryArgs, InitSpendOrchestrationArgs, InitVaultArgs, MigrateAuthorityArgs,
-        RotateAuthorityArgs, SplitQuantumVaultArgs, WriteAuthorityProofChunkArgs,
-        WINTERNITZ_SIGNATURE_BYTES,
+        AdvancePqcWalletArgs, AdvanceWinterAuthorityArgs, CloseQuantumVaultArgs,
+        CommitSpendOrchestrationArgs, CompleteRecoveryArgs, CompleteSpendOrchestrationArgs,
+        CoreInstruction, FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs,
+        InitPqcWalletArgs, InitQuantumVaultArgs, InitRecoveryArgs, InitSpendOrchestrationArgs,
+        InitVaultArgs, MigrateAuthorityArgs, RotateAuthorityArgs, SplitQuantumVaultArgs,
+        WriteAuthorityProofChunkArgs, WINTERNITZ_SIGNATURE_BYTES,
     };
     use pinocchio::program_error::ProgramError;
     use vaulkyrie_protocol::{
-        AuthorityRotationStatement, PolicyReceipt, ThresholdRequirement,
-        WinterAuthorityAdvanceStatement, WinterAuthoritySignature, WotsAuthProof,
-        AUTHORITY_PROOF_CHUNK_MAX_BYTES, WINTER_AUTHORITY_SIGNATURE_BYTES, WOTS_KEY_BYTES,
-        XMSS_AUTH_PATH_BYTES,
+        AuthorityRotationStatement, WinterAuthorityAdvanceStatement, WinterAuthoritySignature,
+        WotsAuthProof, AUTHORITY_PROOF_CHUNK_MAX_BYTES, WINTER_AUTHORITY_SIGNATURE_BYTES,
+        WOTS_KEY_BYTES, XMSS_AUTH_PATH_BYTES,
     };
 
     #[test]
@@ -749,51 +792,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_instruction() {
-        assert_eq!(
-            CoreInstruction::try_from(&[1][..]),
-            Err(ProgramError::InvalidInstructionData)
-        );
-    }
-
-    #[test]
     fn parses_init_vault_instruction() {
         let mut data = vec![1];
         data.extend_from_slice(&[7; 32]);
         data.extend_from_slice(&[9; 32]);
-        data.extend_from_slice(&42u64.to_le_bytes());
         data.push(3);
-        data.extend_from_slice(&[11; 32]);
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
             Ok(CoreInstruction::InitVault(InitVaultArgs {
                 wallet_pubkey: [7; 32],
                 authority_hash: [9; 32],
-                policy_version: 42,
                 bump: 3,
-                policy_mxe_program: [11; 32],
-            }))
-        );
-    }
-
-    #[test]
-    fn parses_stage_receipt_instruction() {
-        let mut data = vec![4];
-        data.extend_from_slice(&[4; 32]);
-        data.extend_from_slice(&10u64.to_le_bytes());
-        data.push(2);
-        data.extend_from_slice(&11u64.to_le_bytes());
-        data.extend_from_slice(&12u64.to_le_bytes());
-
-        assert_eq!(
-            CoreInstruction::try_from(data.as_slice()),
-            Ok(CoreInstruction::StageReceipt(PolicyReceipt {
-                action_hash: [4; 32],
-                policy_version: 10,
-                threshold: ThresholdRequirement::TwoOfThree,
-                nonce: 11,
-                expiry_slot: 12,
             }))
         );
     }
@@ -811,70 +821,6 @@ mod tests {
                 current_authority_hash: [3; 32],
                 current_authority_root: [4; 32],
                 bump: 5,
-            }))
-        );
-    }
-
-    #[test]
-    fn parses_open_session_instruction() {
-        let mut data = vec![6];
-        data.extend_from_slice(&[4; 32]);
-        data.extend_from_slice(&10u64.to_le_bytes());
-        data.push(2);
-        data.extend_from_slice(&11u64.to_le_bytes());
-        data.extend_from_slice(&12u64.to_le_bytes());
-
-        assert_eq!(
-            CoreInstruction::try_from(data.as_slice()),
-            Ok(CoreInstruction::OpenSession(PolicyReceipt {
-                action_hash: [4; 32],
-                policy_version: 10,
-                threshold: ThresholdRequirement::TwoOfThree,
-                nonce: 11,
-                expiry_slot: 12,
-            }))
-        );
-    }
-
-    #[test]
-    fn parses_activate_session_instruction() {
-        let mut data = vec![7];
-        data.extend_from_slice(&[7; 32]);
-
-        assert_eq!(
-            CoreInstruction::try_from(data.as_slice()),
-            Ok(CoreInstruction::ActivateSession([7; 32]))
-        );
-    }
-
-    #[test]
-    fn parses_consume_session_instruction() {
-        let mut data = vec![8];
-        data.extend_from_slice(&[8; 32]);
-
-        assert_eq!(
-            CoreInstruction::try_from(data.as_slice()),
-            Ok(CoreInstruction::ConsumeSession([8; 32]))
-        );
-    }
-
-    #[test]
-    fn parses_finalize_session_instruction() {
-        let mut data = vec![9];
-        data.extend_from_slice(&[4; 32]);
-        data.extend_from_slice(&10u64.to_le_bytes());
-        data.push(2);
-        data.extend_from_slice(&11u64.to_le_bytes());
-        data.extend_from_slice(&12u64.to_le_bytes());
-
-        assert_eq!(
-            CoreInstruction::try_from(data.as_slice()),
-            Ok(CoreInstruction::FinalizeSession(PolicyReceipt {
-                action_hash: [4; 32],
-                policy_version: 10,
-                threshold: ThresholdRequirement::TwoOfThree,
-                nonce: 11,
-                expiry_slot: 12,
             }))
         );
     }
@@ -907,16 +853,6 @@ mod tests {
                     auth_path: [10; XMSS_AUTH_PATH_BYTES],
                 },
             }))
-        );
-    }
-
-    #[test]
-    fn parses_set_vault_status_instruction() {
-        let data = vec![10, 2];
-
-        assert_eq!(
-            CoreInstruction::try_from(data.as_slice()),
-            Ok(CoreInstruction::SetVaultStatus(2))
         );
     }
 
@@ -1010,21 +946,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_threshold_encoding() {
-        let mut data = vec![4];
-        data.extend_from_slice(&[4; 32]);
-        data.extend_from_slice(&10u64.to_le_bytes());
-        data.push(99);
-        data.extend_from_slice(&11u64.to_le_bytes());
-        data.extend_from_slice(&12u64.to_le_bytes());
-
-        assert_eq!(
-            CoreInstruction::try_from(data.as_slice()),
-            Err(ProgramError::InvalidInstructionData)
-        );
-    }
-
-    #[test]
     fn rejects_oversized_authority_chunk() {
         let mut data = vec![13];
         data.extend_from_slice(&0u32.to_le_bytes());
@@ -1089,6 +1010,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_close_quantum_vault_instruction() {
+        let signature = [1; WINTERNITZ_SIGNATURE_BYTES];
+
+        let mut data = vec![16];
+        data.extend_from_slice(&signature);
+        data.push(6);
+
+        assert_eq!(
+            CoreInstruction::try_from(data.as_slice()),
+            Ok(CoreInstruction::CloseQuantumVault(CloseQuantumVaultArgs {
+                signature,
+                bump: 6,
+            }))
+        );
+    }
+
+    #[test]
     fn parses_advance_pqc_wallet_instruction() {
         let signature = [2; WINTERNITZ_SIGNATURE_BYTES];
 
@@ -1108,33 +1046,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_close_quantum_vault_instruction() {
-        let signature = [1; WINTERNITZ_SIGNATURE_BYTES];
-
-        let mut data = vec![16];
-        data.extend_from_slice(&signature);
-        data.push(6);
-
-        assert_eq!(
-            CoreInstruction::try_from(data.as_slice()),
-            Ok(CoreInstruction::CloseQuantumVault(CloseQuantumVaultArgs {
-                signature,
-                bump: 6,
-            }))
-        );
-    }
-
-    #[test]
     fn parses_init_spend_orchestration_instruction() {
         let mut data = vec![17];
-        data.extend_from_slice(&[1; 32]); // action_hash
-        data.extend_from_slice(&[2; 32]); // session_commitment
-        data.extend_from_slice(&[3; 32]); // signers_commitment
-        data.extend_from_slice(&[4; 32]); // signing_package_hash
+        data.extend_from_slice(&[1; 32]);
+        data.extend_from_slice(&[2; 32]);
+        data.extend_from_slice(&[3; 32]);
+        data.extend_from_slice(&[4; 32]);
         data.extend_from_slice(&500u64.to_le_bytes());
-        data.push(2); // threshold
-        data.push(3); // participant_count
-        data.push(7); // bump
+        data.push(2);
+        data.push(3);
+        data.push(7);
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
@@ -1156,8 +1077,8 @@ mod tests {
     #[test]
     fn parses_commit_spend_orchestration_instruction() {
         let mut data = vec![18];
-        data.extend_from_slice(&[5; 32]); // action_hash
-        data.extend_from_slice(&[6; 32]); // signing_package_hash
+        data.extend_from_slice(&[5; 32]);
+        data.extend_from_slice(&[6; 32]);
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
@@ -1173,8 +1094,8 @@ mod tests {
     #[test]
     fn parses_complete_spend_orchestration_instruction() {
         let mut data = vec![19];
-        data.extend_from_slice(&[7; 32]); // action_hash
-        data.extend_from_slice(&[9; 32]); // tx_binding
+        data.extend_from_slice(&[7; 32]);
+        data.extend_from_slice(&[9; 32]);
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
@@ -1191,7 +1112,7 @@ mod tests {
     fn parses_fail_spend_orchestration_instruction() {
         let mut data = vec![20];
         data.extend_from_slice(&[8; 32]);
-        data.push(42); // reason_code
+        data.push(42);
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
@@ -1205,35 +1126,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_stage_bridged_receipt_instruction() {
-        let mut data = vec![21];
-        data.extend_from_slice(&[11; 32]); // action_hash
-        data.extend_from_slice(&7u64.to_le_bytes()); // policy_version
-        data.push(2); // threshold = TwoOfThree
-        data.extend_from_slice(&8u64.to_le_bytes()); // nonce
-        data.extend_from_slice(&900u64.to_le_bytes()); // expiry_slot
-
-        assert_eq!(
-            CoreInstruction::try_from(data.as_slice()),
-            Ok(CoreInstruction::StageBridgedReceipt(PolicyReceipt {
-                action_hash: [11; 32],
-                policy_version: 7,
-                threshold: ThresholdRequirement::TwoOfThree,
-                nonce: 8,
-                expiry_slot: 900,
-            }))
-        );
-    }
-
-    #[test]
     fn parses_init_recovery_instruction() {
         let mut data = vec![22];
-        data.extend_from_slice(&[1; 32]); // vault_pubkey
-        data.extend_from_slice(&[2; 32]); // recovery_commitment
-        data.extend_from_slice(&5000u64.to_le_bytes()); // expiry_slot
-        data.push(2); // new_threshold
-        data.push(3); // new_participant_count
-        data.push(7); // bump
+        data.extend_from_slice(&[1; 32]);
+        data.extend_from_slice(&[2; 32]);
+        data.extend_from_slice(&5000u64.to_le_bytes());
+        data.push(2);
+        data.push(3);
+        data.push(7);
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
@@ -1251,8 +1151,8 @@ mod tests {
     #[test]
     fn parses_complete_recovery_instruction() {
         let mut data = vec![23];
-        data.extend_from_slice(&[3; 32]); // new_group_key
-        data.extend_from_slice(&[4; 32]); // new_authority_hash
+        data.extend_from_slice(&[3; 32]);
+        data.extend_from_slice(&[4; 32]);
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
@@ -1266,26 +1166,13 @@ mod tests {
     #[test]
     fn parses_migrate_authority_instruction() {
         let mut data = vec![24];
-        data.extend_from_slice(&[5; 32]); // new_authority_root
+        data.extend_from_slice(&[5; 32]);
 
         assert_eq!(
             CoreInstruction::try_from(data.as_slice()),
             Ok(CoreInstruction::MigrateAuthority(MigrateAuthorityArgs {
                 new_authority_root: [5; 32],
             }))
-        );
-    }
-
-    #[test]
-    fn parses_advance_policy_version_instruction() {
-        let mut data = vec![25];
-        data.extend_from_slice(&42u64.to_le_bytes());
-
-        assert_eq!(
-            CoreInstruction::try_from(data.as_slice()),
-            Ok(CoreInstruction::AdvancePolicyVersion(
-                AdvancePolicyVersionArgs { new_version: 42 }
-            ))
         );
     }
 }

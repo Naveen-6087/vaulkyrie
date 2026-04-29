@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Command-line interface for the Vaulkyrie threshold wallet — vault management, DKG ceremonies, policy receipts, authority rotation, and quantum vault operations."
+description = "Command-line interface for the Vaulkyrie threshold wallet — vault management, DKG ceremonies, authority rotation, and quantum vault operations."
 
 [[bin]]
 name = "vaulkyrie"

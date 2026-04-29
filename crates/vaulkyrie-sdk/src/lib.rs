@@ -14,7 +14,6 @@ pub mod accounts;
 pub mod error;
 pub mod instruction;
 pub mod pda;
-pub mod privacy;
 pub mod types;
 
 #[cfg(feature = "frost")]

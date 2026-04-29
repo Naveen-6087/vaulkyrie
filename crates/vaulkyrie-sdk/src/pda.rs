@@ -11,8 +11,8 @@ use curve25519_dalek::edwards::CompressedEdwardsY;
 use sha2::{Digest, Sha256};
 use solana_pubkey::Pubkey;
 use vaulkyrie_protocol::{
-    ACTION_SESSION_SEED, AUTHORITY_PROOF_SEED, POLICY_RECEIPT_SEED, PQC_WALLET_SEED,
-    QUANTUM_AUTHORITY_SEED, QUANTUM_VAULT_SEED, SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
+    AUTHORITY_PROOF_SEED, PQC_WALLET_SEED, QUANTUM_AUTHORITY_SEED, QUANTUM_VAULT_SEED,
+    SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
 };
 
 /// Standard Solana PDA derivation: tries bumps 255..=0 until the hash lands
@@ -47,30 +47,6 @@ fn create_program_address(seeds: &[&[u8]], bump: u8, program_id: &Pubkey) -> Opt
 /// VaultRegistry PDA — seeds: `["vault_registry", wallet_pubkey]`
 pub fn find_vault_registry(wallet_pubkey: &Pubkey, program_id: &Pubkey) -> (Pubkey, u8) {
     find_program_address(&[VAULT_REGISTRY_SEED, wallet_pubkey.as_ref()], program_id)
-}
-
-/// PolicyReceiptState PDA — seeds: `["policy_receipt", vault_id, action_hash]`
-pub fn find_policy_receipt(
-    vault_id: &Pubkey,
-    action_hash: &[u8; 32],
-    program_id: &Pubkey,
-) -> (Pubkey, u8) {
-    find_program_address(
-        &[POLICY_RECEIPT_SEED, vault_id.as_ref(), action_hash],
-        program_id,
-    )
-}
-
-/// ActionSessionState PDA — seeds: `["action_session", vault_id, action_hash]`
-pub fn find_action_session(
-    vault_id: &Pubkey,
-    action_hash: &[u8; 32],
-    program_id: &Pubkey,
-) -> (Pubkey, u8) {
-    find_program_address(
-        &[ACTION_SESSION_SEED, vault_id.as_ref(), action_hash],
-        program_id,
-    )
 }
 
 /// QuantumAuthorityState PDA — seeds: `["quantum_authority", vault_id]`
@@ -145,14 +121,13 @@ mod tests {
         let pid = test_program_id();
 
         let (vault_reg, _) = find_vault_registry(&vault, &pid);
-        let (receipt, _) = find_policy_receipt(&vault, &hash, &pid);
-        let (session, _) = find_action_session(&vault, &hash, &pid);
         let (authority, _) = find_quantum_authority(&vault, &pid);
         let (proof, _) = find_authority_proof(&vault, &hash, &pid);
         let (qv, _) = find_quantum_vault(&hash, &pid);
+        let (pqc_wallet, _) = find_pqc_wallet(&hash, &pid);
         let (orch, _) = find_spend_orchestration(&vault, &hash, &pid);
 
-        let addrs = [vault_reg, receipt, session, authority, proof, qv, orch];
+        let addrs = [vault_reg, authority, proof, qv, pqc_wallet, orch];
         for (i, a) in addrs.iter().enumerate() {
             for (j, b) in addrs.iter().enumerate() {
                 if i != j {

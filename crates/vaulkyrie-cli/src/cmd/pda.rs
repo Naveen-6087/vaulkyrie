@@ -12,28 +12,6 @@ pub enum PdaCmd {
         #[arg(long)]
         wallet_pubkey: String,
     },
-    /// Derive policy receipt PDA
-    PolicyReceipt {
-        #[arg(long)]
-        program_id: String,
-        /// Vault ID (base58)
-        #[arg(long)]
-        vault_id: String,
-        /// Action hash (hex, 32 bytes)
-        #[arg(long)]
-        action_hash: String,
-    },
-    /// Derive action session PDA
-    ActionSession {
-        #[arg(long)]
-        program_id: String,
-        /// Vault ID (base58)
-        #[arg(long)]
-        vault_id: String,
-        /// Action hash (hex, 32 bytes)
-        #[arg(long)]
-        action_hash: String,
-    },
     /// Derive quantum authority PDA
     QuantumAuthority {
         #[arg(long)]
@@ -84,30 +62,6 @@ pub fn run(cmd: PdaCmd) -> Result<(), String> {
             let wallet = parse_pubkey(&wallet_pubkey)?;
             let (addr, bump) = vaulkyrie_sdk::pda::find_vault_registry(&wallet, &pid);
             print_pda("VaultRegistry", &addr, bump);
-            Ok(())
-        }
-        PdaCmd::PolicyReceipt {
-            program_id,
-            vault_id,
-            action_hash,
-        } => {
-            let pid = parse_pubkey(&program_id)?;
-            let vault = parse_pubkey(&vault_id)?;
-            let hash = super::parse_hash(&action_hash)?;
-            let (addr, bump) = vaulkyrie_sdk::pda::find_policy_receipt(&vault, &hash, &pid);
-            print_pda("PolicyReceipt", &addr, bump);
-            Ok(())
-        }
-        PdaCmd::ActionSession {
-            program_id,
-            vault_id,
-            action_hash,
-        } => {
-            let pid = parse_pubkey(&program_id)?;
-            let vault = parse_pubkey(&vault_id)?;
-            let hash = super::parse_hash(&action_hash)?;
-            let (addr, bump) = vaulkyrie_sdk::pda::find_action_session(&vault, &hash, &pid);
-            print_pda("ActionSession", &addr, bump);
             Ok(())
         }
         PdaCmd::QuantumAuthority {

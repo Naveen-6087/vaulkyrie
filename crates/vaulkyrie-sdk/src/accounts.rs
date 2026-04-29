@@ -12,11 +12,8 @@ use vaulkyrie_protocol::WotsAuthProof;
 pub struct VaultRegistry {
     pub wallet_pubkey: [u8; 32],
     pub current_authority_hash: [u8; 32],
-    pub policy_version: u64,
-    pub last_consumed_receipt_nonce: u64,
     pub status: u8,
     pub bump: u8,
-    pub policy_mxe_program: [u8; 32],
 }
 
 impl VaultRegistry {
@@ -36,118 +33,16 @@ impl VaultRegistry {
         let mut current_authority_hash = [0u8; 32];
         current_authority_hash.copy_from_slice(&src[40..72]);
 
-        let mut pv = [0u8; 8];
-        pv.copy_from_slice(&src[72..80]);
-
-        let mut nonce = [0u8; 8];
-        nonce.copy_from_slice(&src[80..88]);
-
-        let mut policy_mxe_program = [0u8; 32];
-        policy_mxe_program.copy_from_slice(&src[90..122]);
-
         Some(Self {
             wallet_pubkey,
             current_authority_hash,
-            policy_version: u64::from_le_bytes(pv),
-            last_consumed_receipt_nonce: u64::from_le_bytes(nonce),
-            status: src[88],
-            bump: src[89],
-            policy_mxe_program,
+            status: src[72],
+            bump: src[73],
         })
     }
 
     pub fn vault_status(&self) -> Option<VaultStatus> {
         VaultStatus::try_from(self.status).ok()
-    }
-}
-
-/// Policy receipt state (96 bytes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PolicyReceiptState {
-    pub receipt_commitment: [u8; 32],
-    pub action_hash: [u8; 32],
-    pub nonce: u64,
-    pub expiry_slot: u64,
-    pub consumed: u8,
-}
-
-impl PolicyReceiptState {
-    pub const LEN: usize = 96;
-
-    pub fn decode(src: &[u8]) -> Option<Self> {
-        if src.len() != Self::LEN {
-            return None;
-        }
-        if src[..8] != POLICY_RECEIPT_DISCRIMINATOR {
-            return None;
-        }
-
-        let mut receipt_commitment = [0u8; 32];
-        receipt_commitment.copy_from_slice(&src[8..40]);
-        let mut action_hash = [0u8; 32];
-        action_hash.copy_from_slice(&src[40..72]);
-        let mut nonce = [0u8; 8];
-        nonce.copy_from_slice(&src[72..80]);
-        let mut expiry = [0u8; 8];
-        expiry.copy_from_slice(&src[80..88]);
-
-        Some(Self {
-            receipt_commitment,
-            action_hash,
-            nonce: u64::from_le_bytes(nonce),
-            expiry_slot: u64::from_le_bytes(expiry),
-            consumed: src[88],
-        })
-    }
-
-    pub fn is_consumed(&self) -> bool {
-        self.consumed != 0
-    }
-}
-
-/// Action session state (96 bytes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ActionSessionState {
-    pub receipt_commitment: [u8; 32],
-    pub action_hash: [u8; 32],
-    pub policy_version: u64,
-    pub expiry_slot: u64,
-    pub threshold: u8,
-    pub status: u8,
-}
-
-impl ActionSessionState {
-    pub const LEN: usize = 96;
-
-    pub fn decode(src: &[u8]) -> Option<Self> {
-        if src.len() != Self::LEN {
-            return None;
-        }
-        if src[..8] != ACTION_SESSION_DISCRIMINATOR {
-            return None;
-        }
-
-        let mut receipt_commitment = [0u8; 32];
-        receipt_commitment.copy_from_slice(&src[8..40]);
-        let mut action_hash = [0u8; 32];
-        action_hash.copy_from_slice(&src[40..72]);
-        let mut pv = [0u8; 8];
-        pv.copy_from_slice(&src[72..80]);
-        let mut expiry = [0u8; 8];
-        expiry.copy_from_slice(&src[80..88]);
-
-        Some(Self {
-            receipt_commitment,
-            action_hash,
-            policy_version: u64::from_le_bytes(pv),
-            expiry_slot: u64::from_le_bytes(expiry),
-            threshold: src[88],
-            status: src[89],
-        })
-    }
-
-    pub fn session_status(&self) -> Option<SessionStatus> {
-        SessionStatus::try_from(self.status).ok()
     }
 }
 
@@ -350,6 +245,42 @@ impl RecoveryState {
     }
 }
 
+/// PQC wallet state (88 bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PqcWalletState {
+    pub wallet_id: [u8; 32],
+    pub current_root: [u8; 32],
+    pub sequence: u64,
+    pub bump: u8,
+}
+
+impl PqcWalletState {
+    pub const LEN: usize = 88;
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() != Self::LEN {
+            return None;
+        }
+        if src[..8] != PQC_WALLET_DISCRIMINATOR {
+            return None;
+        }
+
+        let mut wallet_id = [0u8; 32];
+        wallet_id.copy_from_slice(&src[8..40]);
+        let mut current_root = [0u8; 32];
+        current_root.copy_from_slice(&src[40..72]);
+        let mut sequence = [0u8; 8];
+        sequence.copy_from_slice(&src[72..80]);
+
+        Some(Self {
+            wallet_id,
+            current_root,
+            sequence: u64::from_le_bytes(sequence),
+            bump: src[80],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,11 +290,8 @@ mod tests {
         buf[..8].copy_from_slice(b"VAULKYR1");
         buf[8..40].copy_from_slice(&[1u8; 32]); // wallet_pubkey
         buf[40..72].copy_from_slice(&[2u8; 32]); // authority_hash
-        buf[72..80].copy_from_slice(&42u64.to_le_bytes()); // policy_version
-        buf[80..88].copy_from_slice(&7u64.to_le_bytes()); // nonce
-        buf[88] = 1; // status = Active
-        buf[89] = 3; // bump
-        buf[90..122].copy_from_slice(&[10u8; 32]); // policy_mxe_program
+        buf[72] = 1; // status = Active
+        buf[73] = 3; // bump
         buf
     }
 
@@ -373,11 +301,8 @@ mod tests {
         let vault = VaultRegistry::decode(&bytes).unwrap();
         assert_eq!(vault.wallet_pubkey, [1u8; 32]);
         assert_eq!(vault.current_authority_hash, [2u8; 32]);
-        assert_eq!(vault.policy_version, 42);
-        assert_eq!(vault.last_consumed_receipt_nonce, 7);
         assert_eq!(vault.vault_status(), Some(VaultStatus::Active));
         assert_eq!(vault.bump, 3);
-        assert_eq!(vault.policy_mxe_program, [10u8; 32]);
     }
 
     #[test]
@@ -390,48 +315,6 @@ mod tests {
     #[test]
     fn vault_registry_rejects_wrong_size() {
         assert!(VaultRegistry::decode(&[0u8; 100]).is_none());
-    }
-
-    fn make_receipt_bytes() -> [u8; PolicyReceiptState::LEN] {
-        let mut buf = [0u8; 96];
-        buf[..8].copy_from_slice(b"POLRCPT1");
-        buf[8..40].copy_from_slice(&[3u8; 32]); // receipt_commitment
-        buf[40..72].copy_from_slice(&[4u8; 32]); // action_hash
-        buf[72..80].copy_from_slice(&5u64.to_le_bytes()); // nonce
-        buf[80..88].copy_from_slice(&6u64.to_le_bytes()); // expiry_slot
-        buf[88] = 0; // consumed
-        buf
-    }
-
-    #[test]
-    fn policy_receipt_decodes_correctly() {
-        let bytes = make_receipt_bytes();
-        let receipt = PolicyReceiptState::decode(&bytes).unwrap();
-        assert_eq!(receipt.receipt_commitment, [3u8; 32]);
-        assert_eq!(receipt.action_hash, [4u8; 32]);
-        assert_eq!(receipt.nonce, 5);
-        assert_eq!(receipt.expiry_slot, 6);
-        assert!(!receipt.is_consumed());
-    }
-
-    fn make_session_bytes() -> [u8; ActionSessionState::LEN] {
-        let mut buf = [0u8; 96];
-        buf[..8].copy_from_slice(b"SESSION1");
-        buf[8..40].copy_from_slice(&[6u8; 32]); // receipt_commitment
-        buf[40..72].copy_from_slice(&[7u8; 32]); // action_hash
-        buf[72..80].copy_from_slice(&77u64.to_le_bytes()); // policy_version
-        buf[80..88].copy_from_slice(&99u64.to_le_bytes()); // expiry_slot
-        buf[88] = 2; // threshold
-        buf[89] = 1; // status = Pending
-        buf
-    }
-
-    #[test]
-    fn action_session_decodes_correctly() {
-        let bytes = make_session_bytes();
-        let session = ActionSessionState::decode(&bytes).unwrap();
-        assert_eq!(session.threshold, 2);
-        assert_eq!(session.session_status(), Some(SessionStatus::Pending));
     }
 
     fn make_authority_bytes() -> [u8; QuantumAuthorityState::LEN] {

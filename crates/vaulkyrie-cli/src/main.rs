@@ -4,8 +4,8 @@ use clap::Parser;
 
 /// Vaulkyrie — Solana threshold wallet CLI
 ///
-/// Manage vaults, run DKG ceremonies, stage policy receipts,
-/// rotate quantum authorities, and orchestrate threshold spends.
+/// Manage vaults, run DKG ceremonies, rotate quantum authorities,
+/// and orchestrate threshold spends.
 #[derive(Parser)]
 #[command(name = "vaulkyrie", version, about, long_about = None)]
 struct Cli {

@@ -3,7 +3,6 @@ pub mod decode;
 pub mod dkg;
 pub mod inspect;
 pub mod pda;
-pub mod policy;
 pub mod quantum;
 pub mod recovery;
 pub mod spend;
@@ -20,10 +19,6 @@ pub enum Command {
     /// DKG ceremonies — keygen, sign, refresh, legacy-message signing
     #[command(subcommand)]
     Dkg(dkg::DkgCmd),
-
-    /// Policy receipt operations — stage, consume, bridge
-    #[command(subcommand)]
-    Policy(policy::PolicyCmd),
 
     /// Quantum authority — init, rotate, proof chunks
     #[command(subcommand)]
@@ -65,7 +60,6 @@ pub fn dispatch(cmd: Command) -> Result<(), String> {
     match cmd {
         Command::Vault(sub) => vault::run(sub),
         Command::Dkg(sub) => dkg::run(sub),
-        Command::Policy(sub) => policy::run(sub),
         Command::Authority(sub) => authority::run(sub),
         Command::Quantum(sub) => quantum::run(sub),
         Command::Spend(sub) => spend::run(sub),

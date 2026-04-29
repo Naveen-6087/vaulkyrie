@@ -7,25 +7,15 @@
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 use vaulkyrie_protocol::{
-    AuthorityRotationStatement, PolicyReceipt, WinterAuthorityAdvanceStatement,
-    WinterAuthoritySignature, WotsAuthProof, AUTHORITY_PROOF_CHUNK_MAX_BYTES,
+    AuthorityRotationStatement, WinterAuthorityAdvanceStatement, WinterAuthoritySignature,
+    WotsAuthProof, AUTHORITY_PROOF_CHUNK_MAX_BYTES,
 };
-
-fn system_program_id() -> Pubkey {
-    Pubkey::from([0u8; 32])
-}
 
 // ─── Discriminators ──────────────────────────────────────────────────────────
 const DISC_PING: u8 = 0;
 const DISC_INIT_VAULT: u8 = 1;
 const DISC_INIT_AUTHORITY: u8 = 2;
 const DISC_INIT_QUANTUM_VAULT: u8 = 3;
-const DISC_STAGE_RECEIPT: u8 = 4;
-const DISC_CONSUME_RECEIPT: u8 = 5;
-const DISC_OPEN_SESSION: u8 = 6;
-const DISC_ACTIVATE_SESSION: u8 = 7;
-const DISC_CONSUME_SESSION: u8 = 8;
-const DISC_FINALIZE_SESSION: u8 = 9;
 const DISC_SET_VAULT_STATUS: u8 = 10;
 const DISC_ROTATE_AUTHORITY: u8 = 11;
 const DISC_INIT_AUTHORITY_PROOF: u8 = 12;
@@ -37,34 +27,12 @@ const DISC_INIT_SPEND_ORCH: u8 = 17;
 const DISC_COMMIT_SPEND_ORCH: u8 = 18;
 const DISC_COMPLETE_SPEND_ORCH: u8 = 19;
 const DISC_FAIL_SPEND_ORCH: u8 = 20;
-const DISC_STAGE_BRIDGED_RECEIPT: u8 = 21;
 const DISC_INIT_RECOVERY: u8 = 22;
 const DISC_COMPLETE_RECOVERY: u8 = 23;
 const DISC_MIGRATE_AUTHORITY: u8 = 24;
-const DISC_ADVANCE_POLICY_VERSION: u8 = 25;
 const DISC_ADVANCE_WINTER_AUTHORITY: u8 = 26;
 const DISC_INIT_PQC_WALLET: u8 = 27;
 const DISC_ADVANCE_PQC_WALLET: u8 = 28;
-
-// ─── Receipt helpers ─────────────────────────────────────────────────────────
-
-fn serialize_policy_receipt(disc: u8, receipt: &PolicyReceipt) -> Vec<u8> {
-    let mut data = Vec::with_capacity(1 + 57);
-    data.push(disc);
-    data.extend_from_slice(&receipt.action_hash);
-    data.extend_from_slice(&receipt.policy_version.to_le_bytes());
-    data.push(receipt.threshold as u8);
-    data.extend_from_slice(&receipt.nonce.to_le_bytes());
-    data.extend_from_slice(&receipt.expiry_slot.to_le_bytes());
-    data
-}
-
-fn serialize_action_hash(disc: u8, action_hash: &[u8; 32]) -> Vec<u8> {
-    let mut data = Vec::with_capacity(1 + 32);
-    data.push(disc);
-    data.extend_from_slice(action_hash);
-    data
-}
 
 fn serialize_authority_rotation_statement(stmt: &AuthorityRotationStatement) -> Vec<u8> {
     let mut v = Vec::with_capacity(80);
@@ -99,17 +67,13 @@ pub fn init_vault(
     wallet_signer: &Pubkey,
     wallet_pubkey: [u8; 32],
     authority_hash: [u8; 32],
-    policy_version: u64,
     bump: u8,
-    policy_mxe_program: [u8; 32],
 ) -> Instruction {
-    let mut data = Vec::with_capacity(1 + 105);
+    let mut data = Vec::with_capacity(1 + 65);
     data.push(DISC_INIT_VAULT);
     data.extend_from_slice(&wallet_pubkey);
     data.extend_from_slice(&authority_hash);
-    data.extend_from_slice(&policy_version.to_le_bytes());
     data.push(bump);
-    data.extend_from_slice(&policy_mxe_program);
 
     Instruction::new_with_bytes(
         *program_id,
@@ -190,137 +154,6 @@ pub fn init_pqc_wallet(
             AccountMeta::new(*payer, true),
             AccountMeta::new(*wallet, false),
             AccountMeta::new_readonly(Pubkey::from([0u8; 32]), false),
-        ],
-    )
-}
-
-// ─── 4: StageReceipt ─────────────────────────────────────────────────────────
-
-pub fn stage_receipt(
-    program_id: &Pubkey,
-    vault: &Pubkey,
-    receipt_account: &Pubkey,
-    wallet_signer: &Pubkey,
-    receipt: &PolicyReceipt,
-) -> Instruction {
-    let data = serialize_policy_receipt(DISC_STAGE_RECEIPT, receipt);
-    Instruction::new_with_bytes(
-        *program_id,
-        &data,
-        vec![
-            AccountMeta::new_readonly(*vault, false),
-            AccountMeta::new(*receipt_account, false),
-            AccountMeta::new(*wallet_signer, true),
-            AccountMeta::new_readonly(system_program_id(), false),
-        ],
-    )
-}
-
-// ─── 5: ConsumeReceipt ───────────────────────────────────────────────────────
-
-pub fn consume_receipt(
-    program_id: &Pubkey,
-    vault: &Pubkey,
-    receipt_account: &Pubkey,
-    wallet_signer: &Pubkey,
-    receipt: &PolicyReceipt,
-) -> Instruction {
-    let data = serialize_policy_receipt(DISC_CONSUME_RECEIPT, receipt);
-    Instruction::new_with_bytes(
-        *program_id,
-        &data,
-        vec![
-            AccountMeta::new(*vault, false),
-            AccountMeta::new(*receipt_account, false),
-            AccountMeta::new_readonly(*wallet_signer, true),
-        ],
-    )
-}
-
-// ─── 6: OpenSession ──────────────────────────────────────────────────────────
-
-pub fn open_session(
-    program_id: &Pubkey,
-    receipt_account: &Pubkey,
-    session_account: &Pubkey,
-    vault: &Pubkey,
-    wallet_signer: &Pubkey,
-    receipt: &PolicyReceipt,
-) -> Instruction {
-    let data = serialize_policy_receipt(DISC_OPEN_SESSION, receipt);
-    Instruction::new_with_bytes(
-        *program_id,
-        &data,
-        vec![
-            AccountMeta::new_readonly(*receipt_account, false),
-            AccountMeta::new(*session_account, false),
-            AccountMeta::new_readonly(*vault, false),
-            AccountMeta::new_readonly(*wallet_signer, true),
-        ],
-    )
-}
-
-// ─── 7: ActivateSession ──────────────────────────────────────────────────────
-
-pub fn activate_session(
-    program_id: &Pubkey,
-    session: &Pubkey,
-    vault: &Pubkey,
-    wallet_signer: &Pubkey,
-    action_hash: &[u8; 32],
-) -> Instruction {
-    let data = serialize_action_hash(DISC_ACTIVATE_SESSION, action_hash);
-    Instruction::new_with_bytes(
-        *program_id,
-        &data,
-        vec![
-            AccountMeta::new(*session, false),
-            AccountMeta::new_readonly(*vault, false),
-            AccountMeta::new_readonly(*wallet_signer, true),
-        ],
-    )
-}
-
-// ─── 8: ConsumeSession ───────────────────────────────────────────────────────
-
-pub fn consume_session(
-    program_id: &Pubkey,
-    session: &Pubkey,
-    vault: &Pubkey,
-    wallet_signer: &Pubkey,
-    action_hash: &[u8; 32],
-) -> Instruction {
-    let data = serialize_action_hash(DISC_CONSUME_SESSION, action_hash);
-    Instruction::new_with_bytes(
-        *program_id,
-        &data,
-        vec![
-            AccountMeta::new(*session, false),
-            AccountMeta::new_readonly(*vault, false),
-            AccountMeta::new_readonly(*wallet_signer, true),
-        ],
-    )
-}
-
-// ─── 9: FinalizeSession ──────────────────────────────────────────────────────
-
-pub fn finalize_session(
-    program_id: &Pubkey,
-    receipt_account: &Pubkey,
-    session: &Pubkey,
-    vault: &Pubkey,
-    wallet_signer: &Pubkey,
-    receipt: &PolicyReceipt,
-) -> Instruction {
-    let data = serialize_policy_receipt(DISC_FINALIZE_SESSION, receipt);
-    Instruction::new_with_bytes(
-        *program_id,
-        &data,
-        vec![
-            AccountMeta::new(*receipt_account, false),
-            AccountMeta::new(*session, false),
-            AccountMeta::new(*vault, false),
-            AccountMeta::new_readonly(*wallet_signer, true),
         ],
     )
 }
@@ -678,30 +511,6 @@ pub fn fail_spend_orchestration(
     )
 }
 
-// ─── 21: StageBridgedReceipt ─────────────────────────────────────────────────
-
-pub fn stage_bridged_receipt(
-    program_id: &Pubkey,
-    vault: &Pubkey,
-    receipt_account: &Pubkey,
-    wallet_signer: &Pubkey,
-    policy_eval_account: &Pubkey,
-    receipt: &PolicyReceipt,
-) -> Instruction {
-    let data = serialize_policy_receipt(DISC_STAGE_BRIDGED_RECEIPT, receipt);
-    Instruction::new_with_bytes(
-        *program_id,
-        &data,
-        vec![
-            AccountMeta::new_readonly(*vault, false),
-            AccountMeta::new(*receipt_account, false),
-            AccountMeta::new(*wallet_signer, true),
-            AccountMeta::new_readonly(*policy_eval_account, false),
-            AccountMeta::new_readonly(system_program_id(), false),
-        ],
-    )
-}
-
 // ─── 22: InitRecovery ────────────────────────────────────────────────────────
 
 pub fn init_recovery(
@@ -772,24 +581,9 @@ pub fn migrate_authority(
     )
 }
 
-// ─── 25: AdvancePolicyVersion ────────────────────────────────────────────────
-
-pub fn advance_policy_version(
-    program_id: &Pubkey,
-    vault: &Pubkey,
-    new_version: u64,
-) -> Instruction {
-    let mut data = Vec::with_capacity(1 + 8);
-    data.push(DISC_ADVANCE_POLICY_VERSION);
-    data.extend_from_slice(&new_version.to_le_bytes());
-
-    Instruction::new_with_bytes(*program_id, &data, vec![AccountMeta::new(*vault, false)])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vaulkyrie_protocol::ThresholdRequirement;
 
     fn pid() -> Pubkey {
         Pubkey::from([1u8; 32])
@@ -808,9 +602,9 @@ mod tests {
 
     #[test]
     fn init_vault_serializes_correctly() {
-        let ix = init_vault(&pid(), &key(2), &key(3), [7; 32], [9; 32], 42, 3, [11; 32]);
+        let ix = init_vault(&pid(), &key(2), &key(3), [7; 32], [9; 32], 3);
         assert_eq!(ix.data[0], 1);
-        assert_eq!(ix.data.len(), 1 + 105);
+        assert_eq!(ix.data.len(), 1 + 65);
         assert_eq!(ix.accounts.len(), 3);
         assert!(ix.accounts[0].is_writable);
         assert!(ix.accounts[1].is_signer);
@@ -827,31 +621,6 @@ mod tests {
         assert!(ix.accounts[2].is_signer);
         assert!(ix.accounts[2].is_writable);
         assert_eq!(ix.accounts[3].pubkey, Pubkey::from([0u8; 32]));
-    }
-
-    #[test]
-    fn stage_receipt_serializes_correctly() {
-        let receipt = PolicyReceipt {
-            action_hash: [1; 32],
-            policy_version: 1,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 0,
-            expiry_slot: 100,
-        };
-        let ix = stage_receipt(&pid(), &key(2), &key(3), &key(4), &receipt);
-        assert_eq!(ix.data[0], 4);
-        assert_eq!(ix.data.len(), 1 + 57);
-        assert_eq!(ix.accounts.len(), 4);
-        assert!(ix.accounts[2].is_signer);
-        assert!(ix.accounts[2].is_writable);
-        assert_eq!(ix.accounts[3].pubkey, system_program_id());
-    }
-
-    #[test]
-    fn activate_session_serializes_correctly() {
-        let ix = activate_session(&pid(), &key(2), &key(3), &key(4), &[99; 32]);
-        assert_eq!(ix.data[0], 7);
-        assert_eq!(ix.data.len(), 1 + 32);
     }
 
     #[test]
@@ -920,24 +689,6 @@ mod tests {
     }
 
     #[test]
-    fn stage_bridged_receipt_serializes_correctly() {
-        let receipt = PolicyReceipt {
-            action_hash: [1; 32],
-            policy_version: 1,
-            threshold: ThresholdRequirement::TwoOfThree,
-            nonce: 0,
-            expiry_slot: 100,
-        };
-        let ix = stage_bridged_receipt(&pid(), &key(2), &key(3), &key(4), &key(5), &receipt);
-        assert_eq!(ix.data[0], 21);
-        assert_eq!(ix.data.len(), 1 + 57);
-        assert_eq!(ix.accounts.len(), 5);
-        assert!(ix.accounts[2].is_signer);
-        assert!(ix.accounts[2].is_writable);
-        assert_eq!(ix.accounts[4].pubkey, system_program_id());
-    }
-
-    #[test]
     fn init_recovery_serializes_correctly() {
         let ix = init_recovery(&pid(), &key(2), &key(3), [1; 32], [2; 32], 500, 2, 3, 5);
         assert_eq!(ix.data[0], 22);
@@ -956,13 +707,6 @@ mod tests {
         let ix = migrate_authority(&pid(), &key(2), [5; 32]);
         assert_eq!(ix.data[0], 24);
         assert_eq!(ix.data.len(), 1 + 32);
-    }
-
-    #[test]
-    fn advance_policy_version_serializes_correctly() {
-        let ix = advance_policy_version(&pid(), &key(2), 42);
-        assert_eq!(ix.data[0], 25);
-        assert_eq!(ix.data.len(), 1 + 8);
     }
 
     #[test]

@@ -2,8 +2,8 @@
 use pinocchio::pubkey::create_program_address;
 use pinocchio::{program_error::ProgramError, pubkey::Pubkey};
 use vaulkyrie_protocol::{
-    ACTION_SESSION_SEED, AUTHORITY_PROOF_SEED, POLICY_RECEIPT_SEED, PQC_WALLET_SEED,
-    QUANTUM_AUTHORITY_SEED, QUANTUM_VAULT_SEED, SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
+    AUTHORITY_PROOF_SEED, PQC_WALLET_SEED, QUANTUM_AUTHORITY_SEED, QUANTUM_VAULT_SEED,
+    SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
 };
 
 fn create_pda_address(seeds: &[&[u8]], program_id: &Pubkey) -> Result<Pubkey, ProgramError> {
@@ -40,87 +40,6 @@ pub fn verify_vault_registry(
     program_id: &Pubkey,
 ) -> Result<(), ProgramError> {
     let derived = derive_vault_registry(wallet_pubkey, bump, program_id)?;
-    if &derived != expected_key {
-        return Err(ProgramError::InvalidSeeds);
-    }
-    Ok(())
-}
-
-// ── PolicyReceiptState PDA ─────────────────────────────────────────────────
-// Seeds: ["policy_receipt", vault_id, action_hash, bump]
-
-pub fn derive_policy_receipt(
-    vault_id: &[u8; 32],
-    action_hash: &[u8; 32],
-    bump: u8,
-    program_id: &Pubkey,
-) -> Result<Pubkey, ProgramError> {
-    let bump_slice = [bump];
-    create_pda_address(
-        &[POLICY_RECEIPT_SEED, vault_id, action_hash, &bump_slice],
-        program_id,
-    )
-}
-
-pub fn verify_policy_receipt(
-    expected_key: &Pubkey,
-    vault_id: &[u8; 32],
-    action_hash: &[u8; 32],
-    bump: u8,
-    program_id: &Pubkey,
-) -> Result<(), ProgramError> {
-    let derived = derive_policy_receipt(vault_id, action_hash, bump, program_id)?;
-    if &derived != expected_key {
-        return Err(ProgramError::InvalidSeeds);
-    }
-    Ok(())
-}
-
-pub fn find_policy_receipt_bump(
-    expected_key: &Pubkey,
-    vault_id: &[u8; 32],
-    action_hash: &[u8; 32],
-    program_id: &Pubkey,
-) -> Result<u8, ProgramError> {
-    let mut bump = u8::MAX;
-    loop {
-        if let Ok(derived) = derive_policy_receipt(vault_id, action_hash, bump, program_id) {
-            if &derived == expected_key {
-                return Ok(bump);
-            }
-        }
-        if bump == 0 {
-            break;
-        }
-        bump = bump.saturating_sub(1);
-    }
-    Err(ProgramError::InvalidSeeds)
-}
-
-// ── ActionSessionState PDA ─────────────────────────────────────────────────
-// Seeds: ["action_session", vault_id, action_hash, bump]
-
-pub fn derive_action_session(
-    vault_id: &[u8; 32],
-    action_hash: &[u8; 32],
-    bump: u8,
-    program_id: &Pubkey,
-) -> Result<Pubkey, ProgramError> {
-    let bump_slice = [bump];
-    create_pda_address(
-        &[ACTION_SESSION_SEED, vault_id, action_hash, &bump_slice],
-        program_id,
-    )
-}
-
-pub fn verify_action_session(
-    expected_key: &Pubkey,
-    vault_id: &[u8; 32],
-    action_hash: &[u8; 32],
-    bump: u8,
-    program_id: &Pubkey,
-) -> Result<(), ProgramError> {
-    let derived = derive_action_session(vault_id, action_hash, bump, program_id)?;
     if &derived != expected_key {
         return Err(ProgramError::InvalidSeeds);
     }
@@ -321,8 +240,8 @@ mod host_pda {
 mod tests {
     use super::host_pda;
     use vaulkyrie_protocol::{
-        ACTION_SESSION_SEED, AUTHORITY_PROOF_SEED, POLICY_RECEIPT_SEED, PQC_WALLET_SEED,
-        QUANTUM_AUTHORITY_SEED, QUANTUM_VAULT_SEED, SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
+        AUTHORITY_PROOF_SEED, PQC_WALLET_SEED, QUANTUM_AUTHORITY_SEED, QUANTUM_VAULT_SEED,
+        SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
     };
 
     const PROGRAM_ID: [u8; 32] = [
@@ -361,38 +280,6 @@ mod tests {
                 "different bump should give different address"
             );
         }
-    }
-
-    #[test]
-    fn policy_receipt_pda_derivation() {
-        let vault = [10u8; 32];
-        let action = [20u8; 32];
-        let (expected, bump) =
-            host_pda::find_program_address(&[POLICY_RECEIPT_SEED, &vault, &action], &PROGRAM_ID)
-                .unwrap();
-
-        let derived = host_pda::create_program_address(
-            &[POLICY_RECEIPT_SEED, &vault, &action, &[bump]],
-            &PROGRAM_ID,
-        )
-        .unwrap();
-        assert_eq!(derived, expected);
-    }
-
-    #[test]
-    fn action_session_pda_derivation() {
-        let vault = [11u8; 32];
-        let action = [22u8; 32];
-        let (expected, bump) =
-            host_pda::find_program_address(&[ACTION_SESSION_SEED, &vault, &action], &PROGRAM_ID)
-                .unwrap();
-
-        let derived = host_pda::create_program_address(
-            &[ACTION_SESSION_SEED, &vault, &action, &[bump]],
-            &PROGRAM_ID,
-        )
-        .unwrap();
-        assert_eq!(derived, expected);
     }
 
     #[test]
@@ -466,8 +353,6 @@ mod tests {
     fn all_seed_prefixes_are_unique() {
         let seeds: &[&[u8]] = &[
             VAULT_REGISTRY_SEED,
-            POLICY_RECEIPT_SEED,
-            ACTION_SESSION_SEED,
             QUANTUM_AUTHORITY_SEED,
             AUTHORITY_PROOF_SEED,
             QUANTUM_VAULT_SEED,

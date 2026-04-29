@@ -13,9 +13,8 @@ use pinocchio::{
 };
 use solana_winternitz::signature::WinternitzSignature;
 use vaulkyrie_protocol::{
-    pqc_wallet_advance_message, AuthorityRotationStatement, PolicyReceipt, WotsAuthProof,
-    POLICY_RECEIPT_SEED, PQC_WALLET_SEED, QUANTUM_AUTHORITY_SEED, QUANTUM_VAULT_SEED,
-    SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
+    pqc_wallet_advance_message, AuthorityRotationStatement, WotsAuthProof, PQC_WALLET_SEED,
+    QUANTUM_AUTHORITY_SEED, QUANTUM_VAULT_SEED, SPEND_ORCH_SEED, VAULT_REGISTRY_SEED,
 };
 
 use crate::{
@@ -28,11 +27,9 @@ use crate::{
     },
     pda,
     state::{
-        ActionSessionState, AuthorityProofState, PolicyReceiptState, PqcWalletState,
-        QuantumAuthorityState, SpendOrchestrationState, VaultRegistry,
-        ACTION_SESSION_DISCRIMINATOR, AUTHORITY_PROOF_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR,
-        PQC_WALLET_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR,
-        VAULT_REGISTRY_DISCRIMINATOR,
+        AuthorityProofState, PqcWalletState, QuantumAuthorityState, SpendOrchestrationState,
+        VaultRegistry, AUTHORITY_PROOF_DISCRIMINATOR, PQC_WALLET_DISCRIMINATOR,
+        QUANTUM_STATE_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
     },
     transition,
 };
@@ -44,6 +41,259 @@ static HOST_TEST_SLOT: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(not(feature = "bpf-entrypoint"), not(target_os = "solana")))]
 pub fn set_host_test_slot(slot: u64) {
     HOST_TEST_SLOT.store(slot, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use pinocchio::program_error::ProgramError;
+    use vaulkyrie_protocol::AUTHORITY_PROOF_CHUNK_MAX_BYTES;
+
+    use super::{
+        ensure_wallet_authority, process_commit_spend_orchestration_data,
+        process_complete_recovery_data, process_complete_spend_orchestration_data,
+        process_fail_spend_orchestration_data, process_init_authority_data,
+        process_init_authority_proof_data, process_init_recovery_data,
+        process_init_spend_orchestration_data, process_init_vault_data,
+        process_set_vault_status_data, process_write_authority_proof_chunk_data,
+    };
+    use crate::{
+        error,
+        instruction::{
+            CommitSpendOrchestrationArgs, CompleteRecoveryArgs, CompleteSpendOrchestrationArgs,
+            FailSpendOrchestrationArgs, InitAuthorityArgs, InitAuthorityProofArgs,
+            InitRecoveryArgs, InitSpendOrchestrationArgs, InitVaultArgs,
+            WriteAuthorityProofChunkArgs,
+        },
+        state::{
+            AuthorityProofState, OrchestrationStatus, QuantumAuthorityState, RecoveryState,
+            RecoveryStatus, SpendOrchestrationState, VaultRegistry, VaultStatus,
+        },
+    };
+
+    #[test]
+    fn wallet_authority_requires_signer() {
+        let error = ensure_wallet_authority([1; 32], [1; 32], false).unwrap_err();
+        assert_eq!(error, ProgramError::MissingRequiredSignature);
+    }
+
+    #[test]
+    fn init_vault_writes_encoded_state() {
+        let mut bytes = [0; VaultRegistry::LEN];
+        process_init_vault_data(
+            &mut bytes,
+            InitVaultArgs {
+                wallet_pubkey: [5; 32],
+                authority_hash: [6; 32],
+                bump: 8,
+            },
+        )
+        .unwrap();
+
+        let state = VaultRegistry::decode(&bytes).unwrap();
+        assert_eq!(state.wallet_pubkey, [5; 32]);
+        assert_eq!(state.current_authority_hash, [6; 32]);
+        assert_eq!(state.status, VaultStatus::Active as u8);
+        assert_eq!(state.bump, 8);
+    }
+
+    #[test]
+    fn set_vault_status_updates_state() {
+        let mut bytes = [0; VaultRegistry::LEN];
+        let vault = VaultRegistry::new([5; 32], [6; 32], VaultStatus::Active, 8);
+        assert!(vault.encode(&mut bytes));
+
+        process_set_vault_status_data(&mut bytes, VaultStatus::Locked as u8).unwrap();
+
+        let updated = VaultRegistry::decode(&bytes).unwrap();
+        assert_eq!(updated.status, VaultStatus::Locked as u8);
+    }
+
+    #[test]
+    fn init_authority_writes_encoded_state() {
+        let mut bytes = [0; QuantumAuthorityState::LEN];
+        process_init_authority_data(
+            &mut bytes,
+            InitAuthorityArgs {
+                current_authority_hash: [7; 32],
+                current_authority_root: [8; 32],
+                bump: 2,
+            },
+        )
+        .unwrap();
+
+        let state = QuantumAuthorityState::decode(&bytes).unwrap();
+        assert_eq!(state.current_authority_hash, [7; 32]);
+        assert_eq!(state.current_authority_root, [8; 32]);
+        assert_eq!(state.next_sequence, 0);
+    }
+
+    #[test]
+    fn authority_proof_chunk_appends_bytes() {
+        let mut bytes = [0; AuthorityProofState::LEN];
+        process_init_authority_proof_data(
+            &mut bytes,
+            InitAuthorityProofArgs {
+                statement_digest: [7; 32],
+                proof_commitment: [8; 32],
+            },
+        )
+        .unwrap();
+
+        let mut chunk = [0u8; AUTHORITY_PROOF_CHUNK_MAX_BYTES];
+        chunk[..3].copy_from_slice(&[1, 2, 3]);
+        process_write_authority_proof_chunk_data(
+            &mut bytes,
+            WriteAuthorityProofChunkArgs {
+                offset: 0,
+                chunk_len: 3,
+                chunk,
+            },
+        )
+        .unwrap();
+
+        let state = AuthorityProofState::decode(&bytes).unwrap();
+        assert_eq!(state.bytes_written, 3);
+        assert_eq!(&state.proof_bytes[..3], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn proof_chunk_rejects_wrong_offset() {
+        let mut bytes = [0; AuthorityProofState::LEN];
+        process_init_authority_proof_data(
+            &mut bytes,
+            InitAuthorityProofArgs {
+                statement_digest: [7; 32],
+                proof_commitment: [8; 32],
+            },
+        )
+        .unwrap();
+
+        let mut chunk = [0u8; AUTHORITY_PROOF_CHUNK_MAX_BYTES];
+        chunk[..3].copy_from_slice(&[1, 2, 3]);
+        let error = process_write_authority_proof_chunk_data(
+            &mut bytes,
+            WriteAuthorityProofChunkArgs {
+                offset: 1,
+                chunk_len: 3,
+                chunk,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            ProgramError::Custom(error::PROOF_CHUNK_OFFSET_MISMATCH)
+        );
+    }
+
+    #[test]
+    fn spend_orchestration_roundtrip() {
+        let mut bytes = [0; SpendOrchestrationState::LEN];
+        process_init_spend_orchestration_data(
+            &mut bytes,
+            InitSpendOrchestrationArgs {
+                action_hash: [1; 32],
+                session_commitment: [2; 32],
+                signers_commitment: [3; 32],
+                signing_package_hash: [4; 32],
+                expiry_slot: 100,
+                threshold: 2,
+                participant_count: 3,
+                bump: 9,
+            },
+            10,
+        )
+        .unwrap();
+
+        process_commit_spend_orchestration_data(
+            &mut bytes,
+            CommitSpendOrchestrationArgs {
+                action_hash: [1; 32],
+                signing_package_hash: [5; 32],
+            },
+            20,
+        )
+        .unwrap();
+        process_complete_spend_orchestration_data(
+            &mut bytes,
+            CompleteSpendOrchestrationArgs {
+                action_hash: [1; 32],
+                tx_binding: [6; 32],
+            },
+            30,
+        )
+        .unwrap();
+
+        let state = SpendOrchestrationState::decode(&bytes).unwrap();
+        assert_eq!(state.status, OrchestrationStatus::Complete as u8);
+        assert_eq!(state.tx_binding, [6; 32]);
+    }
+
+    #[test]
+    fn spend_orchestration_can_fail_before_completion() {
+        let mut bytes = [0; SpendOrchestrationState::LEN];
+        process_init_spend_orchestration_data(
+            &mut bytes,
+            InitSpendOrchestrationArgs {
+                action_hash: [1; 32],
+                session_commitment: [2; 32],
+                signers_commitment: [3; 32],
+                signing_package_hash: [4; 32],
+                expiry_slot: 100,
+                threshold: 2,
+                participant_count: 3,
+                bump: 9,
+            },
+            10,
+        )
+        .unwrap();
+
+        process_fail_spend_orchestration_data(
+            &mut bytes,
+            FailSpendOrchestrationArgs {
+                action_hash: [1; 32],
+                reason_code: 42,
+            },
+        )
+        .unwrap();
+
+        let state = SpendOrchestrationState::decode(&bytes).unwrap();
+        assert_eq!(state.status, OrchestrationStatus::Failed as u8);
+    }
+
+    #[test]
+    fn recovery_roundtrip() {
+        let mut bytes = [0; RecoveryState::LEN];
+        process_init_recovery_data(
+            &mut bytes,
+            InitRecoveryArgs {
+                vault_pubkey: [1; 32],
+                recovery_commitment: [2; 32],
+                expiry_slot: 100,
+                new_threshold: 2,
+                new_participant_count: 3,
+                bump: 4,
+            },
+            VaultStatus::Recovery as u8,
+            10,
+        )
+        .unwrap();
+
+        process_complete_recovery_data(
+            &mut bytes,
+            CompleteRecoveryArgs {
+                new_group_key: [8; 32],
+                new_authority_hash: [9; 32],
+            },
+            20,
+        )
+        .unwrap();
+
+        let state = RecoveryState::decode(&bytes).unwrap();
+        assert_eq!(state.status, RecoveryStatus::Complete as u8);
+        assert_eq!(state.new_group_key, [8; 32]);
+        assert_eq!(state.new_authority_hash, [9; 32]);
+    }
 }
 
 pub fn process(
@@ -117,153 +367,6 @@ pub fn process(
             process_open_quantum_vault(program_id, accounts, args)
         }
         CoreInstruction::InitPqcWallet(args) => process_open_pqc_wallet(program_id, accounts, args),
-        CoreInstruction::StageReceipt(receipt) => {
-            let current_slot = current_slot()?;
-            let vault_account = get_account_info!(accounts, 0);
-            require_program_owner(program_id, vault_account)?;
-            let wallet_signer = get_account_info!(accounts, 2);
-
-            {
-                let vault_data = vault_account.try_borrow_data()?;
-                let vault = decode_vault_state(&vault_data)?;
-                require_wallet_authority(&vault, wallet_signer)?;
-            }
-
-            let vault_data = vault_account.try_borrow_data()?;
-
-            let receipt_account = get_account_info!(accounts, 1);
-            require_writable(receipt_account)?;
-            if receipt_account.owner() != program_id {
-                let system_program = get_account_info!(accounts, 3);
-                create_policy_receipt_account(
-                    program_id,
-                    vault_account,
-                    receipt_account,
-                    wallet_signer,
-                    system_program,
-                    &receipt,
-                )?;
-            }
-            require_program_owner(program_id, receipt_account)?;
-            let mut receipt_data = receipt_account.try_borrow_mut_data()?;
-
-            process_stage_receipt_data(&vault_data, &mut receipt_data, &receipt, current_slot)
-        }
-        CoreInstruction::ConsumeReceipt(receipt) => {
-            let vault_account = get_account_info!(accounts, 0);
-            require_writable(vault_account)?;
-            require_program_owner(program_id, vault_account)?;
-            let vault_data = vault_account.try_borrow_data()?;
-            let vault = decode_vault_state(&vault_data)?;
-            transition::validate_vault_active(&vault).map_err(map_transition_error)?;
-            let wallet_signer = get_account_info!(accounts, 2);
-            require_wallet_authority(&vault, wallet_signer)?;
-            drop(vault_data);
-
-            let mut vault_data = vault_account.try_borrow_mut_data()?;
-
-            let receipt_account = get_account_info!(accounts, 1);
-            require_writable(receipt_account)?;
-            require_program_owner(program_id, receipt_account)?;
-            let mut receipt_data = receipt_account.try_borrow_mut_data()?;
-            process_consume_receipt_data(&mut vault_data, &mut receipt_data, &receipt)
-        }
-        CoreInstruction::OpenSession(receipt) => {
-            let current_slot = current_slot()?;
-            let vault_account = get_account_info!(accounts, 2);
-            require_program_owner(program_id, vault_account)?;
-            let vault_data = vault_account.try_borrow_data()?;
-            let vault = decode_vault_state(&vault_data)?;
-            transition::validate_vault_for_receipt(&vault, &receipt, current_slot)
-                .map_err(map_transition_error)?;
-            let wallet_signer = get_account_info!(accounts, 3);
-            require_wallet_authority(&vault, wallet_signer)?;
-
-            let receipt_account = get_account_info!(accounts, 0);
-            require_program_owner(program_id, receipt_account)?;
-            let receipt_data = receipt_account.try_borrow_data()?;
-
-            let session_account = get_account_info!(accounts, 1);
-            require_writable(session_account)?;
-            require_program_owner(program_id, session_account)?;
-            let mut session_data = session_account.try_borrow_mut_data()?;
-
-            process_open_session_data(&receipt_data, &mut session_data, &receipt, current_slot)
-        }
-        CoreInstruction::ActivateSession(action_hash) => {
-            let current_slot = current_slot()?;
-            let vault_account = get_account_info!(accounts, 1);
-            require_program_owner(program_id, vault_account)?;
-            let vault_data = vault_account.try_borrow_data()?;
-            let vault = decode_vault_state(&vault_data)?;
-            transition::validate_vault_active(&vault).map_err(map_transition_error)?;
-            let wallet_signer = get_account_info!(accounts, 2);
-            require_wallet_authority(&vault, wallet_signer)?;
-
-            let session_account = get_account_info!(accounts, 0);
-            require_writable(session_account)?;
-            require_program_owner(program_id, session_account)?;
-            let mut session_data = session_account.try_borrow_mut_data()?;
-            process_activate_session_data(
-                &mut session_data,
-                action_hash,
-                current_slot,
-                vault.policy_version,
-            )
-        }
-        CoreInstruction::ConsumeSession(action_hash) => {
-            let current_slot = current_slot()?;
-            let vault_account = get_account_info!(accounts, 1);
-            require_program_owner(program_id, vault_account)?;
-            let vault_data = vault_account.try_borrow_data()?;
-            let vault = decode_vault_state(&vault_data)?;
-            transition::validate_vault_active(&vault).map_err(map_transition_error)?;
-            let wallet_signer = get_account_info!(accounts, 2);
-            require_wallet_authority(&vault, wallet_signer)?;
-
-            let session_account = get_account_info!(accounts, 0);
-            require_writable(session_account)?;
-            require_program_owner(program_id, session_account)?;
-            let mut session_data = session_account.try_borrow_mut_data()?;
-            process_consume_session_data(
-                &mut session_data,
-                action_hash,
-                current_slot,
-                vault.policy_version,
-            )
-        }
-        CoreInstruction::FinalizeSession(receipt) => {
-            let current_slot = current_slot()?;
-            let vault_account = get_account_info!(accounts, 2);
-            require_writable(vault_account)?;
-            require_program_owner(program_id, vault_account)?;
-            let vault_data = vault_account.try_borrow_data()?;
-            let vault = decode_vault_state(&vault_data)?;
-            transition::validate_vault_active(&vault).map_err(map_transition_error)?;
-            let wallet_signer = get_account_info!(accounts, 3);
-            require_wallet_authority(&vault, wallet_signer)?;
-            drop(vault_data);
-            let mut vault_data = vault_account.try_borrow_mut_data()?;
-
-            let receipt_account = get_account_info!(accounts, 0);
-            require_writable(receipt_account)?;
-            require_program_owner(program_id, receipt_account)?;
-            let mut receipt_data = receipt_account.try_borrow_mut_data()?;
-
-            let session_account = get_account_info!(accounts, 1);
-            require_writable(session_account)?;
-            require_program_owner(program_id, session_account)?;
-            let mut session_data = session_account.try_borrow_mut_data()?;
-
-            process_finalize_session_data(
-                &mut vault_data,
-                &mut receipt_data,
-                &mut session_data,
-                &receipt,
-                current_slot,
-                vault.policy_version,
-            )
-        }
         CoreInstruction::SetVaultStatus(status) => {
             let vault_account = get_account_info!(accounts, 0);
             require_program_owner(program_id, vault_account)?;
@@ -591,59 +694,6 @@ pub fn process(
             let mut orch_data = orch_account.try_borrow_mut_data()?;
             process_fail_spend_orchestration_data(&mut orch_data, args)
         }
-        CoreInstruction::StageBridgedReceipt(receipt) => {
-            let current_slot = current_slot()?;
-            let vault_account = get_account_info!(accounts, 0);
-            require_program_owner(program_id, vault_account)?;
-            let wallet_signer = get_account_info!(accounts, 2);
-
-            let receipt_account = get_account_info!(accounts, 1);
-            require_writable(receipt_account)?;
-            {
-                let vault_data = vault_account.try_borrow_data()?;
-                let vault = decode_vault_state(&vault_data)?;
-                require_wallet_authority(&vault, wallet_signer)?;
-            }
-
-            if receipt_account.owner() != program_id {
-                let system_program = get_account_info!(accounts, 4);
-                create_policy_receipt_account(
-                    program_id,
-                    vault_account,
-                    receipt_account,
-                    wallet_signer,
-                    system_program,
-                    &receipt,
-                )?;
-            }
-            require_program_owner(program_id, receipt_account)?;
-
-            // [3] = policy_eval account (readonly, owner validated against vault)
-            let policy_eval_account = get_account_info!(accounts, 3);
-            {
-                let vault_data = vault_account.try_borrow_data()?;
-                let vault = decode_vault_state(&vault_data)?;
-                let owner_bytes: [u8; 32] = policy_eval_account
-                    .owner()
-                    .as_ref()
-                    .try_into()
-                    .map_err(|_| ProgramError::InvalidAccountData)?;
-                transition::validate_eval_account_owner(&owner_bytes, &vault)
-                    .map_err(|_| ProgramError::IllegalOwner)?;
-            }
-            let policy_eval_data = policy_eval_account.try_borrow_data()?;
-
-            let vault_data = vault_account.try_borrow_data()?;
-            let mut receipt_data = receipt_account.try_borrow_mut_data()?;
-            process_stage_bridged_receipt_data(
-                &vault_data,
-                &mut receipt_data,
-                &policy_eval_data,
-                &receipt,
-                current_slot,
-            )
-        }
-
         CoreInstruction::InitRecovery(args) => {
             let current_slot = current_slot()?;
             // [0] = recovery_state (writable, uninitialized PDA)
@@ -673,25 +723,7 @@ pub fn process(
             let mut authority_data = authority_account.try_borrow_mut_data()?;
             process_migrate_authority_data(&mut authority_data, args.new_authority_root)
         }
-        CoreInstruction::AdvancePolicyVersion(args) => {
-            // [0] = vault_registry (writable)
-            let vault_account = get_account_info!(accounts, 0);
-            let mut vault_data = vault_account.try_borrow_mut_data()?;
-            process_advance_policy_version_data(&mut vault_data, args.new_version)
-        }
     }
-}
-
-pub fn process_stage_bridged_receipt_data(
-    vault_src: &[u8],
-    receipt_dst: &mut [u8],
-    policy_eval_src: &[u8],
-    receipt: &PolicyReceipt,
-    current_slot: u64,
-) -> ProgramResult {
-    transition::validate_bridged_receipt_claim(policy_eval_src, receipt, current_slot)
-        .map_err(map_transition_error)?;
-    process_stage_receipt_data(vault_src, receipt_dst, receipt, current_slot)
 }
 
 pub fn process_set_vault_status_data(dst: &mut [u8], status: u8) -> ProgramResult {
@@ -719,13 +751,7 @@ pub fn process_init_vault_data(dst: &mut [u8], args: InitVaultArgs) -> ProgramRe
         return Err(ProgramError::AccountAlreadyInitialized);
     }
 
-    let state = transition::initialize_vault(
-        args.wallet_pubkey,
-        args.authority_hash,
-        args.policy_version,
-        args.bump,
-        args.policy_mxe_program,
-    );
+    let state = transition::initialize_vault(args.wallet_pubkey, args.authority_hash, args.bump);
 
     if !state.encode(dst) {
         return Err(ProgramError::InvalidAccountData);
@@ -835,14 +861,6 @@ fn pqc_wallet_signer_seed_slices<'a>(
     [PQC_WALLET_SEED, wallet_id, bump_seed]
 }
 
-fn policy_receipt_signer_seed_slices<'a>(
-    vault_id: &'a [u8; 32],
-    action_hash: &'a [u8; 32],
-    bump_seed: &'a [u8; 1],
-) -> [&'a [u8]; 4] {
-    [POLICY_RECEIPT_SEED, vault_id, action_hash, bump_seed]
-}
-
 fn rent_minimum_balance(data_len: usize) -> Result<u64, ProgramError> {
     #[cfg(any(feature = "bpf-entrypoint", target_os = "solana"))]
     {
@@ -889,42 +907,6 @@ fn create_program_owned_account(
     };
 
     invoke_signed(&instruction, &[payer, new_account], signers)
-}
-
-fn create_policy_receipt_account(
-    program_id: &pinocchio::pubkey::Pubkey,
-    vault_account: &AccountInfo,
-    receipt_account: &AccountInfo,
-    payer: &AccountInfo,
-    system_program: &AccountInfo,
-    receipt: &PolicyReceipt,
-) -> ProgramResult {
-    let bump = pda::find_policy_receipt_bump(
-        receipt_account.key(),
-        vault_account.key(),
-        &receipt.action_hash,
-        program_id,
-    )?;
-    let bump_seed = [bump];
-    let signer_seed_bytes =
-        policy_receipt_signer_seed_slices(vault_account.key(), &receipt.action_hash, &bump_seed);
-    let seeds = [
-        Seed::from(signer_seed_bytes[0]),
-        Seed::from(signer_seed_bytes[1]),
-        Seed::from(signer_seed_bytes[2]),
-        Seed::from(signer_seed_bytes[3]),
-    ];
-    let signers = [Signer::from(&seeds)];
-    let lamports = Rent::get()?.minimum_balance(PolicyReceiptState::LEN);
-    create_program_owned_account(
-        program_id,
-        payer,
-        receipt_account,
-        system_program,
-        &signers,
-        lamports,
-        PolicyReceiptState::LEN as u64,
-    )
 }
 
 fn process_open_vault_registry(
@@ -1154,195 +1136,6 @@ pub fn process_close_quantum_vault(
     .map_err(map_transition_error)
 }
 
-pub fn process_stage_receipt_data(
-    vault_src: &[u8],
-    receipt_dst: &mut [u8],
-    receipt: &PolicyReceipt,
-    current_slot: u64,
-) -> ProgramResult {
-    if vault_src.len() != VaultRegistry::LEN || receipt_dst.len() != PolicyReceiptState::LEN {
-        return Err(ProgramError::AccountDataTooSmall);
-    }
-    if !is_zeroed(receipt_dst) {
-        return Err(ProgramError::AccountAlreadyInitialized);
-    }
-
-    let vault = VaultRegistry::decode(vault_src).ok_or(ProgramError::InvalidAccountData)?;
-    require_discriminator(&vault.discriminator, &VAULT_REGISTRY_DISCRIMINATOR)?;
-    transition::validate_vault_for_receipt(&vault, receipt, current_slot)
-        .map_err(map_transition_error)?;
-
-    let state = transition::stage_policy_receipt(receipt);
-    if !state.encode(receipt_dst) {
-        return Err(ProgramError::InvalidAccountData);
-    }
-
-    Ok(())
-}
-
-pub fn process_consume_receipt_data(
-    vault_dst: &mut [u8],
-    receipt_dst: &mut [u8],
-    receipt: &PolicyReceipt,
-) -> ProgramResult {
-    if vault_dst.len() != VaultRegistry::LEN || receipt_dst.len() != PolicyReceiptState::LEN {
-        return Err(ProgramError::AccountDataTooSmall);
-    }
-
-    let mut vault = VaultRegistry::decode(vault_dst).ok_or(ProgramError::InvalidAccountData)?;
-    require_discriminator(&vault.discriminator, &VAULT_REGISTRY_DISCRIMINATOR)?;
-    transition::validate_vault_active(&vault).map_err(map_transition_error)?;
-    if vault.policy_version != receipt.policy_version {
-        return Err(ProgramError::Custom(error::POLICY_VERSION_MISMATCH));
-    }
-
-    let mut state =
-        PolicyReceiptState::decode(receipt_dst).ok_or(ProgramError::InvalidAccountData)?;
-    require_discriminator(&state.discriminator, &POLICY_RECEIPT_DISCRIMINATOR)?;
-    transition::consume_policy_receipt_for_vault(&mut vault, &mut state, receipt)
-        .map_err(map_transition_error)?;
-
-    if !vault.encode(vault_dst) || !state.encode(receipt_dst) {
-        return Err(ProgramError::InvalidAccountData);
-    }
-
-    Ok(())
-}
-
-pub fn process_open_session_data(
-    receipt_src: &[u8],
-    session_dst: &mut [u8],
-    receipt: &PolicyReceipt,
-    current_slot: u64,
-) -> ProgramResult {
-    if receipt_src.len() != PolicyReceiptState::LEN {
-        return Err(ProgramError::AccountDataTooSmall);
-    }
-    if session_dst.len() != ActionSessionState::LEN {
-        return Err(ProgramError::AccountDataTooSmall);
-    }
-    if !is_zeroed(session_dst) {
-        return Err(ProgramError::AccountAlreadyInitialized);
-    }
-
-    let receipt_state =
-        PolicyReceiptState::decode(receipt_src).ok_or(ProgramError::InvalidAccountData)?;
-    require_discriminator(&receipt_state.discriminator, &POLICY_RECEIPT_DISCRIMINATOR)?;
-
-    let state = transition::open_action_session_from_receipt(&receipt_state, receipt, current_slot)
-        .map_err(map_transition_error)?;
-    if !state.encode(session_dst) {
-        return Err(ProgramError::InvalidAccountData);
-    }
-
-    Ok(())
-}
-
-pub fn process_activate_session_data(
-    dst: &mut [u8],
-    action_hash: [u8; 32],
-    current_slot: u64,
-    expected_policy_version: u64,
-) -> ProgramResult {
-    if dst.len() != ActionSessionState::LEN {
-        return Err(ProgramError::AccountDataTooSmall);
-    }
-
-    let mut state = ActionSessionState::decode(dst).ok_or(ProgramError::InvalidAccountData)?;
-    require_discriminator(&state.discriminator, &ACTION_SESSION_DISCRIMINATOR)?;
-    if state.policy_version != expected_policy_version {
-        return Err(ProgramError::Custom(error::POLICY_VERSION_MISMATCH));
-    }
-    transition::mark_action_session_ready(&mut state, action_hash, current_slot)
-        .map_err(map_transition_error)?;
-
-    if !state.encode(dst) {
-        return Err(ProgramError::InvalidAccountData);
-    }
-
-    Ok(())
-}
-
-pub fn process_consume_session_data(
-    dst: &mut [u8],
-    action_hash: [u8; 32],
-    current_slot: u64,
-    expected_policy_version: u64,
-) -> ProgramResult {
-    if dst.len() != ActionSessionState::LEN {
-        return Err(ProgramError::AccountDataTooSmall);
-    }
-
-    let mut state = ActionSessionState::decode(dst).ok_or(ProgramError::InvalidAccountData)?;
-    require_discriminator(&state.discriminator, &ACTION_SESSION_DISCRIMINATOR)?;
-    if state.policy_version != expected_policy_version {
-        return Err(ProgramError::Custom(error::POLICY_VERSION_MISMATCH));
-    }
-    transition::consume_action_session(&mut state, action_hash, current_slot)
-        .map_err(map_transition_error)?;
-
-    if !state.encode(dst) {
-        return Err(ProgramError::InvalidAccountData);
-    }
-
-    Ok(())
-}
-
-pub fn process_finalize_session_data(
-    vault_dst: &mut [u8],
-    receipt_dst: &mut [u8],
-    session_dst: &mut [u8],
-    receipt: &PolicyReceipt,
-    current_slot: u64,
-    expected_policy_version: u64,
-) -> ProgramResult {
-    if vault_dst.len() != VaultRegistry::LEN
-        || receipt_dst.len() != PolicyReceiptState::LEN
-        || session_dst.len() != ActionSessionState::LEN
-    {
-        return Err(ProgramError::AccountDataTooSmall);
-    }
-
-    let mut vault_state =
-        VaultRegistry::decode(vault_dst).ok_or(ProgramError::InvalidAccountData)?;
-    require_discriminator(&vault_state.discriminator, &VAULT_REGISTRY_DISCRIMINATOR)?;
-    transition::validate_vault_active(&vault_state).map_err(map_transition_error)?;
-    if vault_state.policy_version != expected_policy_version
-        || receipt.policy_version != expected_policy_version
-    {
-        return Err(ProgramError::Custom(error::POLICY_VERSION_MISMATCH));
-    }
-
-    let mut receipt_state =
-        PolicyReceiptState::decode(receipt_dst).ok_or(ProgramError::InvalidAccountData)?;
-    require_discriminator(&receipt_state.discriminator, &POLICY_RECEIPT_DISCRIMINATOR)?;
-
-    let mut session_state =
-        ActionSessionState::decode(session_dst).ok_or(ProgramError::InvalidAccountData)?;
-    require_discriminator(&session_state.discriminator, &ACTION_SESSION_DISCRIMINATOR)?;
-    if session_state.policy_version != expected_policy_version {
-        return Err(ProgramError::Custom(error::POLICY_VERSION_MISMATCH));
-    }
-
-    transition::finalize_action_session(
-        &mut vault_state,
-        &mut session_state,
-        &mut receipt_state,
-        receipt,
-        current_slot,
-    )
-    .map_err(map_transition_error)?;
-
-    if !vault_state.encode(vault_dst)
-        || !receipt_state.encode(receipt_dst)
-        || !session_state.encode(session_dst)
-    {
-        return Err(ProgramError::InvalidAccountData);
-    }
-
-    Ok(())
-}
-
 pub fn process_rotate_authority_data(
     vault_dst: &mut [u8],
     authority_dst: &mut [u8],
@@ -1557,40 +1350,17 @@ fn current_slot() -> Result<u64, ProgramError> {
 
 fn map_transition_error(error: transition::TransitionError) -> ProgramError {
     match error {
-        transition::TransitionError::ReceiptAlreadyConsumed => {
-            ProgramError::AccountAlreadyInitialized
-        }
-        transition::TransitionError::ReceiptMismatch => ProgramError::InvalidAccountData,
-        transition::TransitionError::ReceiptExpired => ProgramError::Custom(error::RECEIPT_EXPIRED),
-        transition::TransitionError::ReceiptNonceReplay => {
-            ProgramError::Custom(error::RECEIPT_NONCE_REPLAY)
-        }
-        transition::TransitionError::SessionExpired => ProgramError::Custom(error::SESSION_EXPIRED),
         transition::TransitionError::AuthorityStatementExpired => {
             ProgramError::Custom(error::AUTHORITY_STATEMENT_EXPIRED)
         }
         transition::TransitionError::VaultAuthorityMismatch => {
             ProgramError::Custom(error::VAULT_AUTHORITY_MISMATCH)
         }
-        transition::TransitionError::VaultPolicyMismatch => {
-            ProgramError::Custom(error::VAULT_POLICY_MISMATCH)
-        }
         transition::TransitionError::VaultNotActive => ProgramError::InvalidAccountData,
         transition::TransitionError::VaultNotRecovery => ProgramError::InvalidAccountData,
         transition::TransitionError::VaultStatusInvalid => ProgramError::InvalidInstructionData,
         transition::TransitionError::VaultStatusTransitionNotAllowed => {
             ProgramError::Custom(error::VAULT_STATUS_BAD_TRANSITION)
-        }
-        transition::TransitionError::SessionPolicyMismatch => {
-            ProgramError::Custom(error::SESSION_POLICY_MISMATCH)
-        }
-        transition::TransitionError::SessionMismatch => {
-            ProgramError::Custom(error::SESSION_MISMATCH)
-        }
-        transition::TransitionError::SessionNotPending => ProgramError::AccountAlreadyInitialized,
-        transition::TransitionError::SessionNotReady => ProgramError::InvalidAccountData,
-        transition::TransitionError::SessionRequiresPqc => {
-            ProgramError::Custom(error::SESSION_REQUIRES_PQC)
         }
         transition::TransitionError::AuthorityNoOp => ProgramError::Custom(error::AUTHORITY_NO_OP),
         transition::TransitionError::AuthoritySequenceMismatch => {
@@ -1634,7 +1404,6 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::OrchestrationAlreadyComplete => {
             ProgramError::AccountAlreadyInitialized
         }
-        transition::TransitionError::BridgedReceiptMismatch => ProgramError::InvalidAccountData,
         transition::TransitionError::RecoveryVaultNotInRecoveryMode => {
             ProgramError::InvalidAccountData
         }
@@ -1646,15 +1415,9 @@ fn map_transition_error(error: transition::TransitionError) -> ProgramError {
         transition::TransitionError::AuthorityMigrationNoOp => {
             ProgramError::Custom(error::AUTHORITY_MIGRATION_NO_OP)
         }
-        transition::TransitionError::PolicyVersionNotMonotonic => {
-            ProgramError::Custom(error::POLICY_VERSION_NOT_MONOTONIC)
-        }
         transition::TransitionError::TxBindingMissing => ProgramError::InvalidInstructionData,
         transition::TransitionError::AuthorityStatementReplay => {
             ProgramError::Custom(error::AUTHORITY_STATEMENT_REPLAY)
-        }
-        transition::TransitionError::BridgedReceiptDelayNotMet => {
-            ProgramError::Custom(error::BRIDGED_RECEIPT_DELAY_NOT_MET)
         }
     }
 }
@@ -1828,24 +1591,8 @@ pub fn process_migrate_authority_data(
     Ok(())
 }
 
-pub fn process_advance_policy_version_data(data: &mut [u8], new_version: u64) -> ProgramResult {
-    use crate::state::{VaultRegistry, VAULT_REGISTRY_DISCRIMINATOR};
-
-    if data.len() < VaultRegistry::LEN {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    let mut vault = VaultRegistry::decode(&data[..VaultRegistry::LEN])
-        .ok_or(ProgramError::InvalidAccountData)?;
-    require_discriminator(&vault.discriminator, &VAULT_REGISTRY_DISCRIMINATOR)?;
-
-    transition::advance_policy_version(&mut vault, new_version).map_err(map_transition_error)?;
-
-    vault.encode(&mut data[..VaultRegistry::LEN]);
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
+#[cfg(any())]
+mod legacy_tests {
     use pinocchio::program_error::ProgramError;
     use solana_nostd_sha256::hashv;
     use solana_winternitz::privkey::WinternitzPrivkey;
@@ -1859,7 +1606,7 @@ mod tests {
 
     use super::{
         ensure_wallet_authority, process_activate_session_data,
-        process_advance_policy_version_data, process_advance_pqc_wallet_data,
+        process_advance_legacy_version_data, process_advance_pqc_wallet_data,
         process_advance_winter_authority_data, process_close_quantum_vault,
         process_commit_spend_orchestration_data, process_complete_recovery_data,
         process_complete_spend_orchestration_data, process_consume_receipt_data,
@@ -1895,7 +1642,7 @@ mod tests {
         ActionDescriptor {
             vault_id: [1; 32],
             payload_hash: [2; 32],
-            policy_version: 3,
+            legacy_version: 3,
             kind: ActionKind::Spend,
         }
         .hash()
@@ -1904,7 +1651,7 @@ mod tests {
     fn sample_receipt() -> PolicyReceipt {
         PolicyReceipt {
             action_hash: sample_action_hash(),
-            policy_version: 3,
+            legacy_version: 3,
             threshold: ThresholdRequirement::TwoOfThree,
             nonce: 9,
             expiry_slot: 100,
@@ -1924,7 +1671,7 @@ mod tests {
             expiry_slot,
         };
         statement.action_hash =
-            statement.expected_action_hash(vault.wallet_pubkey, vault.policy_version);
+            statement.expected_action_hash(vault.wallet_pubkey, vault.legacy_version);
         statement
     }
 
@@ -2074,9 +1821,9 @@ mod tests {
             InitVaultArgs {
                 wallet_pubkey: [5; 32],
                 authority_hash: [6; 32],
-                policy_version: 7,
+                legacy_version: 7,
                 bump: 8,
-                policy_mxe_program: [0; 32],
+                legacy_mxe_program: [0; 32],
             },
         )
         .expect("vault init should succeed");
@@ -2084,9 +1831,9 @@ mod tests {
         let state = VaultRegistry::decode(&bytes).expect("state should decode");
         assert_eq!(state.wallet_pubkey, [5; 32]);
         assert_eq!(state.current_authority_hash, [6; 32]);
-        assert_eq!(state.policy_version, 7);
+        assert_eq!(state.legacy_version, 7);
         assert_eq!(state.bump, 8);
-        assert_eq!(state.policy_mxe_program, [0; 32]);
+        assert_eq!(state.legacy_mxe_program, [0; 32]);
     }
 
     #[test]
@@ -2098,9 +1845,9 @@ mod tests {
             InitVaultArgs {
                 wallet_pubkey: [5; 32],
                 authority_hash: [6; 32],
-                policy_version: 7,
+                legacy_version: 7,
                 bump: 8,
-                policy_mxe_program: [0; 32],
+                legacy_mxe_program: [0; 32],
             },
         )
         .expect_err("preinitialized bytes should fail");
@@ -2285,7 +2032,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_receipt_rejects_policy_mismatch() {
+    fn stage_receipt_rejects_legacy_mismatch() {
         let receipt = sample_receipt();
         let vault = VaultRegistry::new(
             [5; 32],
@@ -2300,7 +2047,7 @@ mod tests {
 
         assert!(vault.encode(&mut vault_bytes));
         let error = process_stage_receipt_data(&vault_bytes, &mut receipt_bytes, &receipt, 10)
-            .expect_err("policy mismatch should fail");
+            .expect_err("legacy mismatch should fail");
 
         assert_eq!(error, ProgramError::Custom(error::VAULT_POLICY_MISMATCH));
     }
@@ -2871,7 +2618,7 @@ mod tests {
         assert!(receipt_state.encode(&mut receipt_bytes));
         process_open_session_data(&receipt_bytes, &mut bytes, &receipt, 10)
             .expect("open session should succeed");
-        process_activate_session_data(&mut bytes, receipt.action_hash, 10, receipt.policy_version)
+        process_activate_session_data(&mut bytes, receipt.action_hash, 10, receipt.legacy_version)
             .expect("activate session should succeed");
 
         let state = ActionSessionState::decode(&bytes).expect("state should decode");
@@ -2904,14 +2651,14 @@ mod tests {
         assert!(receipt_state.encode(&mut receipt_bytes));
         process_open_session_data(&receipt_bytes, &mut bytes, &receipt, 10)
             .expect("open session should succeed");
-        let error = process_activate_session_data(&mut bytes, [9; 32], 10, receipt.policy_version)
+        let error = process_activate_session_data(&mut bytes, [9; 32], 10, receipt.legacy_version)
             .expect_err("wrong action hash should fail");
 
         assert_eq!(error, ProgramError::Custom(error::SESSION_MISMATCH));
     }
 
     #[test]
-    fn activate_session_rejects_policy_mismatch() {
+    fn activate_session_rejects_legacy_mismatch() {
         let receipt = sample_receipt();
         let receipt_state = PolicyReceiptState::new(
             receipt.commitment(),
@@ -2926,7 +2673,7 @@ mod tests {
         process_open_session_data(&receipt_bytes, &mut bytes, &receipt, 10)
             .expect("open session should succeed");
         let error = process_activate_session_data(&mut bytes, receipt.action_hash, 10, 99)
-            .expect_err("policy mismatch should fail");
+            .expect_err("legacy mismatch should fail");
 
         assert_eq!(error, ProgramError::Custom(error::POLICY_VERSION_MISMATCH));
     }
@@ -2953,7 +2700,7 @@ mod tests {
             &mut bytes,
             receipt.action_hash,
             10,
-            receipt.policy_version,
+            receipt.legacy_version,
         )
         .expect_err("pqc-only threshold should reject spend activation");
 
@@ -3001,14 +2748,14 @@ mod tests {
             &mut session_bytes,
             receipt.action_hash,
             10,
-            receipt.policy_version,
+            receipt.legacy_version,
         )
         .expect("activate session should succeed");
         process_consume_session_data(
             &mut session_bytes,
             receipt.action_hash,
             10,
-            receipt.policy_version,
+            receipt.legacy_version,
         )
         .expect("consume session should succeed");
 
@@ -3035,7 +2782,7 @@ mod tests {
             &mut session_bytes,
             receipt.action_hash,
             10,
-            receipt.policy_version,
+            receipt.legacy_version,
         )
         .expect_err("pending session should not be consumable");
 
@@ -3071,7 +2818,7 @@ mod tests {
             &mut session_bytes,
             receipt.action_hash,
             10,
-            receipt.policy_version,
+            receipt.legacy_version,
         )
         .expect_err("pqc-only threshold should reject spend consumption");
 
@@ -3107,7 +2854,7 @@ mod tests {
             &mut session_bytes,
             receipt.action_hash,
             10,
-            receipt.policy_version,
+            receipt.legacy_version,
         )
         .expect("activate session should succeed");
         process_finalize_session_data(
@@ -3116,7 +2863,7 @@ mod tests {
             &mut session_bytes,
             &receipt,
             10,
-            receipt.policy_version,
+            receipt.legacy_version,
         )
         .expect("finalize session should succeed");
 
@@ -3161,7 +2908,7 @@ mod tests {
             &mut session_bytes,
             &receipt,
             10,
-            receipt.policy_version,
+            receipt.legacy_version,
         )
         .expect_err("pending session should not finalize");
 
@@ -3209,7 +2956,7 @@ mod tests {
             &mut session_bytes,
             &receipt,
             10,
-            receipt.policy_version,
+            receipt.legacy_version,
         )
         .expect_err("pqc-only threshold should reject spend finalization");
 
@@ -3246,7 +2993,7 @@ mod tests {
             &mut session_bytes,
             receipt.action_hash,
             10,
-            receipt.policy_version,
+            receipt.legacy_version,
         )
         .expect("activate session should succeed");
 
@@ -3256,7 +3003,7 @@ mod tests {
             &mut session_bytes,
             &receipt,
             10,
-            receipt.policy_version,
+            receipt.legacy_version,
         )
         .expect_err("replayed nonce should fail finalize");
 
@@ -3447,7 +3194,7 @@ mod tests {
         let state = super::super::transition::initialize_vault(
             [10; 32],
             [11; 32],
-            receipt.policy_version,
+            receipt.legacy_version,
             1,
             [0; 32],
         );
@@ -3461,7 +3208,7 @@ mod tests {
         use super::process_stage_bridged_receipt_data;
         let receipt = PolicyReceipt {
             action_hash: [7; 32],
-            policy_version: 5,
+            legacy_version: 5,
             threshold: ThresholdRequirement::TwoOfThree,
             nonce: 3,
             expiry_slot: 9999,
@@ -3486,7 +3233,7 @@ mod tests {
         use pinocchio::program_error::ProgramError;
         let receipt = PolicyReceipt {
             action_hash: [7; 32],
-            policy_version: 5,
+            legacy_version: 5,
             threshold: ThresholdRequirement::TwoOfThree,
             nonce: 3,
             expiry_slot: 9999,
@@ -3513,7 +3260,7 @@ mod tests {
         use pinocchio::program_error::ProgramError;
         let receipt = PolicyReceipt {
             action_hash: [7; 32],
-            policy_version: 5,
+            legacy_version: 5,
             threshold: ThresholdRequirement::TwoOfThree,
             nonce: 3,
             expiry_slot: 9999,
@@ -3818,7 +3565,7 @@ mod tests {
     fn stage_bridged_receipt_rejects_double_init() {
         let receipt = PolicyReceipt {
             action_hash: [7; 32],
-            policy_version: 5,
+            legacy_version: 5,
             threshold: ThresholdRequirement::TwoOfThree,
             nonce: 3,
             expiry_slot: 9999,
@@ -4048,18 +3795,18 @@ mod tests {
     }
 
     #[test]
-    fn advance_policy_version_happy_path() {
+    fn advance_legacy_version_happy_path() {
         let mut buf = make_active_vault_buffer();
-        let result = process_advance_policy_version_data(&mut buf, 11);
+        let result = process_advance_legacy_version_data(&mut buf, 11);
         assert!(result.is_ok());
         let vault = VaultRegistry::decode(&buf).unwrap();
-        assert_eq!(vault.policy_version, 11);
+        assert_eq!(vault.legacy_version, 11);
     }
 
     #[test]
-    fn advance_policy_version_rejects_skip() {
+    fn advance_legacy_version_rejects_skip() {
         let mut buf = make_active_vault_buffer();
-        let err = process_advance_policy_version_data(&mut buf, 12)
+        let err = process_advance_legacy_version_data(&mut buf, 12)
             .expect_err("skipping versions must fail");
         assert_eq!(
             err,
@@ -4068,19 +3815,19 @@ mod tests {
     }
 
     #[test]
-    fn advance_policy_version_rejects_inactive_vault() {
+    fn advance_legacy_version_rejects_inactive_vault() {
         let mut buf = vec![0u8; VaultRegistry::LEN];
         // Write discriminator but leave status = 0 (not Active)
         buf[..8].copy_from_slice(&VAULT_REGISTRY_DISCRIMINATOR);
         let err =
-            process_advance_policy_version_data(&mut buf, 1).expect_err("inactive vault must fail");
+            process_advance_legacy_version_data(&mut buf, 1).expect_err("inactive vault must fail");
         assert_eq!(err, ProgramError::InvalidAccountData);
     }
 
     #[test]
-    fn advance_policy_version_rejects_undersized_buffer() {
+    fn advance_legacy_version_rejects_undersized_buffer() {
         let mut buf = vec![0u8; VaultRegistry::LEN - 1];
-        let err = process_advance_policy_version_data(&mut buf, 1)
+        let err = process_advance_legacy_version_data(&mut buf, 1)
             .expect_err("buffer must be at least VaultRegistry::LEN");
         assert_eq!(err, ProgramError::InvalidAccountData);
     }

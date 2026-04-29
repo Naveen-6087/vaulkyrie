@@ -1,9 +1,8 @@
 use clap::Subcommand;
 
 use vaulkyrie_sdk::types::{
-    ACTION_SESSION_DISCRIMINATOR, AUTHORITY_PROOF_DISCRIMINATOR, POLICY_RECEIPT_DISCRIMINATOR,
-    QUANTUM_STATE_DISCRIMINATOR, RECOVERY_STATE_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR,
-    VAULT_REGISTRY_DISCRIMINATOR,
+    AUTHORITY_PROOF_DISCRIMINATOR, PQC_WALLET_DISCRIMINATOR, QUANTUM_STATE_DISCRIMINATOR,
+    RECOVERY_STATE_DISCRIMINATOR, SPEND_ORCH_DISCRIMINATOR, VAULT_REGISTRY_DISCRIMINATOR,
 };
 
 #[derive(Subcommand)]
@@ -32,18 +31,6 @@ pub fn run(cmd: InspectCmd) -> Result<(), String> {
                     println!("{acct:#?}");
                     "VaultRegistry"
                 }
-                POLICY_RECEIPT_DISCRIMINATOR => {
-                    let acct = vaulkyrie_sdk::accounts::PolicyReceiptState::decode(&bytes)
-                        .ok_or("failed to decode PolicyReceiptState")?;
-                    println!("{acct:#?}");
-                    "PolicyReceipt"
-                }
-                ACTION_SESSION_DISCRIMINATOR => {
-                    let acct = vaulkyrie_sdk::accounts::ActionSessionState::decode(&bytes)
-                        .ok_or("failed to decode ActionSessionState")?;
-                    println!("{acct:#?}");
-                    "ActionSession"
-                }
                 QUANTUM_STATE_DISCRIMINATOR => {
                     let acct = vaulkyrie_sdk::accounts::QuantumAuthorityState::decode(&bytes)
                         .ok_or("failed to decode QuantumAuthorityState")?;
@@ -67,6 +54,12 @@ pub fn run(cmd: InspectCmd) -> Result<(), String> {
                         .ok_or("failed to decode RecoveryState")?;
                     println!("{acct:#?}");
                     "RecoveryState"
+                }
+                PQC_WALLET_DISCRIMINATOR => {
+                    let acct = vaulkyrie_sdk::accounts::PqcWalletState::decode(&bytes)
+                        .ok_or("failed to decode PqcWalletState")?;
+                    println!("{acct:#?}");
+                    "PqcWallet"
                 }
                 _ => {
                     return Err(format!("unknown discriminator: {}", hex::encode(disc)));
