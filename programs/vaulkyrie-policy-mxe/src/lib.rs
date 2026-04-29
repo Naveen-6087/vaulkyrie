@@ -36,12 +36,16 @@ pub struct PolicyEvaluateOutput {
     pub reason_code: u16,
     /// Decision bit flags that summarize which private signals escalated the action.
     pub decision_flags: u16,
+    /// Bounded private-risk score revealed by the MXE circuit (0..100).
+    pub risk_score: u16,
+    /// Compact tier derived from `risk_score`: 0 low, 1 medium, 2 high, 3 critical.
+    pub risk_tier: u8,
     /// 1 = approved, 0 = denied.
     pub approved: u8,
 }
 
 impl arcium_anchor::HasSize for PolicyEvaluateOutput {
-    const SIZE: usize = 77; // 32 + 32 + 8 + 2 + 2 + 1
+    const SIZE: usize = 80; // 32 + 32 + 8 + 2 + 2 + 2 + 1 + 1
 }
 
 // `#[arcium_program]` wraps Anchor's `#[program]` and generates:
@@ -332,6 +336,8 @@ impl<'info> InitCompDefAccs<'info> for InitPolicyEvaluateCompDef<'info> {
             Output::PlaintextU64, // delay_until_slot
             Output::PlaintextU16, // reason_code
             Output::PlaintextU16, // decision_flags
+            Output::PlaintextU16, // risk_score
+            Output::PlaintextU8,  // risk_tier
             Output::PlaintextU8,  // approved flag
         ]
     }
@@ -864,6 +870,8 @@ mod handlers {
             verified_output.delay_until_slot,
             verified_output.reason_code,
             verified_output.decision_flags,
+            verified_output.risk_score,
+            verified_output.risk_tier,
             verified_output.approved == 1,
         )
         .map_err(PolicyMxeError::from)?;

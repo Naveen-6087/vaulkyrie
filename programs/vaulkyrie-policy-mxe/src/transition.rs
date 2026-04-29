@@ -167,6 +167,8 @@ pub fn apply_mxe_callback(
     delay_until_slot: u64,
     reason_code: u16,
     decision_flags: u16,
+    risk_score: u16,
+    risk_tier: u8,
     approved: bool,
 ) -> Result<(), TransitionError> {
     if state.status != PolicyEvaluationStatus::ComputationQueued as u8 {
@@ -175,6 +177,8 @@ pub fn apply_mxe_callback(
 
     state.reason_code = reason_code;
     state.set_decision_flags(decision_flags);
+    state.set_risk_score(risk_score);
+    state.set_risk_tier(risk_tier);
 
     if approved {
         state.receipt_commitment = receipt_commitment;
@@ -413,7 +417,7 @@ mod tests {
             open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
         queue_arcium_computation(&mut state, 77, 400).expect("queue should succeed");
 
-        apply_mxe_callback(&mut state, [10; 32], [11; 32], 850, 0, 0x33, true)
+        apply_mxe_callback(&mut state, [10; 32], [11; 32], 850, 0, 0x33, 64, 2, true)
             .expect("approved callback should finalize");
 
         assert_eq!(state.status, PolicyEvaluationStatus::Finalized as u8);
@@ -421,6 +425,8 @@ mod tests {
         assert_eq!(state.decision_commitment, [11; 32]);
         assert_eq!(state.delay_until_slot, 850);
         assert_eq!(state.decision_flags(), 0x33);
+        assert_eq!(state.risk_score(), 64);
+        assert_eq!(state.risk_tier(), 2);
         assert_eq!(state.reason_code, 0);
     }
 
@@ -432,12 +438,14 @@ mod tests {
             open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
         queue_arcium_computation(&mut state, 77, 400).expect("queue should succeed");
 
-        apply_mxe_callback(&mut state, [10; 32], [11; 32], 850, 42, 0x55, false)
+        apply_mxe_callback(&mut state, [10; 32], [11; 32], 850, 42, 0x55, 100, 3, false)
             .expect("denied callback should abort");
 
         assert_eq!(state.status, PolicyEvaluationStatus::Aborted as u8);
         assert_eq!(state.reason_code, 42);
         assert_eq!(state.decision_flags(), 0x55);
+        assert_eq!(state.risk_score(), 100);
+        assert_eq!(state.risk_tier(), 3);
         // Commitments should NOT be written on denial.
         assert_eq!(state.receipt_commitment, [0; 32]);
         assert_eq!(state.decision_commitment, [0; 32]);
@@ -451,7 +459,7 @@ mod tests {
             open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
         // State is Pending, not ComputationQueued.
         assert_eq!(
-            apply_mxe_callback(&mut state, [10; 32], [11; 32], 850, 0, 0, true),
+            apply_mxe_callback(&mut state, [10; 32], [11; 32], 850, 0, 0, 0, 0, true),
             Err(TransitionError::InvalidComputationStatus)
         );
     }
@@ -463,12 +471,12 @@ mod tests {
         let mut state =
             open_policy_evaluation(&mut config, &request, 77, 400).expect("request should open");
         queue_arcium_computation(&mut state, 77, 400).expect("queue should succeed");
-        apply_mxe_callback(&mut state, [10; 32], [11; 32], 850, 0, 0, true)
+        apply_mxe_callback(&mut state, [10; 32], [11; 32], 850, 0, 0, 0, 0, true)
             .expect("first callback should succeed");
 
         // Second callback on already-finalized state should fail.
         assert_eq!(
-            apply_mxe_callback(&mut state, [10; 32], [11; 32], 850, 0, 0, true),
+            apply_mxe_callback(&mut state, [10; 32], [11; 32], 850, 0, 0, 0, 0, true),
             Err(TransitionError::InvalidComputationStatus)
         );
     }

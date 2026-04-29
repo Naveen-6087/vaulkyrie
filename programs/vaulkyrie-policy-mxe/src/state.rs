@@ -130,6 +130,8 @@ pub struct PolicyEvaluationState {
 impl PolicyEvaluationState {
     pub const LEN: usize = size_of::<Self>();
     const DECISION_FLAGS_OFFSET: usize = 0;
+    const RISK_SCORE_OFFSET: usize = 2;
+    const RISK_TIER_OFFSET: usize = 4;
 
     pub const fn new(
         request_commitment: [u8; 32],
@@ -265,6 +267,27 @@ impl PolicyEvaluationState {
         self.reserved[Self::DECISION_FLAGS_OFFSET] = bytes[0];
         self.reserved[Self::DECISION_FLAGS_OFFSET + 1] = bytes[1];
     }
+
+    pub fn risk_score(&self) -> u16 {
+        u16::from_le_bytes([
+            self.reserved[Self::RISK_SCORE_OFFSET],
+            self.reserved[Self::RISK_SCORE_OFFSET + 1],
+        ])
+    }
+
+    pub fn set_risk_score(&mut self, score: u16) {
+        let bytes = score.to_le_bytes();
+        self.reserved[Self::RISK_SCORE_OFFSET] = bytes[0];
+        self.reserved[Self::RISK_SCORE_OFFSET + 1] = bytes[1];
+    }
+
+    pub fn risk_tier(&self) -> u8 {
+        self.reserved[Self::RISK_TIER_OFFSET]
+    }
+
+    pub fn set_risk_tier(&mut self, tier: u8) {
+        self.reserved[Self::RISK_TIER_OFFSET] = tier;
+    }
 }
 
 #[cfg(test)]
@@ -293,12 +316,16 @@ mod tests {
         state.receipt_commitment = [10; 32];
         state.decision_commitment = [11; 32];
         state.set_decision_flags(0x1234);
+        state.set_risk_score(88);
+        state.set_risk_tier(3);
 
         let mut bytes = [0u8; PolicyEvaluationState::LEN];
         assert!(state.encode(&mut bytes));
         assert_eq!(PolicyEvaluationState::decode(&bytes), Some(state));
         assert_eq!(state.discriminator, POLICY_EVAL_DISCRIMINATOR);
         assert_eq!(state.decision_flags(), 0x1234);
+        assert_eq!(state.risk_score(), 88);
+        assert_eq!(state.risk_tier(), 3);
     }
 
     #[test]

@@ -130,6 +130,8 @@
 ///             decision.delay_until_slot,
 ///             decision.reason_code,
 ///             decision.decision_flags,
+///             decision.risk_score,
+///             decision.risk_tier,
 ///             decision.approved,
 ///         )
 ///     }
@@ -147,6 +149,8 @@ pub mod circuits {
         pub delay_until_slot: u64,
         pub reason_code: u16,
         pub decision_flags: u16,
+        pub risk_score: u16,
+        pub risk_tier: u8,
         pub approved: u8,
     }
 

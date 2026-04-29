@@ -421,6 +421,12 @@ pub struct PolicyDecision {
     pub delay_until_slot: u64,
     pub reason_code: u16,
     pub decision_flags: u16,
+    /// Privacy-preserving risk score revealed by the policy engine.
+    ///
+    /// The raw private signal buckets stay encrypted.  The circuit reveals only
+    /// this bounded summary so wallets and auditors can explain the decision.
+    pub risk_score: u16,
+    pub risk_tier: u8,
 }
 
 impl PolicyDecision {
@@ -437,6 +443,8 @@ impl PolicyDecision {
         hasher.update(self.delay_until_slot.to_le_bytes());
         hasher.update(self.reason_code.to_le_bytes());
         hasher.update(self.decision_flags.to_le_bytes());
+        hasher.update(self.risk_score.to_le_bytes());
+        hasher.update([self.risk_tier]);
         hasher.update([self.approved as u8]);
         hasher.finalize().into()
     }
@@ -469,6 +477,28 @@ pub struct PolicyEvaluationArtifacts {
     pub signal_commitment: [u8; 32],
     pub decision: PolicyDecision,
     pub envelope: PolicyDecisionEnvelope,
+}
+
+pub const RISK_TIER_LOW: u8 = 0;
+pub const RISK_TIER_MEDIUM: u8 = 1;
+pub const RISK_TIER_HIGH: u8 = 2;
+pub const RISK_TIER_CRITICAL: u8 = 3;
+
+pub fn risk_tier_from_score(score: u16) -> u8 {
+    match score {
+        0..=24 => RISK_TIER_LOW,
+        25..=49 => RISK_TIER_MEDIUM,
+        50..=84 => RISK_TIER_HIGH,
+        _ => RISK_TIER_CRITICAL,
+    }
+}
+
+fn risk_score_from_severity(severity: u16, denied: bool) -> u16 {
+    if denied {
+        100
+    } else {
+        severity.saturating_mul(3).min(100)
+    }
 }
 
 pub fn build_policy_request(
@@ -611,6 +641,8 @@ pub fn evaluate_policy(
     if delay_until_slot > current_slot {
         decision_flags |= DECISION_FLAG_DELAY_APPLIED;
     }
+    let risk_score = risk_score_from_severity(severity, !approved);
+    let risk_tier = risk_tier_from_score(risk_score);
 
     let decision = PolicyDecision {
         approved,
@@ -618,6 +650,8 @@ pub fn evaluate_policy(
         delay_until_slot,
         reason_code: reason.as_byte() as u16,
         decision_flags,
+        risk_score,
+        risk_tier,
     };
     let envelope = decision.into_envelope(request, computation_offset, signal_commitment);
 
@@ -685,6 +719,8 @@ mod tests {
             ThresholdRequirement::OneOfThree
         );
         assert_eq!(artifacts.decision.delay_until_slot, 500);
+        assert!(artifacts.decision.risk_score < 25);
+        assert_eq!(artifacts.decision.risk_tier, super::RISK_TIER_LOW);
     }
 
     #[test]
@@ -705,6 +741,8 @@ mod tests {
             ThresholdRequirement::ThreeOfThree
         );
         assert!(artifacts.decision.delay_until_slot > 500);
+        assert!(artifacts.decision.risk_score >= 50);
+        assert_eq!(artifacts.decision.risk_tier, super::RISK_TIER_HIGH);
     }
 
     #[test]
@@ -719,6 +757,8 @@ mod tests {
 
         assert!(!artifacts.decision.approved);
         assert_ne!(artifacts.decision.decision_flags & DECISION_FLAG_DENIED, 0);
+        assert_eq!(artifacts.decision.risk_score, 100);
+        assert_eq!(artifacts.decision.risk_tier, super::RISK_TIER_CRITICAL);
     }
 
     #[test]
