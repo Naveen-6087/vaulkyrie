@@ -1,8 +1,10 @@
 #![cfg_attr(not(test), no_std)]
 
 mod policy_engine;
+mod privacy_engine;
 
 pub use policy_engine::*;
+pub use privacy_engine::*;
 
 use sha2::{Digest, Sha256};
 

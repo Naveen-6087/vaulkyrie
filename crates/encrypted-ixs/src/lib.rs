@@ -45,6 +45,13 @@
 //! Vaulkyrie policy engine mirrors that approach by packing all private policy
 //! buckets into two `u128` lanes before encryption. The wallet SDK mirrors the
 //! same packing logic in `vaulkyrie_protocol::PolicySignals::pack_lanes()`.
+//!
+//! Vaulkyrie's privacy layer uses the same Arcium constraint model, but for a
+//! different purpose: private wallet intents. The privacy circuit receives
+//! encrypted signal lanes describing a shield/deposit, private transfer,
+//! withdraw, swap intent, or sealed receipt request. It returns compact
+//! decision material and a receipt commitment; full note sets, balances, and
+//! private metadata stay encrypted or local to the wallet.
 
 // ── Policy evaluation circuit ──────────────────────────────────────────────
 
@@ -139,6 +146,7 @@
 /// ```
 pub mod circuits {
     pub const POLICY_SIGNAL_LANES: usize = 2;
+    pub const PRIVACY_SIGNAL_LANES: usize = 2;
 
     /// Representation of the `policy_evaluate` circuit output.
     /// When Arcis compilation is available, replace this with the generated
@@ -182,11 +190,56 @@ pub mod circuits {
             }
         }
     }
+
+    /// Representation of the `privacy_evaluate` circuit output.
+    ///
+    /// The real Arcis implementation should compute this over encrypted
+    /// `PrivacySignals` lanes and bind it to an action-specific
+    /// `PrivacyIntent` commitment supplied by the caller program.
+    pub struct PrivacyEvaluateOutput {
+        pub receipt_commitment: [u8; 32],
+        pub intent_commitment: [u8; 32],
+        pub decision_flags: u16,
+        pub privacy_score: u16,
+        pub min_confirmations: u8,
+        pub provider_code: u8,
+        pub approved: u8,
+    }
+
+    /// Packed representation of the private wallet intent signals.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PrivacyEvaluateInput {
+        pub signal_lane_0: u128,
+        pub signal_lane_1: u128,
+    }
+
+    impl PrivacyEvaluateInput {
+        pub fn encode(&self) -> [u8; 32] {
+            let mut buf = [0u8; 32];
+            buf[0..16].copy_from_slice(&self.signal_lane_0.to_le_bytes());
+            buf[16..32].copy_from_slice(&self.signal_lane_1.to_le_bytes());
+            buf
+        }
+
+        pub fn decode(src: &[u8; 32]) -> Self {
+            let mut lane_0 = [0u8; 16];
+            lane_0.copy_from_slice(&src[0..16]);
+            let mut lane_1 = [0u8; 16];
+            lane_1.copy_from_slice(&src[16..32]);
+
+            Self {
+                signal_lane_0: u128::from_le_bytes(lane_0),
+                signal_lane_1: u128::from_le_bytes(lane_1),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::circuits::{PolicyEvaluateInput, POLICY_SIGNAL_LANES};
+    use super::circuits::{
+        PolicyEvaluateInput, PrivacyEvaluateInput, POLICY_SIGNAL_LANES, PRIVACY_SIGNAL_LANES,
+    };
 
     #[test]
     fn policy_input_roundtrip() {
@@ -203,5 +256,22 @@ mod tests {
     #[test]
     fn policy_input_keeps_two_fixed_signal_lanes() {
         assert_eq!(POLICY_SIGNAL_LANES, 2);
+    }
+
+    #[test]
+    fn privacy_input_roundtrip() {
+        let input = PrivacyEvaluateInput {
+            signal_lane_0: 0x010203040506u128,
+            signal_lane_1: 0xFFEEDDCCBBAA9988u128,
+        };
+        let encoded = input.encode();
+        assert_eq!(encoded.len(), 32);
+        let decoded = PrivacyEvaluateInput::decode(&encoded);
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn privacy_input_keeps_two_fixed_signal_lanes() {
+        assert_eq!(PRIVACY_SIGNAL_LANES, 2);
     }
 }
